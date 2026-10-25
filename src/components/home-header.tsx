@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { GoPlus } from "react-icons/go";
 import { LuChevronLeft, LuChevronRight, LuSearch, LuX } from "react-icons/lu";
+import { useWindowDecorations } from "@/hooks/use-window-decorations";
 import { getCurrentOS } from "@/lib/browser-utils";
 import { cn } from "@/lib/utils";
 import type { GroupWithCount } from "@/types";
@@ -59,7 +60,13 @@ const HomeHeader = ({
   }, []);
 
   const isMacOS = platform === "macos";
+  const isLinux = platform === "linux";
   const showProfileToolbar = !pageTitle;
+
+  // Same hook the controls use, so the reserved space can never disagree with
+  // what is actually drawn.
+  const decorations = useWindowDecorations();
+  const linuxLayout = decorations.clientSide ? decorations.layout : null;
 
   // Press-and-hold drag: any pixel of the sys-bar becomes a drag handle after
   // HOLD_MS, but quick clicks still reach buttons/inputs underneath.
@@ -179,14 +186,29 @@ const HomeHeader = ({
       onPointerCancel={handlePointerEnd}
       onDoubleClick={handleDoubleClick}
       className={cn(
-        "flex h-11 items-center gap-2 border-b border-border bg-card pl-3 select-none",
+        "flex h-11 items-center gap-2 border-b border-border bg-card select-none",
         // Windows: WindowDragArea renders three 44px native-style controls
         // (minimize + maximize/restore + close) fixed at top-right with
         // z-50, total 132px wide. Reserve 144px on the right edge so the
         // "+ New" button and search input clear them with a few pixels of
         // breathing room and never sit underneath the controls.
-        isWindows ? "pr-[144px]" : "pr-3",
+        isWindows ? "pl-3 pr-[144px]" : null,
+        // Linux reserves its space through the inline style below, because the
+        // desktop chooses which side the controls sit on and how many there
+        // are. Everything else keeps the plain symmetric padding.
+        !isWindows && !isLinux ? "pl-3 pr-3" : null,
       )}
+      style={
+        isLinux
+          ? {
+              // Each control is 44px wide; add the usual 12px gutter. Before
+              // the layout resolves, fall back to the gutter alone rather than
+              // to no padding, which would visibly shift the content.
+              paddingLeft: (linuxLayout?.left.length ?? 0) * 44 + 12,
+              paddingRight: (linuxLayout?.right.length ?? 0) * 44 + 12,
+            }
+          : undefined
+      }
     >
       {isMacOS && (
         <div
@@ -221,7 +243,7 @@ const HomeHeader = ({
                     behavior: "smooth",
                   });
               }}
-              className="absolute top-1/2 left-0 z-10 grid size-5 -translate-y-1/2 place-items-center rounded-full bg-card/90 text-muted-foreground shadow-sm transition-colors hover:bg-accent hover:text-foreground"
+              className="absolute top-1/2 left-0 z-10 grid size-5 -translate-y-1/2 place-items-center rounded-full bg-card/90 text-muted-foreground shadow-sm transition-colors hover:bg-accent hover:text-accent-foreground"
             >
               <LuChevronLeft className="size-3" />
             </button>
@@ -295,7 +317,7 @@ const HomeHeader = ({
                     behavior: "smooth",
                   });
               }}
-              className="absolute top-1/2 right-0 z-10 grid size-5 -translate-y-1/2 place-items-center rounded-full bg-card/90 text-muted-foreground shadow-sm transition-colors hover:bg-accent hover:text-foreground"
+              className="absolute top-1/2 right-0 z-10 grid size-5 -translate-y-1/2 place-items-center rounded-full bg-card/90 text-muted-foreground shadow-sm transition-colors hover:bg-accent hover:text-accent-foreground"
             >
               <LuChevronRight className="size-3" />
             </button>
@@ -323,7 +345,7 @@ const HomeHeader = ({
               onClick={() => {
                 onSearchQueryChange("");
               }}
-              className="absolute top-1/2 right-1.5 -translate-y-1/2 transform rounded-sm p-0.5 transition-colors hover:bg-accent"
+              className="absolute top-1/2 right-1.5 -translate-y-1/2 transform rounded-sm p-0.5 transition-colors hover:bg-accent hover:text-accent-foreground"
               aria-label={t("header.clearSearch")}
             >
               <LuX className="size-3.5 text-muted-foreground hover:text-foreground" />

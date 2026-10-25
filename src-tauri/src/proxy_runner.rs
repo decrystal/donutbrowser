@@ -4,32 +4,69 @@ use crate::proxy_storage::{
 };
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 lazy_static::lazy_static! {
   static ref PROXY_PROCESSES: std::sync::Mutex<std::collections::HashMap<String, u32>> =
     std::sync::Mutex::new(std::collections::HashMap::new());
 }
 
-fn target_binary_name(base_name: &str) -> Option<String> {
-  let target = std::env::var("TARGET").ok()?;
+static SIDECAR_VERSION_VERIFIED: AtomicBool = AtomicBool::new(false);
+const RETAINED_PROXY_LOGS: usize = 20;
 
+fn prune_stale_proxy_logs(temp_dir: &Path, retain: usize) {
+  let active_ids = PROXY_PROCESSES
+    .lock()
+    .map(|processes| processes.keys().cloned().collect::<Vec<_>>())
+    .unwrap_or_default();
+  let Ok(entries) = std::fs::read_dir(temp_dir) else {
+    return;
+  };
+  let mut logs = entries
+    .flatten()
+    .filter_map(|entry| {
+      let file_name = entry.file_name();
+      let file_name = file_name.to_str()?;
+      let id = file_name
+        .strip_prefix("donut-proxy-")?
+        .strip_suffix(".log")?;
+      if active_ids.iter().any(|active_id| active_id == id) {
+        return None;
+      }
+      let modified = entry
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(std::time::UNIX_EPOCH);
+      Some((modified, entry.path()))
+    })
+    .collect::<Vec<_>>();
+  logs.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+  for (_, path) in logs.into_iter().skip(retain) {
+    if let Err(error) = std::fs::remove_file(&path) {
+      log::debug!(
+        "Failed to prune stale proxy log {}: {error}",
+        path.display()
+      );
+    }
+  }
+}
+
+fn target_binary_name(base_name: &str) -> String {
+  let target = env!("DONUT_BUILD_TARGET");
   #[cfg(windows)]
   {
-    Some(format!("{base_name}-{target}.exe"))
+    format!("{base_name}-{target}.exe")
   }
 
   #[cfg(not(windows))]
   {
-    Some(format!("{base_name}-{target}"))
+    format!("{base_name}-{target}")
   }
 }
 
 fn unsuffixed_binary_name(base_name: &str) -> String {
   #[cfg(windows)]
   {
-    match base_name {
-      "donut-proxy" => "donut-proxy.exe".to_string(),
-      _ => String::new(),
-    }
+    format!("{base_name}.exe")
   }
 
   #[cfg(not(windows))]
@@ -38,19 +75,24 @@ fn unsuffixed_binary_name(base_name: &str) -> String {
   }
 }
 
-fn binary_matches_prefix(path: &Path, base_name: &str) -> bool {
-  let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+fn is_executable_file(path: &Path) -> bool {
+  let Ok(metadata) = path.metadata() else {
     return false;
   };
-
+  if !metadata.is_file() {
+    return false;
+  }
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+  }
   #[cfg(windows)]
   {
-    file_name.starts_with(&format!("{base_name}-")) && file_name.ends_with(".exe")
-  }
-
-  #[cfg(not(windows))]
-  {
-    file_name.starts_with(&format!("{base_name}-"))
+    path
+      .extension()
+      .and_then(|extension| extension.to_str())
+      .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
   }
 }
 
@@ -115,10 +157,10 @@ pub(crate) fn find_sidecar_executable(
     Some(manifest_dir.join("target").join("release")),
   );
 
-  let mut exact_names = vec![unsuffixed_binary_name(base_name)];
-  if let Some(target_name) = target_binary_name(base_name) {
-    exact_names.push(target_name);
-  }
+  let exact_names = [
+    unsuffixed_binary_name(base_name),
+    target_binary_name(base_name),
+  ];
 
   for dir in &search_dirs {
     for name in &exact_names {
@@ -127,17 +169,8 @@ pub(crate) fn find_sidecar_executable(
       }
 
       let candidate = dir.join(name);
-      if candidate.exists() {
+      if is_executable_file(&candidate) {
         return Ok(candidate);
-      }
-    }
-
-    if let Ok(entries) = std::fs::read_dir(dir) {
-      for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() && binary_matches_prefix(&path, base_name) {
-          return Ok(path);
-        }
       }
     }
   }
@@ -156,21 +189,96 @@ pub(crate) fn find_sidecar_executable(
   )
 }
 
+fn parse_sidecar_version(stdout: &[u8]) -> Option<String> {
+  let output = std::str::from_utf8(stdout).ok()?.trim();
+  output
+    .strip_prefix("donut-proxy ")
+    .map(str::trim)
+    .filter(|version| !version.is_empty() && !version.contains(char::is_whitespace))
+    .map(str::to_string)
+}
+
+fn sidecar_version_mismatch_error() -> Box<dyn std::error::Error> {
+  serde_json::json!({
+    "code": "PROXY_SIDECAR_VERSION_MISMATCH"
+  })
+  .to_string()
+  .into()
+}
+
+/// Verify that the installed sidecar was built for the same release as the
+/// main app. Windows can otherwise retain an executing, locked sidecar while
+/// NSIS replaces the app, leaving an incompatible mixed-version installation.
+pub(crate) async fn ensure_sidecar_version() -> Result<(), Box<dyn std::error::Error>> {
+  if SIDECAR_VERSION_VERIFIED.load(Ordering::Acquire) {
+    return Ok(());
+  }
+
+  let executable = match find_sidecar_executable("donut-proxy") {
+    Ok(executable) => executable,
+    Err(e) => {
+      log::error!("Failed to locate donut-proxy for version verification: {e}");
+      return Err(sidecar_version_mismatch_error());
+    }
+  };
+  let mut command = std::process::Command::new(&executable);
+  command.arg("--version");
+
+  #[cfg(windows)]
+  {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    command.creation_flags(CREATE_NO_WINDOW);
+  }
+
+  let output = match command.output() {
+    Ok(output) => output,
+    Err(e) => {
+      log::error!(
+        "Failed to run {} for version verification: {e}",
+        executable.display()
+      );
+      return Err(sidecar_version_mismatch_error());
+    }
+  };
+  let actual_version = parse_sidecar_version(&output.stdout);
+  let expected_version = env!("BUILD_VERSION");
+
+  if output.status.success() && actual_version.as_deref() == Some(expected_version) {
+    SIDECAR_VERSION_VERIFIED.store(true, Ordering::Release);
+    return Ok(());
+  }
+
+  log::error!(
+    "donut-proxy version mismatch: expected {}, got {:?}; status={}, stdout={:?}, stderr={:?}",
+    expected_version,
+    actual_version,
+    output.status,
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+  Err(sidecar_version_mismatch_error())
+}
+
 pub async fn start_proxy_process(
   upstream_url: Option<String>,
   port: Option<u16>,
 ) -> Result<ProxyConfig, Box<dyn std::error::Error>> {
-  start_proxy_process_with_profile(upstream_url, port, None, Vec::new(), None, None).await
+  start_proxy_process_with_profile(upstream_url, port, None, Vec::new(), None, false, None).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_proxy_process_with_profile(
   upstream_url: Option<String>,
   port: Option<u16>,
   profile_id: Option<String>,
   bypass_rules: Vec<String>,
   blocklist_file: Option<String>,
+  dns_allowlist_mode: bool,
   local_protocol: Option<String>,
 ) -> Result<ProxyConfig, Box<dyn std::error::Error>> {
+  ensure_sidecar_version().await?;
+
   let id = generate_proxy_id();
   let upstream = upstream_url.unwrap_or_else(|| "DIRECT".to_string());
 
@@ -185,6 +293,7 @@ pub async fn start_proxy_process_with_profile(
     .with_profile_id(profile_id.clone())
     .with_bypass_rules(bypass_rules)
     .with_blocklist_file(blocklist_file)
+    .with_dns_allowlist_mode(dns_allowlist_mode)
     .with_local_protocol(local_protocol);
   save_proxy_config(&config)?;
 
@@ -198,6 +307,10 @@ pub async fn start_proxy_process_with_profile(
   // Spawn proxy worker process in the background using std::process::Command
   // This ensures proper process detachment on Unix systems
   let exe = find_sidecar_executable("donut-proxy")?;
+  let temp_dir = std::env::temp_dir();
+  let log_path = temp_dir.join(format!("donut-proxy-{id}.log"));
+  let log_file = crate::app_dirs::create_owner_only(&log_path);
+  prune_stale_proxy_logs(&temp_dir, RETAINED_PROXY_LOGS);
 
   #[cfg(unix)]
   {
@@ -209,13 +322,14 @@ pub async fn start_proxy_process_with_profile(
     cmd.arg("start");
     cmd.arg("--id");
     cmd.arg(&id);
+    cmd.env_remove("DONUT_PROXY_USERNAME");
+    cmd.env_remove("DONUT_PROXY_PASSWORD");
 
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
 
     // Always log to file for diagnostics (both debug and release builds)
-    let log_path = std::env::temp_dir().join(format!("donut-proxy-{}.log", id));
-    if let Ok(file) = std::fs::File::create(&log_path) {
+    if let Ok(file) = log_file {
       log::info!("Proxy worker stderr will be logged to: {:?}", log_path);
       cmd.stderr(Stdio::from(file));
     } else {
@@ -286,13 +400,14 @@ pub async fn start_proxy_process_with_profile(
     cmd.arg("start");
     cmd.arg("--id");
     cmd.arg(&id);
+    cmd.env_remove("DONUT_PROXY_USERNAME");
+    cmd.env_remove("DONUT_PROXY_PASSWORD");
 
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
 
     // Log to file for diagnostics (matching Unix behavior)
-    let log_path = std::env::temp_dir().join(format!("donut-proxy-{}.log", id));
-    if let Ok(file) = std::fs::File::create(&log_path) {
+    if let Ok(file) = log_file {
       log::info!("Proxy worker stderr will be logged to: {:?}", log_path);
       cmd.stderr(Stdio::from(file));
     } else {
@@ -370,24 +485,21 @@ pub async fn start_proxy_process_with_profile(
     attempts += 1;
     if attempts >= max_attempts {
       // Try to get the config one more time for better error message
-      if let Some(config) = get_proxy_config(&id) {
+      let detail = if let Some(config) = get_proxy_config(&id) {
         // Check if process is still running
         let process_running = config.pid.map(is_process_running).unwrap_or(false);
-        return Err(
-          format!(
-            "Proxy worker failed to start in time. Config: id={}, local_url={:?}, local_port={:?}, pid={:?}, process_running={}",
-            config.id, config.local_url, config.local_port, config.pid, process_running
-          )
-          .into(),
-        );
-      }
-      return Err(
         format!(
-          "Proxy worker failed to start in time. Config not found for id: {}",
-          id
+          "Config: id={}, local_url={:?}, local_port={:?}, pid={:?}, process_running={}",
+          config.id, config.local_url, config.local_port, config.pid, process_running
         )
-        .into(),
-      );
+      } else {
+        format!("Config not found for id: {}", id)
+      };
+      // The detached worker (if it did spawn) would otherwise outlive this
+      // failed start with nothing tracking it — callers only get an error
+      // string, so this is the last place that can still kill it.
+      let _ = stop_proxy_process(&id).await;
+      return Err(format!("Proxy worker failed to start in time. {detail}").into());
     }
   }
 }
@@ -441,4 +553,74 @@ pub async fn stop_all_proxy_processes() -> Result<(), Box<dyn std::error::Error>
     let _ = stop_proxy_process(&config.id).await;
   }
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{
+    is_executable_file, parse_sidecar_version, prune_stale_proxy_logs, target_binary_name,
+  };
+  use std::fs;
+  use std::time::Duration;
+
+  #[test]
+  fn parses_exact_sidecar_version_output() {
+    assert_eq!(
+      parse_sidecar_version(b"donut-proxy v0.28.2\n").as_deref(),
+      Some("v0.28.2")
+    );
+    assert_eq!(
+      parse_sidecar_version(b"donut-proxy nightly-2026-07-19-a4ed5c8\r\n").as_deref(),
+      Some("nightly-2026-07-19-a4ed5c8")
+    );
+  }
+
+  #[test]
+  fn rejects_missing_or_ambiguous_sidecar_version_output() {
+    assert_eq!(parse_sidecar_version(b""), None);
+    assert_eq!(parse_sidecar_version(b"donut-proxy"), None);
+    assert_eq!(parse_sidecar_version(b"other-proxy v0.28.2"), None);
+    assert_eq!(
+      parse_sidecar_version(b"donut-proxy v0.28.2\nunexpected"),
+      None
+    );
+  }
+
+  #[test]
+  fn sidecar_target_name_is_exact_and_metadata_files_are_not_executables() {
+    let target_name = target_binary_name("xray");
+    assert!(target_name.starts_with("xray-"));
+    assert!(target_name.contains(env!("DONUT_BUILD_TARGET")));
+
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join(format!("{target_name}.source.json"));
+    fs::write(&marker, "{}").unwrap();
+    assert!(!is_executable_file(&marker));
+
+    let executable = temp.path().join(target_name);
+    fs::write(&executable, "binary").unwrap();
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::PermissionsExt;
+      fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert!(is_executable_file(&executable));
+  }
+
+  #[test]
+  fn prunes_only_old_proxy_logs() {
+    let temp = tempfile::tempdir().unwrap();
+    for id in ["oldest", "middle", "newest"] {
+      fs::write(temp.path().join(format!("donut-proxy-{id}.log")), id).unwrap();
+      std::thread::sleep(Duration::from_millis(10));
+    }
+    fs::write(temp.path().join("unrelated.log"), "keep").unwrap();
+
+    prune_stale_proxy_logs(temp.path(), 2);
+
+    assert!(!temp.path().join("donut-proxy-oldest.log").exists());
+    assert!(temp.path().join("donut-proxy-middle.log").exists());
+    assert!(temp.path().join("donut-proxy-newest.log").exists());
+    assert!(temp.path().join("unrelated.log").exists());
+  }
 }

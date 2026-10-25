@@ -20,7 +20,7 @@ jobs:
   security-scan:
     if: github.repository == 'zhom/donutbrowser'
     name: Security Vulnerability Scan
-    uses: "google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@9a498708959aeaef5ef730655706c5a1df1edbc2" # v2.3.8
+    uses: "google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@8deb546fdb875b9996d27d4950be7312dac076a1" # v2.5.0
     with:
       scan-args: |-
         -r
@@ -37,7 +37,6 @@ jobs:
     if: github.repository == 'zhom/donutbrowser'
     name: Lint JavaScript/TypeScript
     uses: ./.github/workflows/lint-js.yml
-    secrets: inherit
     permissions:
       contents: read
 
@@ -45,7 +44,6 @@ jobs:
     if: github.repository == 'zhom/donutbrowser'
     name: Lint Rust
     uses: ./.github/workflows/lint-rs.yml
-    secrets: inherit
     permissions:
       contents: read
 
@@ -53,7 +51,6 @@ jobs:
     if: github.repository == 'zhom/donutbrowser'
     name: CodeQL
     uses: ./.github/workflows/codeql.yml
-    secrets: inherit
     permissions:
       security-events: write
       contents: read
@@ -64,7 +61,6 @@ jobs:
     if: github.repository == 'zhom/donutbrowser'
     name: Spell Check
     uses: ./.github/workflows/spellcheck.yml
-    secrets: inherit
     permissions:
       contents: read
 
@@ -105,15 +101,15 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 #v6.0.9
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 #v6.0.10
         with:
           run_install: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f #v6.1.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 #v7.0.0
         with:
           node-version-file: .node-version
           cache: "pnpm"
@@ -128,10 +124,10 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04' || matrix.platform == 'ubuntu-22.04-arm'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev pkg-config xdg-utils
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev pkg-config unzip xdg-utils
 
       - name: Rust cache
-        uses: swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 #v2.9.1
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 #v2.9.2
         with:
           workdir: ./src-tauri
 
@@ -143,7 +139,7 @@ jobs:
         # from secrets explicitly — they are NOT inherited from the job env.
         env:
           NEXT_PUBLIC_TURNSTILE: ${{ secrets.NEXT_PUBLIC_TURNSTILE }}
-        run: pnpm exec next build
+        run: pnpm build
 
       - name: Verify frontend dist exists
         shell: bash
@@ -160,6 +156,8 @@ jobs:
       - name: Build sidecar binaries
         shell: bash
         working-directory: ./src-tauri
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
           cargo build --bin donut-proxy --target ${{ matrix.target }} --release
 
@@ -173,6 +171,9 @@ jobs:
             cp src-tauri/target/${{ matrix.target }}/release/donut-proxy src-tauri/binaries/donut-proxy-${{ matrix.target }}
             chmod +x src-tauri/binaries/donut-proxy-${{ matrix.target }}
           fi
+
+      - name: Download verified Xray-core sidecar
+        run: node src-tauri/download-xray.mjs --target ${{ matrix.target }}
 
       - name: Import Apple certificate
         if: matrix.platform == 'macos-latest'
@@ -216,6 +217,7 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TARGET: ${{ matrix.target }}
           # tauri-action invokes `pnpm tauri build`, which runs
           # `beforeBuildCommand` from tauri.conf.json. That rebuilds the
           # frontend in its own subprocess, so the env var MUST be forwarded
@@ -246,6 +248,9 @@ jobs:
 
           # Copy sidecar binaries
           cp "src-tauri/target/${{ matrix.target }}/release/donut-proxy.exe" "$PORTABLE_DIR/"
+          cp "src-tauri/binaries/xray-${{ matrix.target }}.exe" "$PORTABLE_DIR/xray.exe"
+          mkdir -p "$PORTABLE_DIR/licenses"
+          cp "src-tauri/binaries/xray-LICENSE.txt" "$PORTABLE_DIR/licenses/Xray-core-LICENSE.txt"
           # The daemon is currently disabled (no Cargo bin target), so it isn't
           # built. Copy it only if a build produced it, so the absent binary
           # doesn't fail the job.
@@ -280,6 +285,29 @@ jobs:
           security delete-keychain $RUNNER_TEMP/app-signing.keychain-db || true
           rm -f $RUNNER_TEMP/build_certificate.p12 || true
 
+  # Runs after every matrix leg (including the portable ZIP upload) so the
+  # sums cover the complete, final asset set. The app self-updater refuses to
+  # install a release it cannot verify against this file.
+  checksums:
+    if: github.repository == 'zhom/donutbrowser'
+    needs: [release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Generate and upload SHA256SUMS.txt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ASSETS_DIR="/tmp/release-assets"
+          mkdir -p "$ASSETS_DIR"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$ASSETS_DIR"
+          cd "$ASSETS_DIR"
+          sha256sum Donut* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          gh release upload "$TAG" SHA256SUMS.txt --clobber --repo "$GITHUB_REPOSITORY"
+
   changelog:
     if: github.repository == 'zhom/donutbrowser'
     needs: [release]
@@ -288,7 +316,7 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           ref: main
           fetch-depth: 0
@@ -454,7 +482,7 @@ jobs:
     needs: [release, changelog]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           ref: main
           fetch-depth: 0
@@ -534,7 +562,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Trigger Cloudflare Pages deployment
-        run: curl -fsSL -X POST "${{ secrets.CLOUDFLARE_WEB_DEPLOYMENT_HOOK }}"
+        env:
+          DEPLOYMENT_HOOK: ${{ secrets.CLOUDFLARE_WEB_DEPLOYMENT_HOOK }}
+        run: curl -fsSL -X POST "$DEPLOYMENT_HOOK"
 
   docker:
     if: github.repository == 'zhom/donutbrowser'
@@ -542,7 +572,9 @@ jobs:
     uses: ./.github/workflows/docker-sync.yml
     with:
       tag: ${{ github.ref_name }}
-    secrets: inherit
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 
   update-flake:
     if: github.repository == 'zhom/donutbrowser'
@@ -552,7 +584,7 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           ref: main
 

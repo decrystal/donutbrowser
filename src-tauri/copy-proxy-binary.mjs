@@ -1,10 +1,14 @@
-import { execSync, execFileSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { downloadXray } from "./download-xray.mjs";
 
 const MANIFEST_DIR = dirname(fileURLToPath(import.meta.url));
-const PROFILE = process.env.PROFILE || "debug";
+const PROFILE =
+  process.argv.includes("--release") || process.env.PROFILE === "release"
+    ? "release"
+    : "debug";
 
 function getTarget() {
   if (process.env.TARGET) return process.env.TARGET;
@@ -32,9 +36,18 @@ const isWindows = TARGET.includes("windows");
 // Determine source directory
 let srcDir;
 if (TARGET === HOST_TARGET || TARGET === "unknown") {
-  srcDir = join(MANIFEST_DIR, "target", PROFILE === "release" ? "release" : "debug");
+  srcDir = join(
+    MANIFEST_DIR,
+    "target",
+    PROFILE === "release" ? "release" : "debug",
+  );
 } else {
-  srcDir = join(MANIFEST_DIR, "target", TARGET, PROFILE === "release" ? "release" : "debug");
+  srcDir = join(
+    MANIFEST_DIR,
+    "target",
+    TARGET,
+    PROFILE === "release" ? "release" : "debug",
+  );
 }
 
 const destDir = join(MANIFEST_DIR, "binaries");
@@ -48,32 +61,23 @@ function copyBinary(baseName) {
   if (isWindows) destName += ".exe";
   const dest = join(destDir, destName);
 
-  if (existsSync(source)) {
-    copyFileSync(source, dest);
-    console.log(`Copied ${binName} to ${dest}`);
-  } else {
-    console.log(`Warning: Binary not found at ${source}`);
-    console.log(`Building ${baseName} binary...`);
-
-    const buildArgs = ["build", "--bin", baseName];
-    if (PROFILE === "release") buildArgs.push("--release");
-    if (TARGET !== "unknown" && TARGET !== HOST_TARGET) {
-      buildArgs.push("--target", TARGET);
-    }
-
-    execFileSync("cargo", buildArgs, {
-      cwd: MANIFEST_DIR,
-      stdio: "inherit",
-    });
-
-    if (existsSync(source)) {
-      copyFileSync(source, dest);
-      console.log(`Built and copied ${binName} to ${dest}`);
-    } else {
-      console.error(`Error: Failed to build ${baseName} binary`);
-      process.exit(1);
-    }
+  const buildArgs = ["build", "--bin", baseName];
+  if (PROFILE === "release") buildArgs.push("--release");
+  if (TARGET !== "unknown" && TARGET !== HOST_TARGET) {
+    buildArgs.push("--target", TARGET);
   }
+  execFileSync("cargo", buildArgs, {
+    cwd: MANIFEST_DIR,
+    stdio: "inherit",
+  });
+
+  if (!existsSync(source)) {
+    console.error(`Error: Failed to build ${baseName} binary`);
+    process.exit(1);
+  }
+  copyFileSync(source, dest);
+  console.log(`Built and copied ${binName} to ${dest}`);
 }
 
 copyBinary("donut-proxy");
+await downloadXray(TARGET);

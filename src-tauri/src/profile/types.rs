@@ -75,6 +75,10 @@ pub struct BrowserProfile {
   /// Decryption goes to a RAM-backed ephemeral dir, never to disk.
   #[serde(default)]
   pub password_protected: bool,
+  /// Wipe browsing data (except extensions and bookmarks) when the browser
+  /// exits. Ignored for ephemeral and password-protected profiles.
+  #[serde(default)]
+  pub clear_on_close: bool,
   /// Profile creation timestamp (epoch seconds, UTC). `None` for legacy
   /// profiles that pre-date this field — those are treated as ancient by
   /// any staleness check.
@@ -100,6 +104,16 @@ pub fn get_host_os() -> String {
   } else {
     "linux".to_string()
   }
+}
+
+/// Whether a value is one `get_host_os` can actually return.
+///
+/// A fingerprint OS is a wider set than a host OS: `"android"` and `"ios"` are
+/// valid fingerprints but no machine ever reports them as its host. Storing one
+/// in `host_os` makes `is_cross_os` permanently true, which bars the profile
+/// from every local launch path on the very machine that created it.
+pub fn is_host_os(value: &str) -> bool {
+  matches!(value, "macos" | "windows" | "linux")
 }
 
 impl BrowserProfile {
@@ -141,5 +155,30 @@ impl BrowserProfile {
   /// Returns true if sync uses E2E encryption.
   pub fn is_encrypted_sync(&self) -> bool {
     self.sync_mode == SyncMode::Encrypted
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn host_os_is_always_a_valid_host_os() {
+    // The invariant the host_os backfill guard rests on: whatever this machine
+    // reports must satisfy is_host_os, on every platform.
+    assert!(is_host_os(&get_host_os()));
+  }
+
+  #[test]
+  fn mobile_fingerprint_targets_are_not_host_operating_systems() {
+    // Backfilling host_os from a fingerprint OS used to store these, and since
+    // get_host_os can never return them, is_cross_os stayed true forever and
+    // the profile could not be launched on the machine that created it.
+    for os in ["macos", "windows", "linux"] {
+      assert!(is_host_os(os), "{os} must count as a host OS");
+    }
+    for os in ["android", "ios", "", "Windows", "chromeos"] {
+      assert!(!is_host_os(os), "{os} must not be stored as a host OS");
+    }
   }
 }

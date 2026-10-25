@@ -21,8 +21,10 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Textarea } from "@/components/ui/textarea";
 import { translateBackendError } from "@/lib/backend-errors";
-import type { StoredProxy } from "@/types";
+import { pickParsedProxy } from "@/lib/proxy-string";
+import type { ProxyParseResult, StoredProxy } from "@/types";
 import { RippleButton } from "./ui/ripple";
 
 interface ProxyFormData {
@@ -32,6 +34,7 @@ interface ProxyFormData {
   port: number;
   username: string;
   password: string;
+  vless_uri: string;
 }
 
 interface ProxyFormDialogProps {
@@ -47,7 +50,37 @@ const DEFAULT_FORM: ProxyFormData = {
   port: 8080,
   username: "",
   password: "",
+  vless_uri: "",
 };
+
+interface VlessEndpoint {
+  host: string;
+  port: number;
+}
+
+function parseVlessEndpoint(uri: string): VlessEndpoint | null {
+  try {
+    const parsed = new URL(uri.trim());
+    const port = Number.parseInt(parsed.port, 10);
+    if (
+      parsed.protocol !== "vless:" ||
+      !parsed.hostname ||
+      !Number.isInteger(port) ||
+      port < 1 ||
+      port > 65535
+    ) {
+      return null;
+    }
+
+    const host =
+      parsed.hostname.startsWith("[") && parsed.hostname.endsWith("]")
+        ? parsed.hostname.slice(1, -1)
+        : parsed.hostname;
+    return { host, port };
+  } catch {
+    return null;
+  }
+}
 
 export function ProxyFormDialog({
   isOpen,
@@ -57,6 +90,12 @@ export function ProxyFormDialog({
   const { t } = useTranslation();
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [form, setForm] = useState<ProxyFormData>(DEFAULT_FORM);
+  // The local parse only covers scheme/host/port. Whether Donut can actually
+  // use the server — REALITY, XTLS Vision, plain TCP — is decided by the Rust
+  // parser, so ask it (below) and show the specific reason while the user is
+  // still editing rather than after they save. Declared here because
+  // `handleSubmit` guards on it.
+  const [vlessUnsupported, setVlessUnsupported] = useState<string | null>(null);
 
   const resetForm = useCallback(() => {
     setForm(DEFAULT_FORM);
@@ -79,6 +118,7 @@ export function ProxyFormDialog({
       port: editingProxy.proxy_settings.port,
       username: editingProxy.proxy_settings.username ?? "",
       password: editingProxy.proxy_settings.password ?? "",
+      vless_uri: editingProxy.proxy_settings.vless_uri ?? "",
     });
   }, [editingProxy, isOpen, resetForm]);
 
@@ -88,7 +128,25 @@ export function ProxyFormDialog({
       return;
     }
 
-    if (!form.host.trim() || !form.port) {
+    const isVless = form.proxy_type === "vless";
+    const vlessEndpoint = isVless ? parseVlessEndpoint(form.vless_uri) : null;
+
+    if (isVless && !form.vless_uri.trim()) {
+      toast.error(t("proxies.form.vlessUriRequired"));
+      return;
+    }
+
+    if (isVless && !vlessEndpoint) {
+      toast.error(t("proxies.form.vlessUriInvalid"));
+      return;
+    }
+
+    if (isVless && vlessUnsupported) {
+      toast.error(vlessUnsupported);
+      return;
+    }
+
+    if (!isVless && (!form.host.trim() || !form.port)) {
       toast.error(t("proxies.form.hostPortRequired"));
       return;
     }
@@ -107,10 +165,11 @@ export function ProxyFormDialog({
         name: form.name.trim(),
         proxySettings: {
           proxy_type: form.proxy_type,
-          host: form.host.trim(),
-          port: form.port,
-          username: form.username.trim() || undefined,
-          password: form.password.trim() || undefined,
+          host: vlessEndpoint?.host ?? form.host.trim(),
+          port: vlessEndpoint?.port ?? form.port,
+          username: isVless ? undefined : form.username.trim() || undefined,
+          password: isVless ? undefined : form.password.trim() || undefined,
+          vless_uri: isVless ? form.vless_uri.trim() : undefined,
         },
       };
 
@@ -136,7 +195,7 @@ export function ProxyFormDialog({
     } finally {
       setIsSubmitting(false);
     }
-  }, [editingProxy, form, onClose, t]);
+  }, [editingProxy, form, onClose, t, vlessUnsupported]);
 
   const handleClose = useCallback(() => {
     if (!isSubmitting) {
@@ -144,13 +203,86 @@ export function ProxyFormDialog({
     }
   }, [isSubmitting, onClose]);
 
+  // Proxies are copied around as one string — `socks5://user:pass@host:1080`,
+  // `host:1080:user:pass`, and a dozen variants of both — so a paste into any
+  // one field is almost never meant for that field alone. Hand the clipboard to
+  // the same Rust parser the import dialog uses and spread the result across
+  // the form. The default paste is left alone until the answer comes back, so a
+  // string that isn't a proxy (a hostname, a port) lands where it was dropped.
+  const handleProxyPaste = useCallback(
+    (event: React.ClipboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
+      const content = event.clipboardData.getData("text").trim();
+      if (!content) {
+        return;
+      }
+
+      // Captured before the browser applies the paste, so a proxy string
+      // dropped into the empty name field names the proxy after its endpoint
+      // instead of keeping the raw line.
+      const nameBeforePaste = form.name.trim();
+
+      void invoke<ProxyParseResult[]>("parse_txt_proxies", { content })
+        .then((results) => {
+          const parsed = pickParsedProxy(results);
+          if (!parsed) {
+            return;
+          }
+          setForm((previous) => ({
+            ...previous,
+            name: nameBeforePaste || `${parsed.host}:${parsed.port}`,
+            proxy_type: parsed.proxy_type,
+            host: parsed.host,
+            port: parsed.port,
+            username: parsed.username ?? "",
+            password: parsed.password ?? "",
+            vless_uri: parsed.vless_uri ?? "",
+          }));
+        })
+        .catch((error: unknown) => {
+          console.error("Failed to parse pasted proxy:", error);
+        });
+    },
+    [form.name],
+  );
+
+  const isVless = form.proxy_type === "vless";
+  const vlessEndpoint = isVless ? parseVlessEndpoint(form.vless_uri) : null;
+
+  const trimmedVlessUri = form.vless_uri.trim();
+  useEffect(() => {
+    if (!isVless || trimmedVlessUri.length === 0) {
+      setVlessUnsupported(null);
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void invoke("validate_vless_uri", { uri: trimmedVlessUri })
+        .then(() => {
+          if (!cancelled) setVlessUnsupported(null);
+        })
+        .catch((error: unknown) => {
+          if (!cancelled) setVlessUnsupported(translateBackendError(t, error));
+        });
+    }, 300);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [isVless, trimmedVlessUri, t]);
+
+  const hasInvalidVlessUri =
+    isVless &&
+    trimmedVlessUri.length > 0 &&
+    (!vlessEndpoint || vlessUnsupported !== null);
   const isFormValid =
     form.name.trim() &&
-    form.host.trim() &&
-    form.port > 0 &&
-    form.port <= 65535 &&
-    (form.proxy_type !== "ss" ||
-      (form.username.trim() && form.password.trim()));
+    (isVless
+      ? vlessEndpoint !== null && vlessUnsupported === null
+      : form.host.trim() &&
+        form.port > 0 &&
+        form.port <= 65535 &&
+        (form.proxy_type !== "ss" ||
+          (form.username.trim() && form.password.trim())));
 
   return (
     <Dialog open={isOpen} onOpenChange={handleClose}>
@@ -170,13 +302,14 @@ export function ProxyFormDialog({
               onChange={(e) => {
                 setForm({ ...form, name: e.target.value });
               }}
+              onPaste={handleProxyPaste}
               placeholder={t("proxies.form.namePlaceholder")}
               disabled={isSubmitting}
             />
           </div>
 
           <div className="grid gap-2">
-            <Label>{t("proxies.form.type")}</Label>
+            <Label htmlFor="proxy-type">{t("proxies.form.type")}</Label>
             <Select
               value={form.proxy_type}
               onValueChange={(value) => {
@@ -184,91 +317,138 @@ export function ProxyFormDialog({
               }}
               disabled={isSubmitting}
             >
-              <SelectTrigger>
+              <SelectTrigger id="proxy-type">
                 <SelectValue placeholder={t("proxies.form.selectType")} />
               </SelectTrigger>
               <SelectContent>
-                {["http", "https", "socks4", "socks5", "ss"].map((type) => (
-                  <SelectItem key={type} value={type}>
-                    {type === "ss" ? "Shadowsocks" : type.toUpperCase()}
-                  </SelectItem>
-                ))}
+                {["http", "https", "socks4", "socks5", "ss", "vless"].map(
+                  (type) => (
+                    <SelectItem key={type} value={type}>
+                      {type === "ss"
+                        ? "Shadowsocks"
+                        : type === "vless"
+                          ? t("proxies.form.vlessType")
+                          : type.toUpperCase()}
+                    </SelectItem>
+                  ),
+                )}
               </SelectContent>
             </Select>
           </div>
 
-          <div className="grid grid-cols-2 gap-4">
+          {isVless ? (
             <div className="grid gap-2">
-              <Label htmlFor="proxy-host">{t("proxies.form.host")}</Label>
-              <Input
-                id="proxy-host"
-                value={form.host}
-                onChange={(e) => {
-                  setForm({ ...form, host: e.target.value });
-                }}
-                placeholder={t("proxies.form.hostPlaceholder")}
-                disabled={isSubmitting}
-              />
-            </div>
-
-            <div className="grid gap-2">
-              <Label htmlFor="proxy-port">{t("proxies.form.port")}</Label>
-              <Input
-                id="proxy-port"
-                type="number"
-                value={form.port}
-                onChange={(e) => {
-                  setForm({
-                    ...form,
-                    port: Number.parseInt(e.target.value, 10) || 0,
-                  });
-                }}
-                placeholder={t("proxies.form.portPlaceholder")}
-                min="1"
-                max="65535"
-                disabled={isSubmitting}
-              />
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 gap-4 @sm:grid-cols-2">
-            <div className="grid gap-2">
-              <Label htmlFor="proxy-username">
-                {form.proxy_type === "ss"
-                  ? t("proxies.form.cipher")
-                  : t("proxies.form.username")}
+              <Label htmlFor="proxy-vless-uri">
+                {t("proxies.form.vlessUri")}
               </Label>
-              <Input
-                id="proxy-username"
-                value={form.username}
+              <Textarea
+                id="proxy-vless-uri"
+                value={form.vless_uri}
                 onChange={(e) => {
-                  setForm({ ...form, username: e.target.value });
+                  setForm({ ...form, vless_uri: e.target.value });
                 }}
-                placeholder={
-                  form.proxy_type === "ss"
-                    ? t("proxies.form.cipherPlaceholder")
-                    : t("proxies.form.usernamePlaceholder")
+                onPaste={handleProxyPaste}
+                placeholder={t("proxies.form.vlessUriPlaceholder")}
+                disabled={isSubmitting}
+                aria-invalid={hasInvalidVlessUri}
+                aria-describedby="proxy-vless-uri-help"
+                autoCapitalize="none"
+                autoComplete="off"
+                spellCheck={false}
+                className="min-h-24 resize-y font-mono text-xs leading-relaxed"
+              />
+              <p
+                id="proxy-vless-uri-help"
+                className={
+                  hasInvalidVlessUri
+                    ? "text-xs text-destructive-text"
+                    : "text-xs text-muted-foreground"
                 }
-                disabled={isSubmitting}
-              />
+                role={hasInvalidVlessUri ? "alert" : undefined}
+              >
+                {hasInvalidVlessUri
+                  ? (vlessUnsupported ?? t("proxies.form.vlessUriInvalid"))
+                  : t("proxies.form.vlessUriHint")}
+              </p>
             </div>
+          ) : (
+            <>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="grid gap-2">
+                  <Label htmlFor="proxy-host">{t("proxies.form.host")}</Label>
+                  <Input
+                    id="proxy-host"
+                    value={form.host}
+                    onChange={(e) => {
+                      setForm({ ...form, host: e.target.value });
+                    }}
+                    onPaste={handleProxyPaste}
+                    placeholder={t("proxies.form.hostPlaceholder")}
+                    disabled={isSubmitting}
+                  />
+                </div>
 
-            <div className="grid gap-2">
-              <Label htmlFor="proxy-password">
-                {t("proxies.form.password")}
-              </Label>
-              <Input
-                id="proxy-password"
-                type="password"
-                value={form.password}
-                onChange={(e) => {
-                  setForm({ ...form, password: e.target.value });
-                }}
-                placeholder={t("proxies.form.passwordPlaceholder")}
-                disabled={isSubmitting}
-              />
-            </div>
-          </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="proxy-port">{t("proxies.form.port")}</Label>
+                  <Input
+                    id="proxy-port"
+                    type="number"
+                    value={form.port}
+                    onChange={(e) => {
+                      setForm({
+                        ...form,
+                        port: Number.parseInt(e.target.value, 10) || 0,
+                      });
+                    }}
+                    onPaste={handleProxyPaste}
+                    placeholder={t("proxies.form.portPlaceholder")}
+                    min="1"
+                    max="65535"
+                    disabled={isSubmitting}
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 gap-4 @sm:grid-cols-2">
+                <div className="grid gap-2">
+                  <Label htmlFor="proxy-username">
+                    {form.proxy_type === "ss"
+                      ? t("proxies.form.cipher")
+                      : t("proxies.form.username")}
+                  </Label>
+                  <Input
+                    id="proxy-username"
+                    value={form.username}
+                    onChange={(e) => {
+                      setForm({ ...form, username: e.target.value });
+                    }}
+                    placeholder={
+                      form.proxy_type === "ss"
+                        ? t("proxies.form.cipherPlaceholder")
+                        : t("proxies.form.usernamePlaceholder")
+                    }
+                    disabled={isSubmitting}
+                  />
+                </div>
+
+                <div className="grid gap-2">
+                  <Label htmlFor="proxy-password">
+                    {t("proxies.form.password")}
+                  </Label>
+                  <Input
+                    id="proxy-password"
+                    type="password"
+                    value={form.password}
+                    onChange={(e) => {
+                      setForm({ ...form, password: e.target.value });
+                    }}
+                    placeholder={t("proxies.form.passwordPlaceholder")}
+                    disabled={isSubmitting}
+                  />
+                </div>
+              </div>
+            </>
+          )}
         </div>
 
         <DialogFooter>

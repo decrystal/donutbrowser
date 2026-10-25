@@ -66,7 +66,17 @@ async fn setup_test() -> Result<std::path::PathBuf, Box<dyn std::error::Error + 
     .join("debug")
     .join(proxy_binary_name);
 
-  if !proxy_binary.exists() {
+  let binary_is_current = proxy_binary.exists()
+    && std::process::Command::new(&proxy_binary)
+      .arg("--version")
+      .output()
+      .is_ok_and(|output| {
+        output.status.success()
+          && String::from_utf8_lossy(&output.stdout).trim()
+            == format!("donut-proxy {}", env!("BUILD_VERSION"))
+      });
+
+  if !binary_is_current {
     println!("Building donut-proxy binary for integration tests...");
     let build_status = std::process::Command::new("cargo")
       .args(["build", "--bin", "donut-proxy"])
@@ -127,6 +137,300 @@ impl Drop for ProxyTestTracker {
   }
 }
 
+#[tokio::test]
+#[serial]
+async fn test_sidecar_reports_build_version() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
+  let binary_path = setup_test().await?;
+  let output = TestUtils::execute_command(&binary_path, &["--version"]).await?;
+
+  assert!(
+    output.status.success(),
+    "donut-proxy --version failed: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  assert_eq!(
+    String::from_utf8(output.stdout)?.trim(),
+    format!("donut-proxy {}", env!("BUILD_VERSION"))
+  );
+  Ok(())
+}
+
+struct XrayChainCleanup {
+  outer_id: Option<String>,
+  xray_id: Option<String>,
+}
+
+impl XrayChainCleanup {
+  fn new() -> Self {
+    Self {
+      outer_id: None,
+      xray_id: None,
+    }
+  }
+
+  async fn cleanup(&mut self) {
+    if let Some(id) = self.outer_id.take() {
+      let _ = donutbrowser_lib::proxy_runner::stop_proxy_process(&id).await;
+    }
+    if let Some(id) = self.xray_id.take() {
+      let _ = donutbrowser_lib::xray_worker_runner::stop_xray_worker(&id).await;
+    }
+  }
+}
+
+impl Drop for XrayChainCleanup {
+  fn drop(&mut self) {
+    fn terminate_process_tree(pid: u32) {
+      #[cfg(unix)]
+      {
+        let _ = std::process::Command::new("kill")
+          .args(["-TERM", &format!("-{pid}")])
+          .output();
+      }
+      #[cfg(windows)]
+      {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let _ = std::process::Command::new("taskkill")
+          .args(["/T", "/F", "/PID", &pid.to_string()])
+          .creation_flags(CREATE_NO_WINDOW)
+          .output();
+      }
+    }
+
+    if let Some(id) = self.outer_id.take() {
+      if let Some(config) = donutbrowser_lib::proxy_storage::get_proxy_config(&id) {
+        if let Some(pid) = config.pid {
+          terminate_process_tree(pid);
+        }
+      }
+      donutbrowser_lib::proxy_storage::delete_proxy_config(&id);
+    }
+    if let Some(id) = self.xray_id.take() {
+      if let Some(config) = donutbrowser_lib::xray_worker_storage::get_xray_worker_config(&id) {
+        if let Some(pid) = config.pid {
+          terminate_process_tree(pid);
+        }
+      }
+      donutbrowser_lib::xray_worker_storage::delete_xray_worker_config(&id);
+    }
+  }
+}
+
+struct EnvironmentRestore {
+  name: &'static str,
+  previous: Option<std::ffi::OsString>,
+}
+
+impl EnvironmentRestore {
+  fn set_path(name: &'static str, value: &std::path::Path) -> Self {
+    let previous = std::env::var_os(name);
+    std::env::set_var(name, value);
+    Self { name, previous }
+  }
+}
+
+impl Drop for EnvironmentRestore {
+  fn drop(&mut self) {
+    if let Some(previous) = &self.previous {
+      std::env::set_var(self.name, previous);
+    } else {
+      std::env::remove_var(self.name);
+    }
+  }
+}
+
+/// End-to-end VLESS + XTLS Vision + REALITY test.
+///
+/// This is intentionally opt-in because it requires a live official Xray-core
+/// server. Set `DONUT_E2E_VLESS_URI`; optionally set
+/// `DONUT_E2E_XRAY_TARGET_URL` to a controlled plain-HTTP endpoint. When the
+/// VLESS endpoint itself is loopback, the test supplies an isolated local HTTP
+/// target automatically.
+#[tokio::test]
+#[serial]
+async fn test_xray_reality_chain_and_local_traffic_monitoring(
+) -> Result<(), Box<dyn std::error::Error>> {
+  let Some(vless_uri) = std::env::var("DONUT_E2E_VLESS_URI")
+    .ok()
+    .filter(|value| !value.is_empty())
+  else {
+    println!("skipping Xray-core integration test: DONUT_E2E_VLESS_URI is not set");
+    return Ok(());
+  };
+
+  let parsed = donutbrowser_lib::xray::parse_vless_uri(&vless_uri)?;
+  let endpoint_is_loopback = parsed.config.address == "localhost"
+    || parsed
+      .config
+      .address
+      .parse::<std::net::IpAddr>()
+      .is_ok_and(|address| address.is_loopback());
+  let mut local_target = None;
+  let target_url = if let Ok(url) = std::env::var("DONUT_E2E_XRAY_TARGET_URL") {
+    url
+  } else if endpoint_is_loopback {
+    let (port, server) = start_mock_http_server("XRAY-REALITY-INTEGRATION-OK").await;
+    local_target = Some(server);
+    format!("http://127.0.0.1:{port}/xray-reality")
+  } else {
+    "http://httpbin.org/anything".to_string()
+  };
+  let target = url::Url::parse(&target_url)?;
+  if target.scheme() != "http" {
+    return Err(
+      "DONUT_E2E_XRAY_TARGET_URL must use plain HTTP for exact payload accounting".into(),
+    );
+  }
+  let target_host = target.host_str().ok_or("Xray target URL has no host")?;
+  let target_port = target
+    .port_or_known_default()
+    .ok_or("Xray target URL has no port")?;
+  let host_header = if target_port == 80 {
+    target_host.to_string()
+  } else {
+    format!("{target_host}:{target_port}")
+  };
+
+  let isolated_root = tempfile::tempdir()?;
+  let _data_root = EnvironmentRestore::set_path("DONUTBROWSER_DATA_ROOT", isolated_root.path());
+  let _binary_path = setup_test().await.map_err(|error| error.to_string())?;
+  let profile_id = format!("xray-integration-{}", uuid::Uuid::new_v4());
+  let payload = b"donut-xray-monitor-payload";
+  let mut cleanup = XrayChainCleanup::new();
+
+  let (first_worker, concurrent_worker) = tokio::join!(
+    donutbrowser_lib::xray_worker_runner::start_xray_worker(Some(&profile_id), &vless_uri),
+    donutbrowser_lib::xray_worker_runner::start_xray_worker(Some(&profile_id), &vless_uri),
+  );
+  let xray_worker = first_worker?;
+  let concurrent_worker = concurrent_worker?;
+  assert_eq!(
+    concurrent_worker.id, xray_worker.id,
+    "concurrent starts for one profile must reuse one Xray worker"
+  );
+  cleanup.xray_id = Some(xray_worker.id.clone());
+
+  let upstream_url = format!(
+    "socks5://{}:{}@127.0.0.1:{}",
+    urlencoding::encode(&xray_worker.username),
+    urlencoding::encode(&xray_worker.password),
+    xray_worker.local_port
+  );
+  let mut outer = donutbrowser_lib::proxy_runner::start_proxy_process_with_profile(
+    Some(upstream_url),
+    None,
+    Some(profile_id.clone()),
+    Vec::new(),
+    None,
+    false,
+    Some("http".to_string()),
+  )
+  .await?;
+  cleanup.outer_id = Some(outer.id.clone());
+  outer.browser_pid = Some(std::process::id());
+  assert!(
+    donutbrowser_lib::proxy_storage::update_proxy_config(&outer),
+    "outer traffic-monitor config should remain writable"
+  );
+
+  let local_port = outer.local_port.ok_or("outer proxy has no local port")?;
+  let request = format!(
+    "POST {target_url} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: \
+     application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+    payload.len()
+  );
+  let mut stream = TcpStream::connect(("127.0.0.1", local_port)).await?;
+  stream.write_all(request.as_bytes()).await?;
+  stream.write_all(payload).await?;
+  let mut response = Vec::new();
+  tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut response))
+    .await
+    .map_err(|_| "HTTP request through Xray-core timed out")??;
+
+  let header_end = response
+    .windows(4)
+    .position(|window| window == b"\r\n\r\n")
+    .map(|position| position + 4)
+    .ok_or("proxy returned an invalid HTTP response")?;
+  let status_line = String::from_utf8_lossy(&response[..header_end])
+    .lines()
+    .next()
+    .unwrap_or_default()
+    .to_string();
+  if !status_line.contains(" 200 ") {
+    return Err(
+      format!(
+        "HTTP request through Xray-core failed ({status_line}): {}",
+        String::from_utf8_lossy(&response[header_end..])
+      )
+      .into(),
+    );
+  }
+  let response_body = &response[header_end..];
+  if endpoint_is_loopback && std::env::var_os("DONUT_E2E_XRAY_TARGET_URL").is_none() {
+    assert_eq!(response_body, b"XRAY-REALITY-INTEGRATION-OK");
+  } else {
+    assert!(
+      !response_body.is_empty(),
+      "controlled Xray target returned an empty body"
+    );
+  }
+
+  let stats = tokio::time::timeout(Duration::from_secs(10), async {
+    loop {
+      if let Some(stats) = donutbrowser_lib::traffic_stats::load_traffic_stats(&profile_id) {
+        if stats.total_requests > 0 {
+          break stats;
+        }
+      }
+      sleep(Duration::from_millis(100)).await;
+    }
+  })
+  .await
+  .map_err(|_| "traffic monitor did not flush Xray session statistics")?;
+
+  assert_eq!(stats.total_requests, 1);
+  assert_eq!(stats.total_bytes_sent, payload.len() as u64);
+  assert_eq!(stats.total_bytes_received, response_body.len() as u64);
+  let domain = stats
+    .domains
+    .get(target_host)
+    .ok_or("traffic monitor did not attribute the target domain")?;
+  assert_eq!(domain.request_count, 1);
+  assert_eq!(domain.bytes_sent, payload.len() as u64);
+  assert_eq!(domain.bytes_received, response_body.len() as u64);
+
+  let outer_id = outer.id.clone();
+  let outer_pid = outer.pid;
+  let xray_id = xray_worker.id.clone();
+  let supervisor_pid = xray_worker.pid;
+  let xray_pid = xray_worker.xray_pid;
+  cleanup.cleanup().await;
+  if let Some(server) = local_target.take() {
+    server.abort();
+  }
+
+  assert!(donutbrowser_lib::proxy_storage::get_proxy_config(&outer_id).is_none());
+  assert!(donutbrowser_lib::xray_worker_storage::get_xray_worker_config(&xray_id).is_none());
+  assert!(!donutbrowser_lib::xray_worker_storage::xray_runtime_config_path(&xray_id).exists());
+  for pid in [outer_pid, supervisor_pid, xray_pid].into_iter().flatten() {
+    for _ in 0..20 {
+      if !donutbrowser_lib::proxy_storage::is_process_running(pid) {
+        break;
+      }
+      sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+      !donutbrowser_lib::proxy_storage::is_process_running(pid),
+      "worker process {pid} survived cleanup"
+    );
+  }
+
+  Ok(())
+}
+
 /// Test starting a local proxy without upstream proxy (DIRECT)
 #[tokio::test]
 #[serial]
@@ -160,15 +464,10 @@ async fn test_local_proxy_direct() -> Result<(), Box<dyn std::error::Error + Sen
   );
 
   // Verify proxy is listening
-  sleep(Duration::from_millis(500)).await;
-  match TcpStream::connect(("127.0.0.1", local_port)).await {
-    Ok(_) => {
-      println!("Proxy is listening on port {local_port}");
-    }
-    Err(e) => {
-      return Err(format!("Proxy port {local_port} is not listening: {e}").into());
-    }
+  if !wait_for_port_open(local_port, Duration::from_secs(10)).await {
+    return Err(format!("Proxy port {local_port} is not listening").into());
   }
+  println!("Proxy is listening on port {local_port}");
 
   // Test making an HTTP request through the proxy
   let mut stream = TcpStream::connect(("127.0.0.1", local_port)).await?;
@@ -220,11 +519,10 @@ async fn test_chained_local_proxies() -> Result<(), Box<dyn std::error::Error + 
   println!("First proxy started on port {}", proxy1_port);
 
   // Wait for first proxy to be ready
-  sleep(Duration::from_millis(500)).await;
-  match TcpStream::connect(("127.0.0.1", proxy1_port)).await {
-    Ok(_) => println!("First proxy is ready"),
-    Err(e) => return Err(format!("First proxy not ready: {e}").into()),
+  if !wait_for_port_open(proxy1_port, Duration::from_secs(10)).await {
+    return Err("First proxy not ready".into());
   }
+  println!("First proxy is ready");
 
   // Start second proxy chained to first proxy
   let output2 = TestUtils::execute_command(
@@ -261,11 +559,10 @@ async fn test_chained_local_proxies() -> Result<(), Box<dyn std::error::Error + 
   );
 
   // Wait for second proxy to be ready
-  sleep(Duration::from_millis(500)).await;
-  match TcpStream::connect(("127.0.0.1", proxy2_port)).await {
-    Ok(_) => println!("Second proxy is ready"),
-    Err(e) => return Err(format!("Second proxy not ready: {e}").into()),
+  if !wait_for_port_open(proxy2_port, Duration::from_secs(10)).await {
+    return Err("Second proxy not ready".into());
   }
+  println!("Second proxy is ready");
 
   // Test making an HTTP request through the chained proxy
   let mut stream = TcpStream::connect(("127.0.0.1", proxy2_port)).await?;
@@ -365,16 +662,11 @@ async fn test_local_proxy_with_http_upstream(
   println!("Proxy started: id={}, port={}", proxy_id, local_port);
 
   // Verify proxy is listening
-  sleep(Duration::from_millis(500)).await;
-  match TcpStream::connect(("127.0.0.1", local_port)).await {
-    Ok(_) => {
-      println!("Proxy is listening on port {local_port}");
-    }
-    Err(e) => {
-      upstream_handle.abort();
-      return Err(format!("Proxy port {local_port} is not listening: {e}").into());
-    }
+  if !wait_for_port_open(local_port, Duration::from_secs(10)).await {
+    upstream_handle.abort();
+    return Err(format!("Proxy port {local_port} is not listening").into());
   }
+  println!("Proxy is listening on port {local_port}");
 
   // Cleanup
   tracker.cleanup_all().await;
@@ -651,11 +943,10 @@ async fn test_proxy_stop() -> Result<(), Box<dyn std::error::Error + Send + Sync
   let local_port = config["localPort"].as_u64().unwrap() as u16;
 
   // Verify proxy is running
-  sleep(Duration::from_millis(500)).await;
-  match TcpStream::connect(("127.0.0.1", local_port)).await {
-    Ok(_) => println!("Proxy is running"),
-    Err(_) => return Err("Proxy is not running".into()),
+  if !wait_for_port_open(local_port, Duration::from_secs(10)).await {
+    return Err("Proxy is not running".into());
   }
+  println!("Proxy is running");
 
   // Stop the proxy
   let stop_output =
@@ -665,14 +956,11 @@ async fn test_proxy_stop() -> Result<(), Box<dyn std::error::Error + Send + Sync
     return Err("Failed to stop proxy".into());
   }
 
-  // Wait a bit for the process to exit
-  sleep(Duration::from_millis(500)).await;
-
   // Verify proxy is stopped (connection should fail)
-  match TcpStream::connect(("127.0.0.1", local_port)).await {
-    Ok(_) => return Err("Proxy should be stopped but is still listening".into()),
-    Err(_) => println!("Proxy successfully stopped"),
+  if !wait_for_port_closed(local_port, Duration::from_secs(10)).await {
+    return Err("Proxy should be stopped but is still listening".into());
   }
+  println!("Proxy successfully stopped");
 
   Ok(())
 }
@@ -1308,10 +1596,8 @@ async fn test_local_proxy_with_shadowsocks_upstream(
   let binary_path = setup_test().await?;
   let mut tracker = ProxyTestTracker::new(binary_path.clone());
 
-  // Check Docker availability
-  let docker_check = std::process::Command::new("docker").arg("version").output();
-  if docker_check.map(|o| !o.status.success()).unwrap_or(true) {
-    eprintln!("skipping Shadowsocks e2e test because Docker is unavailable");
+  if !common::docker_supports_linux_containers() {
+    eprintln!("skipping Shadowsocks e2e test because Docker cannot run Linux containers");
     return Ok(());
   }
 
@@ -1360,9 +1646,8 @@ async fn test_local_proxy_with_shadowsocks_upstream(
   }
 
   // Start donut-proxy with Shadowsocks upstream
-  let output = TestUtils::execute_command(
-    &binary_path,
-    &[
+  let output = tokio::process::Command::new(&binary_path)
+    .args([
       "proxy",
       "start",
       "--host",
@@ -1371,13 +1656,11 @@ async fn test_local_proxy_with_shadowsocks_upstream(
       &ss_port.to_string(),
       "--type",
       "ss",
-      "--username",
-      ss_method,
-      "--password",
-      ss_password,
-    ],
-  )
-  .await?;
+    ])
+    .env("DONUT_PROXY_USERNAME", ss_method)
+    .env("DONUT_PROXY_PASSWORD", ss_password)
+    .output()
+    .await?;
 
   if !output.status.success() {
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1427,5 +1710,265 @@ async fn test_local_proxy_with_shadowsocks_upstream(
     .args(["rm", "-f", ss_container])
     .output();
 
+  Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Worker lifecycle: a detached donut-proxy must die with the browser it serves,
+// with no help from the GUI. These drive a REAL worker process end to end —
+// the unit tests cover the decision table, these prove the process actually
+// exits and cleans up after itself.
+//
+// The watchdog polls every 15s in production; the tests shorten it via
+// DONUT_PROXY_WATCHDOG_INTERVAL_MS so a reap is observable in seconds.
+// ---------------------------------------------------------------------------
+
+const TEST_WATCHDOG_INTERVAL_MS: &str = "300";
+
+/// A long-lived process standing in for a browser, reaped on drop so a failing
+/// assertion can never leave one behind.
+struct StubBrowser {
+  child: std::process::Child,
+}
+
+impl StubBrowser {
+  fn spawn() -> Self {
+    let mut command = if cfg!(windows) {
+      let mut c = std::process::Command::new("cmd");
+      c.args(["/C", "ping -n 600 127.0.0.1 >NUL"]);
+      c
+    } else {
+      let mut c = std::process::Command::new("sleep");
+      c.arg("600");
+      c
+    };
+    let child = command
+      .stdin(std::process::Stdio::null())
+      .stdout(std::process::Stdio::null())
+      .stderr(std::process::Stdio::null())
+      .spawn()
+      .expect("failed to spawn stub browser");
+    Self { child }
+  }
+
+  fn pid(&self) -> u32 {
+    self.child.id()
+  }
+
+  /// Kill and reap, so the PID is genuinely gone before the worker looks at it.
+  /// A zombie still resolves in the process table and would mask the reap.
+  fn terminate(&mut self) {
+    let _ = self.child.kill();
+    let _ = self.child.wait();
+  }
+}
+
+impl Drop for StubBrowser {
+  fn drop(&mut self) {
+    self.terminate();
+  }
+}
+
+/// Wait for a port to start accepting connections.
+///
+/// `proxy start` returns once the worker is spawned, not once it has bound its
+/// listener, so a fixed sleep is a bet on how fast the runner is. Poll instead.
+async fn wait_for_port_open(port: u16, timeout: Duration) -> bool {
+  let deadline = std::time::Instant::now() + timeout;
+  while std::time::Instant::now() < deadline {
+    if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+      return true;
+    }
+    sleep(Duration::from_millis(100)).await;
+  }
+  false
+}
+
+/// Wait for a listening port to stop accepting connections.
+///
+/// `proxy stop` returns once the worker has been told to exit, not once it has
+/// actually gone, so the listener can outlive the command by however long the
+/// process takes to unwind. That gap is invisible on an idle laptop and lands
+/// squarely on a loaded CI runner, so poll to a deadline rather than sleeping a
+/// fixed amount and hoping. Returns false if it is still accepting at the end.
+async fn wait_for_port_closed(port: u16, timeout: Duration) -> bool {
+  let deadline = std::time::Instant::now() + timeout;
+  while std::time::Instant::now() < deadline {
+    if TcpStream::connect(("127.0.0.1", port)).await.is_err() {
+      return true;
+    }
+    sleep(Duration::from_millis(100)).await;
+  }
+  false
+}
+
+/// Wait for a worker to remove its own config, which it does immediately before
+/// exiting. Returns false if it is still there when the deadline passes.
+async fn wait_for_worker_exit(proxy_id: &str, timeout: Duration) -> bool {
+  let deadline = std::time::Instant::now() + timeout;
+  while std::time::Instant::now() < deadline {
+    if donutbrowser_lib::proxy_storage::get_proxy_config(proxy_id).is_none() {
+      return true;
+    }
+    sleep(Duration::from_millis(100)).await;
+  }
+  false
+}
+
+/// Start a direct worker with the short watchdog interval and return its config.
+async fn start_lifecycle_worker(
+  profile_id: &str,
+) -> Result<donutbrowser_lib::proxy_storage::ProxyConfig, Box<dyn std::error::Error + Send + Sync>>
+{
+  std::env::set_var(
+    "DONUT_PROXY_WATCHDOG_INTERVAL_MS",
+    TEST_WATCHDOG_INTERVAL_MS,
+  );
+  donutbrowser_lib::proxy_runner::start_proxy_process_with_profile(
+    None,
+    None,
+    Some(profile_id.to_string()),
+    Vec::new(),
+    None,
+    false,
+    Some("http".to_string()),
+  )
+  .await
+  .map_err(|error| error.to_string().into())
+}
+
+/// Record the owning browser on a worker's config the way the GUI does: the PID
+/// plus the start time that pins it to that exact process.
+fn claim_worker_for(proxy_id: &str, browser_pid: u32) -> bool {
+  let Some(mut config) = donutbrowser_lib::proxy_storage::get_proxy_config(proxy_id) else {
+    return false;
+  };
+  let Some(start_time) = donutbrowser_lib::proxy_storage::resolve_process_start_time(browser_pid)
+  else {
+    return false;
+  };
+  config.browser_pid = Some(browser_pid);
+  config.browser_pid_start_time = Some(start_time);
+  donutbrowser_lib::proxy_storage::update_proxy_config(&config)
+}
+
+/// A worker whose browser exits must terminate itself and delete its config,
+/// with no GUI involved. This is the whole contract behind "no orphaned
+/// donut-proxy after closing the browser".
+#[tokio::test]
+#[serial]
+async fn worker_reaps_itself_when_its_browser_exits(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+  let _binary_path = setup_test().await?;
+  let config = start_lifecycle_worker("lifecycle-browser-exit").await?;
+  let mut tracker = ProxyTestTracker::new(_binary_path.clone());
+  tracker.track_proxy(config.id.clone());
+
+  let mut stub = StubBrowser::spawn();
+  assert!(
+    claim_worker_for(&config.id, stub.pid()),
+    "the worker must accept a live browser as its owner"
+  );
+
+  let owner = donutbrowser_lib::proxy_storage::get_proxy_config(&config.id)
+    .ok_or("worker config vanished before the browser exited")?;
+  assert_eq!(owner.browser_pid, Some(stub.pid()));
+  assert!(
+    owner.browser_pid_start_time.is_some(),
+    "the owner PID must be pinned to a start time"
+  );
+
+  // While the browser lives, the worker must stay: a worker that reaps itself
+  // out from under a running browser is a far worse bug than an orphan.
+  sleep(Duration::from_millis(1500)).await;
+  assert!(
+    donutbrowser_lib::proxy_storage::get_proxy_config(&config.id).is_some(),
+    "worker exited while its browser was still running"
+  );
+
+  let worker_pid = config.pid.ok_or("worker did not report a PID")?;
+  stub.terminate();
+
+  assert!(
+    wait_for_worker_exit(&config.id, Duration::from_secs(20)).await,
+    "worker did not clean up its config after its browser exited"
+  );
+  let mut process_gone = false;
+  for _ in 0..100 {
+    if !donutbrowser_lib::proxy_storage::is_process_running(worker_pid) {
+      process_gone = true;
+      break;
+    }
+    sleep(Duration::from_millis(100)).await;
+  }
+  assert!(
+    process_gone,
+    "worker process {worker_pid} is still in memory after its browser exited"
+  );
+
+  tracker.cleanup_all().await;
+  Ok(())
+}
+
+/// The orphan users actually reported: the browser is gone but its PID has been
+/// handed to some other process. Existence alone reads as "my browser is alive"
+/// and the worker never exits, so the owner is pinned by start time instead.
+#[tokio::test]
+#[serial]
+async fn worker_reaps_itself_when_its_browser_pid_is_recycled(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+  let binary_path = setup_test().await?;
+  let config = start_lifecycle_worker("lifecycle-pid-reuse").await?;
+  let mut tracker = ProxyTestTracker::new(binary_path);
+  tracker.track_proxy(config.id.clone());
+
+  // A live PID with someone else's start time is exactly what a recycled PID
+  // looks like from the worker's side.
+  let stub = StubBrowser::spawn();
+  let mut owner = donutbrowser_lib::proxy_storage::get_proxy_config(&config.id)
+    .ok_or("worker config missing after start")?;
+  owner.browser_pid = Some(stub.pid());
+  owner.browser_pid_start_time = Some(1);
+  assert!(donutbrowser_lib::proxy_storage::update_proxy_config(&owner));
+
+  assert!(
+    wait_for_worker_exit(&config.id, Duration::from_secs(20)).await,
+    "worker kept serving a PID that no longer belongs to its browser"
+  );
+
+  drop(stub);
+  tracker.cleanup_all().await;
+  Ok(())
+}
+
+/// Deleting a worker's config is how the GUI stops it. The worker must notice
+/// and exit even though nothing signalled it.
+#[tokio::test]
+#[serial]
+async fn worker_exits_when_its_config_is_deleted(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+  let binary_path = setup_test().await?;
+  let config = start_lifecycle_worker("lifecycle-config-deleted").await?;
+  let tracker = ProxyTestTracker::new(binary_path);
+  let worker_pid = config.pid.ok_or("worker did not report a PID")?;
+
+  assert!(donutbrowser_lib::proxy_storage::delete_proxy_config(
+    &config.id
+  ));
+
+  let mut process_gone = false;
+  for _ in 0..200 {
+    if !donutbrowser_lib::proxy_storage::is_process_running(worker_pid) {
+      process_gone = true;
+      break;
+    }
+    sleep(Duration::from_millis(100)).await;
+  }
+  assert!(
+    process_gone,
+    "worker process {worker_pid} survived deletion of its config"
+  );
+
+  tracker.cleanup_all().await;
   Ok(())
 }

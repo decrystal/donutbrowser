@@ -292,11 +292,11 @@ fn create_test_storage(temp_dir: &tempfile::TempDir) -> VpnStorage {
 #[serial]
 async fn test_wireguard_tunnel_init() {
   let config = WireGuardConfig {
-    private_key: "YEocP0e2o1WT5GlvBvQzVF7EeR6z9aCk+ZdZ5NKEuXA=".to_string(),
+    private_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
     address: "10.0.0.2/24".to_string(),
     dns: Some("1.1.1.1".to_string()),
     mtu: None,
-    peer_public_key: "aGnF7JlG+U5t0BqB1PVf1yOuELHrWLGGcUJb0eCK9Aw=".to_string(),
+    peer_public_key: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".to_string(),
     peer_endpoint: "127.0.0.1:51820".to_string(),
     allowed_ips: vec!["0.0.0.0/0".to_string()],
     persistent_keepalive: Some(25),
@@ -627,6 +627,37 @@ async fn cleanup_runtime() {
   test_harness::stop_vpn_servers().await;
 }
 
+/// Request through the proxy until the tunnel behind it actually carries the
+/// traffic, or the deadline passes.
+///
+/// Returns the last response either way, so a genuine failure still asserts
+/// against the real body rather than a timeout message.
+async fn wait_for_tunnel(
+  local_port: u16,
+  url: &str,
+  host_header: &str,
+  timeout: Duration,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+  let deadline = tokio::time::Instant::now() + timeout;
+
+  loop {
+    let last = match raw_http_request_via_proxy(local_port, url, host_header).await {
+      Ok(response) => {
+        if response.contains("WG-TUNNEL-OK") {
+          return Ok(response);
+        }
+        response
+      }
+      Err(e) => format!("request error: {e}"),
+    };
+
+    if tokio::time::Instant::now() >= deadline {
+      return Ok(last);
+    }
+    sleep(Duration::from_millis(250)).await;
+  }
+}
+
 async fn wait_for_file(
   path: &std::path::Path,
   timeout: Duration,
@@ -661,12 +692,22 @@ async fn run_proxy_feature_suite(
   let proxy =
     start_proxy_with_upstream(binary_path, &vpn_upstream, &[], None, Some(&profile_id)).await?;
 
-  sleep(Duration::from_millis(500)).await;
-
   let internal_url = format!("http://{}:8080/", server_tunnel_ip);
   let internal_host = format!("{}:8080", server_tunnel_ip);
-  let http_response =
-    raw_http_request_via_proxy(proxy.local_port, &internal_url, &internal_host).await?;
+
+  // The proxy answers as soon as it is listening, but the route behind it is
+  // not ready until the WireGuard handshake completes and the in-tunnel server
+  // accepts. A fixed sleep raced that on a loaded runner and came back
+  // `502 Bad Gateway`, which is the tunnel not being up yet rather than
+  // anything under test being wrong. Poll to a deadline instead, the same way
+  // `wait_for_file` does below.
+  let http_response = wait_for_tunnel(
+    proxy.local_port,
+    &internal_url,
+    &internal_host,
+    Duration::from_secs(20),
+  )
+  .await?;
   assert!(
     http_response.contains("WG-TUNNEL-OK"),
     "HTTP traffic through donut-proxy+VPN tunnel should succeed, got: {}",
@@ -775,18 +816,14 @@ async fn test_wireguard_traffic_flows_through_donut_proxy(
 
   cleanup_runtime().await;
   if !test_harness::is_docker_available() {
-    eprintln!("skipping WireGuard e2e test because Docker is unavailable");
+    eprintln!("skipping WireGuard e2e test because Docker cannot run Linux containers");
     return Ok(());
   }
 
   let binary_path = ensure_donut_proxy_binary().await?;
-  let wg_config = match test_harness::start_wireguard_server().await {
-    Ok(config) => config,
-    Err(error) => {
-      eprintln!("skipping WireGuard e2e test: {error}");
-      return Ok(());
-    }
-  };
+  let wg_config = test_harness::start_wireguard_server()
+    .await
+    .map_err(|error| format!("failed to start Docker WireGuard fixture: {error}"))?;
 
   let vpn_config = new_test_vpn_config(
     "WireGuard E2E",

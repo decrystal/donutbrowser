@@ -87,6 +87,10 @@ pub struct AppReleaseAsset {
   pub name: String,
   pub browser_download_url: String,
   pub size: u64,
+  /// GitHub-computed digest ("sha256:<hex>"); absent on assets uploaded
+  /// before GitHub started calculating digests.
+  #[serde(default)]
+  pub digest: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -111,6 +115,15 @@ pub struct AppUpdateInfo {
   pub release_page_url: Option<String>,
   /// True when a system package manager repo is configured (apt/dnf/zypper)
   pub repo_update: bool,
+  /// URL of the release's SHA256SUMS.txt asset. The downloaded update is
+  /// verified against it before installation; without it the update is
+  /// refused.
+  #[serde(default)]
+  pub checksums_url: Option<String>,
+  /// GitHub's server-side digest of the chosen asset ("sha256:<hex>"),
+  /// cross-checked in addition to SHA256SUMS.txt when present.
+  #[serde(default)]
+  pub asset_digest: Option<String>,
 }
 
 pub struct AppAutoUpdater {
@@ -214,6 +227,35 @@ impl AppAutoUpdater {
       // Find the appropriate asset for current platform
       let download_url = self.get_download_url_for_platform(&latest_release.assets);
 
+      // Locate the release's checksums file and the chosen asset's
+      // GitHub-computed digest for post-download verification.
+      let checksums_url = Self::find_checksums_url(&latest_release.assets);
+      let asset_digest = download_url.as_deref().and_then(|url| {
+        latest_release
+          .assets
+          .iter()
+          .find(|a| a.browser_download_url == url)
+          .and_then(|a| a.digest.clone())
+      });
+
+      // Both release workflows upload SHA256SUMS.txt only after every platform
+      // build finishes, so a release without it is still being assembled (or
+      // its pipeline broke). Downloading now is guaranteed to fail closed, so
+      // treat the release as not ready and retry on a later check instead of
+      // surfacing an error for a healthy in-progress release. Applies only to
+      // the auto-download path — manual/repo notifications don't download.
+      let auto_download_possible = download_url.is_some();
+      #[cfg(target_os = "linux")]
+      let auto_download_possible = auto_download_possible && !self.is_repo_configured();
+      if auto_download_possible && checksums_url.is_none() {
+        log::info!(
+          "Release {} has no {} yet; treating as not ready for auto-update",
+          latest_release.tag_name,
+          Self::CHECKSUMS_ASSET_NAME
+        );
+        return Ok(None);
+      }
+
       // On Linux, when a package repo is configured, notify users to update via
       // their package manager instead of auto-downloading from GitHub.
       #[cfg(target_os = "linux")]
@@ -230,6 +272,8 @@ impl AppAutoUpdater {
           manual_update_required,
           release_page_url: Some(release_page_url),
           repo_update,
+          checksums_url,
+          asset_digest,
         };
 
         log::info!(
@@ -255,6 +299,8 @@ impl AppAutoUpdater {
             manual_update_required: false,
             release_page_url: Some(release_page_url),
             repo_update: false,
+            checksums_url,
+            asset_digest,
           };
 
           log::info!(
@@ -712,6 +758,156 @@ impl AppAutoUpdater {
     None
   }
 
+  /// Name of the checksums asset both release workflows publish.
+  const CHECKSUMS_ASSET_NAME: &'static str = "SHA256SUMS.txt";
+
+  fn find_checksums_url(assets: &[AppReleaseAsset]) -> Option<String> {
+    assets
+      .iter()
+      .find(|a| a.name == Self::CHECKSUMS_ASSET_NAME)
+      .map(|a| a.browser_download_url.clone())
+  }
+
+  /// Extract the hex digest for `filename` from standard `sha256sum` output
+  /// (`<hex>  <name>`, optionally with the `*` binary-mode marker).
+  fn find_checksum_for_file(checksums_text: &str, filename: &str) -> Option<String> {
+    checksums_text.lines().find_map(|line| {
+      let (hash, rest) = line.split_once(char::is_whitespace)?;
+      let name = rest.trim_start().trim_start_matches('*');
+      if name == filename && hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(hash.to_ascii_lowercase())
+      } else {
+        None
+      }
+    })
+  }
+
+  fn sha256_file(path: &Path) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+      let n = file.read(&mut buf)?;
+      if n == 0 {
+        break;
+      }
+      hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+      use std::fmt::Write;
+      let _ = write!(hex, "{byte:02x}");
+    }
+    Ok(hex)
+  }
+
+  /// Fetch the release's SHA256SUMS.txt and return the expected digest for
+  /// `filename`. Called BEFORE the (large) asset download so an unverifiable
+  /// release is rejected without wasting the transfer. Every failure mode
+  /// maps to the UPDATE_CHECKSUMS_UNAVAILABLE code; details go to the log.
+  async fn fetch_expected_checksum(
+    &self,
+    update_info: &AppUpdateInfo,
+    filename: &str,
+  ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let unavailable = || -> Box<dyn std::error::Error + Send + Sync> {
+      serde_json::json!({
+        "code": "UPDATE_CHECKSUMS_UNAVAILABLE",
+        "params": { "version": update_info.new_version }
+      })
+      .to_string()
+      .into()
+    };
+
+    let Some(checksums_url) = update_info.checksums_url.as_deref() else {
+      log::warn!(
+        "No {} asset on release {}",
+        Self::CHECKSUMS_ASSET_NAME,
+        update_info.new_version
+      );
+      return Err(unavailable());
+    };
+
+    let response = match self
+      .client
+      .get(checksums_url)
+      .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
+      .send()
+      .await
+    {
+      Ok(response) if response.status().is_success() => response,
+      Ok(response) => {
+        log::warn!("Checksums file request failed: HTTP {}", response.status());
+        return Err(unavailable());
+      }
+      Err(e) => {
+        log::warn!("Checksums file request failed: {e}");
+        return Err(unavailable());
+      }
+    };
+
+    let checksums_text = match response.text().await {
+      Ok(text) => text,
+      Err(e) => {
+        log::warn!("Failed to read checksums file: {e}");
+        return Err(unavailable());
+      }
+    };
+
+    let Some(expected) = Self::find_checksum_for_file(&checksums_text, filename) else {
+      log::warn!(
+        "No checksum entry for {filename} in {}",
+        Self::CHECKSUMS_ASSET_NAME
+      );
+      return Err(unavailable());
+    };
+    Ok(expected)
+  }
+
+  /// Verify the downloaded update against the expected SHA256SUMS.txt digest
+  /// (and GitHub's server-side asset digest when available) before anything
+  /// is extracted or installed. A corrupt download is deleted so the next
+  /// attempt starts fresh.
+  fn verify_update_checksum(
+    file_path: &Path,
+    filename: &str,
+    expected: &str,
+    asset_digest: Option<&str>,
+  ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let actual = Self::sha256_file(file_path)?;
+
+    let mut mismatch = !actual.eq_ignore_ascii_case(expected);
+
+    // Cross-check GitHub's server-side digest: SHA256SUMS.txt is computed by
+    // re-downloading assets in CI, so this catches corruption in that step.
+    if !mismatch {
+      if let Some(hex) = asset_digest.and_then(|d| d.strip_prefix("sha256:")) {
+        mismatch = !actual.eq_ignore_ascii_case(hex);
+      }
+    }
+
+    if mismatch {
+      log::error!(
+        "Checksum mismatch for {filename}: expected {expected}, got {actual} (asset digest: {asset_digest:?})"
+      );
+      let _ = fs::remove_file(file_path);
+      return Err(
+        serde_json::json!({
+          "code": "UPDATE_CHECKSUM_MISMATCH",
+          "params": { "file": filename }
+        })
+        .to_string()
+        .into(),
+      );
+    }
+
+    log::info!("Checksum verified for {filename}: {actual}");
+    Ok(())
+  }
+
   /// Download the update file without progress tracking (silent download)
   async fn download_update_silent(
     &self,
@@ -767,11 +963,23 @@ impl AppAutoUpdater {
       .unwrap_or("update.dmg")
       .to_string();
 
-    log::info!("Downloading update from: {}", update_info.download_url);
+    // Resolve the expected checksum first so an unverifiable release is
+    // rejected before the multi-hundred-MB download, not after.
+    let expected_sha256 = self.fetch_expected_checksum(update_info, &filename).await?;
+
+    log::info!("Downloading update");
 
     let download_path = self
       .download_update_silent(&update_info.download_url, &temp_dir, &filename)
       .await?;
+
+    log::info!("Verifying update checksum...");
+    Self::verify_update_checksum(
+      &download_path,
+      &filename,
+      &expected_sha256,
+      update_info.asset_digest.as_deref(),
+    )?;
 
     log::info!("Extracting update...");
     let extracted_app_path = self.extract_update(&download_path, &temp_dir).await?;
@@ -825,7 +1033,10 @@ impl AppAutoUpdater {
 
     // Handle compound extensions like .tar.gz
     if file_name.ends_with(".tar.gz") {
-      return self.extractor.extract_tar_gz(archive_path, dest_dir).await;
+      return self
+        .extractor
+        .extract_tar_gz(archive_path, dest_dir, None)
+        .await;
     }
 
     let extension = archive_path
@@ -837,7 +1048,10 @@ impl AppAutoUpdater {
       "dmg" => {
         #[cfg(target_os = "macos")]
         {
-          self.extractor.extract_dmg(archive_path, dest_dir).await
+          self
+            .extractor
+            .extract_dmg(archive_path, dest_dir, None)
+            .await
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -901,7 +1115,12 @@ impl AppAutoUpdater {
           Err("AppImage installation is only supported on Linux".into())
         }
       }
-      "zip" => self.extractor.extract_zip(archive_path, dest_dir).await,
+      "zip" => {
+        self
+          .extractor
+          .extract_zip(archive_path, dest_dir, None)
+          .await
+      }
       _ => Err(format!("Unsupported archive format: {extension}").into()),
     }
   }
@@ -1024,7 +1243,7 @@ impl AppAutoUpdater {
             if !log_content.is_empty() {
               log::info!(
                 "Log file content (last 500 chars): {}",
-                &log_content
+                log_content
                   .chars()
                   .rev()
                   .take(500)
@@ -1110,7 +1329,7 @@ impl AppAutoUpdater {
           // Extract ZIP file
           let extracted_path = self
             .extractor
-            .extract_zip(installer_path, &temp_extract_dir)
+            .extract_zip(installer_path, &temp_extract_dir, None)
             .await?;
 
           // Find the executable in the extracted files
@@ -1385,7 +1604,7 @@ impl AppAutoUpdater {
     // Extract tarball
     let extracted_path = self
       .extractor
-      .extract_tar_gz(tarball_path, &temp_extract_dir)
+      .extract_tar_gz(tarball_path, &temp_extract_dir, None)
       .await?;
 
     // Find the executable in the extracted files
@@ -1479,6 +1698,95 @@ impl AppAutoUpdater {
     }
   }
 
+  #[cfg(any(target_os = "windows", test))]
+  async fn prepare_windows_installer() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let profiles = match crate::profile::ProfileManager::instance().list_profiles() {
+      Ok(profiles) => profiles,
+      Err(e) => {
+        log::error!("Failed to inspect running profiles before app update: {e}");
+        return Err(
+          serde_json::json!({
+            "code": "UPDATE_PREPARATION_FAILED"
+          })
+          .to_string()
+          .into(),
+        );
+      }
+    };
+
+    let has_running_profiles = profiles.into_iter().any(|profile| {
+      profile
+        .process_id
+        .is_some_and(|pid| pid != 0 && crate::proxy_storage::is_process_running(pid))
+    });
+    if has_running_profiles {
+      return Err(
+        serde_json::json!({
+          "code": "UPDATE_PROFILES_RUNNING"
+        })
+        .to_string()
+        .into(),
+      );
+    }
+
+    let proxy_configs = crate::proxy_storage::list_proxy_configs();
+    let vpn_configs = crate::vpn_worker_storage::list_vpn_worker_configs();
+    let mut worker_pids: Vec<u32> = proxy_configs
+      .iter()
+      .filter_map(|config| config.pid)
+      .chain(vpn_configs.iter().filter_map(|config| config.pid))
+      .collect();
+    worker_pids.sort_unstable();
+    worker_pids.dedup();
+
+    let proxy_ids: Vec<String> = proxy_configs.into_iter().map(|config| config.id).collect();
+    let vpn_ids: Vec<String> = vpn_configs.into_iter().map(|config| config.id).collect();
+
+    let stop_proxies = futures_util::future::join_all(proxy_ids.iter().map(|id| async move {
+      crate::proxy_runner::stop_proxy_process(id)
+        .await
+        .map_err(|error| error.to_string())
+    }));
+    let stop_vpns = futures_util::future::join_all(vpn_ids.iter().map(|id| async move {
+      crate::vpn_worker_runner::stop_vpn_worker(id)
+        .await
+        .map_err(|error| error.to_string())
+    }));
+    let (proxy_results, vpn_results) = tokio::join!(stop_proxies, stop_vpns);
+
+    for result in proxy_results.into_iter().chain(vpn_results) {
+      if let Err(e) = result {
+        log::warn!("Failed to stop a network worker before app update: {e}");
+      }
+    }
+
+    for _ in 0..20 {
+      if worker_pids
+        .iter()
+        .all(|pid| !crate::proxy_storage::is_process_running(*pid))
+      {
+        return Ok(());
+      }
+      tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+
+    let remaining: Vec<u32> = worker_pids
+      .into_iter()
+      .filter(|pid| crate::proxy_storage::is_process_running(*pid))
+      .collect();
+    log::error!(
+      "App update aborted because donut-proxy worker PIDs are still running: {:?}",
+      remaining
+    );
+    Err(
+      serde_json::json!({
+        "code": "UPDATE_PREPARATION_FAILED"
+      })
+      .to_string()
+      .into(),
+    )
+  }
+
   /// Restart the application
   async fn restart_application(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     #[cfg(target_os = "macos")]
@@ -1545,6 +1853,11 @@ rm "{}"
       let pending = PENDING_INSTALLER_PATH.lock().unwrap().take();
 
       if let Some(installer_path) = pending {
+        if let Err(e) = Self::prepare_windows_installer().await {
+          *PENDING_INSTALLER_PATH.lock().unwrap() = Some(installer_path);
+          return Err(e);
+        }
+
         // Use ShellExecuteW to run the installer directly — no batch script,
         // no cmd.exe console window. The NSIS/MSI installer handles killing the
         // old process and restarting the app natively (via /UPDATE and
@@ -1724,6 +2037,14 @@ rm "{}"
 
 #[tauri::command]
 pub async fn check_for_app_updates() -> Result<Option<AppUpdateInfo>, String> {
+  #[cfg(feature = "e2e")]
+  if crate::e2e_automation_enabled()
+    && std::env::var_os("DONUT_E2E_DISABLE_STARTUP_NETWORK").is_some()
+  {
+    log::info!("E2E: skipping automatic app update check");
+    return Ok(None);
+  }
+
   if crate::app_dirs::is_portable() {
     log::info!("App auto-updates disabled in portable mode");
     return Ok(None);
@@ -1754,7 +2075,16 @@ pub async fn download_and_prepare_app_update(
   updater
     .download_and_prepare_update(&app_handle, &update_info)
     .await
-    .map_err(|e| format!("Failed to download and prepare app update: {e}"))
+    .map_err(|e| {
+      let msg = e.to_string();
+      // Structured error codes (`{"code": ...}`) must reach the frontend
+      // unwrapped so translateBackendError can resolve them.
+      if msg.starts_with('{') {
+        msg
+      } else {
+        format!("Failed to download and prepare app update: {msg}")
+      }
+    })
 }
 
 #[tauri::command]
@@ -1763,11 +2093,19 @@ pub async fn restart_application() -> Result<(), String> {
   updater
     .restart_application()
     .await
-    .map_err(|e| format!("Failed to restart application: {e}"))
+    .map_err(|e| crate::wrap_backend_error(e, "Failed to restart application"))
 }
 
 #[tauri::command]
 pub async fn check_for_app_updates_manual() -> Result<Option<AppUpdateInfo>, String> {
+  #[cfg(feature = "e2e")]
+  if crate::e2e_automation_enabled()
+    && std::env::var_os("DONUT_E2E_DISABLE_STARTUP_NETWORK").is_some()
+  {
+    log::info!("E2E: skipping manual app update check");
+    return Ok(None);
+  }
+
   log::info!("Manual app update check triggered");
   let updater = AppAutoUpdater::instance();
   updater
@@ -1889,6 +2227,113 @@ mod tests {
   }
 
   #[test]
+  fn test_find_checksum_for_file() {
+    let sums = "\
+0e5a4601745092b7d1c93c1e7e1c30d923be3d1e916b661bd53d1c0c9c7f0a11  Donut_0.29.0_aarch64.dmg
+ABCDEF01745092B7D1C93C1E7E1C30D923BE3D1E916B661BD53D1C0C9C7F0A22 *Donut_0.29.0_x64.dmg
+not-a-hash  Donut_0.29.0_amd64.deb
+";
+
+    // Plain entry.
+    assert_eq!(
+      AppAutoUpdater::find_checksum_for_file(sums, "Donut_0.29.0_aarch64.dmg").as_deref(),
+      Some("0e5a4601745092b7d1c93c1e7e1c30d923be3d1e916b661bd53d1c0c9c7f0a11")
+    );
+    // Binary-mode marker is stripped; hash is normalized to lowercase.
+    assert_eq!(
+      AppAutoUpdater::find_checksum_for_file(sums, "Donut_0.29.0_x64.dmg").as_deref(),
+      Some("abcdef01745092b7d1c93c1e7e1c30d923be3d1e916b661bd53d1c0c9c7f0a22")
+    );
+    // Entries with malformed hashes are rejected rather than trusted.
+    assert_eq!(
+      AppAutoUpdater::find_checksum_for_file(sums, "Donut_0.29.0_amd64.deb"),
+      None
+    );
+    // Missing file.
+    assert_eq!(
+      AppAutoUpdater::find_checksum_for_file(sums, "Donut_0.29.0_arm64.deb"),
+      None
+    );
+  }
+
+  #[test]
+  fn test_sha256_file_matches_known_digest() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("data.bin");
+    std::fs::write(&path, b"hello world").unwrap();
+    assert_eq!(
+      AppAutoUpdater::sha256_file(&path).unwrap(),
+      // sha256 of "hello world"
+      "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+    );
+  }
+
+  #[test]
+  fn test_find_checksums_url() {
+    let assets = vec![
+      AppReleaseAsset {
+        name: "Donut_0.29.0_x64.dmg".to_string(),
+        browser_download_url: "https://example.com/x64.dmg".to_string(),
+        size: 1,
+        digest: None,
+      },
+      AppReleaseAsset {
+        name: "SHA256SUMS.txt".to_string(),
+        browser_download_url: "https://example.com/SHA256SUMS.txt".to_string(),
+        size: 1,
+        digest: None,
+      },
+    ];
+    assert_eq!(
+      AppAutoUpdater::find_checksums_url(&assets).as_deref(),
+      Some("https://example.com/SHA256SUMS.txt")
+    );
+    assert_eq!(AppAutoUpdater::find_checksums_url(&assets[..1]), None);
+  }
+
+  #[test]
+  fn test_release_asset_digest_is_optional_in_api_json() {
+    // Assets uploaded before GitHub started computing digests omit the field.
+    let without: AppReleaseAsset = serde_json::from_str(
+      r#"{"name": "a.dmg", "browser_download_url": "https://example.com/a.dmg", "size": 5}"#,
+    )
+    .expect("asset without digest should deserialize");
+    assert_eq!(without.digest, None);
+
+    let with: AppReleaseAsset = serde_json::from_str(
+      r#"{"name": "a.dmg", "browser_download_url": "https://example.com/a.dmg", "size": 5, "digest": "sha256:ab12"}"#,
+    )
+    .expect("asset with digest should deserialize");
+    assert_eq!(with.digest.as_deref(), Some("sha256:ab12"));
+  }
+
+  #[test]
+  fn test_windows_installer_hook_protects_sidecar_replacement() {
+    let _ = AppAutoUpdater::prepare_windows_installer;
+
+    let config: serde_json::Value =
+      serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+    assert_eq!(
+      config["bundle"]["windows"]["nsis"]["installerHooks"].as_str(),
+      Some("installer-hooks.nsh")
+    );
+
+    let hooks = include_str!("../installer-hooks.nsh");
+    assert!(hooks.contains("NSIS_HOOK_PREINSTALL"));
+    assert!(hooks.contains("IfFileExists \"$INSTDIR\\donut-proxy.exe\""));
+    assert!(hooks.contains("taskkill.exe"));
+    assert!(hooks.contains("donut-proxy.exe"));
+    assert!(hooks.contains("Delete \"$INSTDIR\\donut-proxy.exe\""));
+  }
+
+  #[test]
+  fn test_windows_installer_preparation_future_is_send() {
+    fn assert_send<T: Send>(_: T) {}
+
+    assert_send(AppAutoUpdater::prepare_windows_installer());
+  }
+
+  #[test]
   fn test_platform_specific_download_urls() {
     let updater = AppAutoUpdater::instance();
 
@@ -1899,33 +2344,39 @@ mod tests {
         name: "Donut.Browser_0.1.0_aarch64.dmg".to_string(),
         browser_download_url: "https://example.com/aarch64.dmg".to_string(),
         size: 12345,
+        digest: None,
       },
       AppReleaseAsset {
         name: "Donut.Browser_0.1.0_x64.dmg".to_string(),
         browser_download_url: "https://example.com/x64.dmg".to_string(),
         size: 12345,
+        digest: None,
       },
       // Windows assets (NSIS naming: _ARCH-setup.exe)
       AppReleaseAsset {
         name: "Donut_0.1.0_x64-setup.exe".to_string(),
         browser_download_url: "https://example.com/x64-setup.exe".to_string(),
         size: 12345,
+        digest: None,
       },
       // Linux assets
       AppReleaseAsset {
         name: "donutbrowser_0.1.0_amd64.deb".to_string(),
         browser_download_url: "https://example.com/amd64.deb".to_string(),
         size: 12345,
+        digest: None,
       },
       AppReleaseAsset {
         name: "donutbrowser-0.1.0-1.x86_64.rpm".to_string(),
         browser_download_url: "https://example.com/x86_64.rpm".to_string(),
         size: 12345,
+        digest: None,
       },
       AppReleaseAsset {
         name: "Donut.Browser-0.1.0-x86_64.AppImage".to_string(),
         browser_download_url: "https://example.com/x86_64.AppImage".to_string(),
         size: 12345,
+        digest: None,
       },
     ];
 
@@ -2028,11 +2479,13 @@ mod tests {
         name: "donutbrowser_0.1.0_amd64.deb".to_string(),
         browser_download_url: "https://example.com/amd64.deb".to_string(),
         size: 12345,
+        digest: None,
       },
       AppReleaseAsset {
         name: "Donut.Browser-0.1.0-x86_64.AppImage".to_string(),
         browser_download_url: "https://example.com/x86_64.AppImage".to_string(),
         size: 12345,
+        digest: None,
       },
     ];
 
@@ -2073,23 +2526,27 @@ mod tests {
         name: "Donut.Browser_0.1.0_aarch64.dmg".to_string(),
         browser_download_url: "https://example.com/aarch64.dmg".to_string(),
         size: 12345,
+        digest: None,
       },
       // Windows assets
       AppReleaseAsset {
         name: "Donut.Browser_0.1.0_x64.msi".to_string(),
         browser_download_url: "https://example.com/x64.msi".to_string(),
         size: 12345,
+        digest: None,
       },
       // Linux assets
       AppReleaseAsset {
         name: "donutbrowser_0.1.0_amd64.deb".to_string(),
         browser_download_url: "https://example.com/amd64.deb".to_string(),
         size: 12345,
+        digest: None,
       },
       AppReleaseAsset {
         name: "Donut.Browser-0.1.0-x86_64.AppImage".to_string(),
         browser_download_url: "https://example.com/x86_64.AppImage".to_string(),
         size: 12345,
+        digest: None,
       },
     ];
 

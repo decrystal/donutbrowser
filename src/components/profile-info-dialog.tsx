@@ -15,6 +15,7 @@ import {
   LuCookie,
   LuCopy,
   LuDownload,
+  LuEraser,
   LuFingerprint,
   LuGlobe,
   LuGroup,
@@ -28,12 +29,14 @@ import {
   LuSettings,
   LuShield,
   LuShieldCheck,
+  LuTimer,
   LuTrash2,
   LuUpload,
   LuUsers,
   LuX,
 } from "react-icons/lu";
 import { SharedFingerprintConfigForm } from "@/components/shared-fingerprint-config-form";
+import { AnimatedSwitch } from "@/components/ui/animated-switch";
 import { Button } from "@/components/ui/button";
 import {
   ColorPicker,
@@ -73,6 +76,7 @@ import {
 } from "@/components/ui/select";
 import { translateBackendError } from "@/lib/backend-errors";
 import { getProfileIcon } from "@/lib/browser-utils";
+import { DNS_BLOCKLIST_LEVELS } from "@/lib/dns-blocklist-levels";
 import { formatRelativeTime } from "@/lib/flag-utils";
 import { showErrorToast, showSuccessToast } from "@/lib/toast-utils";
 import { cn } from "@/lib/utils";
@@ -124,6 +128,56 @@ function _OSIcon({ os }: { os: string }) {
     default:
       return null;
   }
+}
+
+function ClearOnCloseToggle({
+  profile,
+  isDisabled,
+}: {
+  profile: BrowserProfile;
+  isDisabled: boolean;
+}) {
+  const { t } = useTranslation();
+  const [enabled, setEnabled] = React.useState(profile.clear_on_close === true);
+  const [saving, setSaving] = React.useState(false);
+
+  React.useEffect(() => {
+    setEnabled(profile.clear_on_close === true);
+  }, [profile.clear_on_close]);
+
+  const toggle = async (next: boolean) => {
+    setEnabled(next);
+    setSaving(true);
+    try {
+      await invoke("update_profile_clear_on_close", {
+        profileId: profile.id,
+        clearOnClose: next,
+      });
+    } catch (error) {
+      setEnabled(!next);
+      showErrorToast(translateBackendError(t, error));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="flex items-center gap-3 rounded-md border border-border bg-muted/40 px-3 py-2">
+      <LuEraser className="size-4 shrink-0 text-muted-foreground" />
+      <div className="min-w-0 flex-1">
+        <p className="text-sm font-medium">{t("clearOnClose.label")}</p>
+        <p className="text-[11px] text-muted-foreground">
+          {t("clearOnClose.description")}
+        </p>
+      </div>
+      <AnimatedSwitch
+        checked={enabled}
+        disabled={saving || isDisabled}
+        onCheckedChange={(v) => void toggle(v === true)}
+        aria-label={t("clearOnClose.label")}
+      />
+    </div>
+  );
 }
 
 function InfoCard({ label, value }: { label: string; value: string }) {
@@ -686,6 +740,13 @@ function ProfileInfoLayout({
     [visibleActions],
   );
 
+  // An ephemeral profile is discarded when the browser closes, so it has
+  // nowhere to keep cookies, extensions or a synced copy. The sections were
+  // hidden outright, which left no way to discover that and read as the app
+  // being broken or the plan lacking the feature. Keep them listed and explain.
+  const isEphemeral = profile.ephemeral === true;
+  const isWayfernProfile = profile.browser === "wayfern";
+
   const deleteAction = findAction("delete");
   const fingerprintAction = findAction("fingerprint");
   const cookiesManageAction = findAction("cookiesManage");
@@ -765,20 +826,20 @@ function ProfileInfoLayout({
         cookieCount !== null && cookieCount > 0
           ? cookieCount.toLocaleString()
           : undefined,
-      hidden: !cookiesAction,
+      hidden: !cookiesAction && !(isEphemeral && isWayfernProfile),
     },
     {
       id: "extensions",
       icon: <LuPuzzle className="size-3.5" />,
       label: t("profileInfo.sections.extensions"),
       badge: extensionGroupName ?? undefined,
-      hidden: !extensionAction,
+      hidden: !extensionAction && !isEphemeral,
     },
     {
       id: "sync",
       icon: <LuRefreshCw className="size-3.5" />,
       label: t("profileInfo.sections.sync"),
-      hidden: !syncAction,
+      hidden: !syncAction && !isEphemeral,
     },
     {
       id: "automation",
@@ -821,7 +882,7 @@ function ProfileInfoLayout({
           type="button"
           aria-label={t("common.buttons.close")}
           onClick={onClose}
-          className="grid size-7 place-items-center rounded-md text-muted-foreground transition-colors duration-100 hover:bg-accent/50 hover:text-foreground"
+          className="grid size-7 place-items-center rounded-md text-muted-foreground transition-colors duration-100 hover:bg-accent hover:text-accent-foreground"
         >
           <LuX className="size-3.5" />
         </button>
@@ -844,7 +905,7 @@ function ProfileInfoLayout({
                     "flex h-7 items-center gap-2 rounded-md px-2 text-left text-xs transition-colors duration-100",
                     active
                       ? "bg-accent text-accent-foreground"
-                      : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+                      : "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
                   )}
                 >
                   <span className="shrink-0">{it.icon}</span>
@@ -864,7 +925,7 @@ function ProfileInfoLayout({
                 type="button"
                 onClick={deleteAction.onClick}
                 disabled={deleteAction.disabled}
-                className="flex h-7 items-center gap-2 rounded-md px-2 text-xs text-destructive transition-colors duration-100 hover:bg-destructive/10 disabled:pointer-events-none disabled:opacity-50"
+                className="flex h-7 items-center gap-2 rounded-md px-2 text-xs text-destructive-text transition-colors duration-100 hover:bg-destructive/10 disabled:pointer-events-none disabled:opacity-50"
               >
                 <LuTrash2 className="size-3.5 shrink-0" />
                 <span className="flex-1 text-left">
@@ -980,6 +1041,10 @@ function ProfileInfoLayout({
                 </div>
               </div>
 
+              {!profile.ephemeral && !profile.password_protected && (
+                <ClearOnCloseToggle profile={profile} isDisabled={isDisabled} />
+              )}
+
               {profile.created_by_email && (
                 <div className="rounded-md border border-border bg-muted/40 px-3 py-2">
                   <p className="text-[10px] tracking-wide text-muted-foreground uppercase">
@@ -1020,34 +1085,55 @@ function ProfileInfoLayout({
             />
           )}
 
-          {section === "cookies" && (
-            <CookiesSectionInline
-              profile={profile}
-              isRunning={isRunning}
-              isDisabled={isDisabled}
-              onCopyCookies={cookiesCopyAction?.onClick}
-              onImportCookies={cookiesManageAction?.onClick}
-              t={t}
-            />
-          )}
+          {section === "cookies" &&
+            (isEphemeral ? (
+              <EphemeralSectionNotice
+                title={t("profileInfo.sections.cookies")}
+                description={t("profileInfo.ephemeral.cookiesUnavailable")}
+                t={t}
+              />
+            ) : (
+              <CookiesSectionInline
+                profile={profile}
+                isRunning={isRunning}
+                isDisabled={isDisabled}
+                onCopyCookies={cookiesCopyAction?.onClick}
+                onImportCookies={cookiesManageAction?.onClick}
+                t={t}
+              />
+            ))}
 
-          {section === "extensions" && (
-            <ExtensionsSectionInline
-              profile={profile}
-              isDisabled={isDisabled}
-              t={t}
-            />
-          )}
+          {section === "extensions" &&
+            (isEphemeral ? (
+              <EphemeralSectionNotice
+                title={t("profileInfo.sections.extensions")}
+                description={t("profileInfo.ephemeral.extensionsUnavailable")}
+                t={t}
+              />
+            ) : (
+              <ExtensionsSectionInline
+                profile={profile}
+                isDisabled={isDisabled}
+                t={t}
+              />
+            ))}
 
-          {section === "sync" && (
-            <SyncSectionInline
-              profile={profile}
-              syncMode={syncMode}
-              syncStatus={syncStatus}
-              isDisabled={isDisabled}
-              t={t}
-            />
-          )}
+          {section === "sync" &&
+            (isEphemeral ? (
+              <EphemeralSectionNotice
+                title={t("profileInfo.sections.sync")}
+                description={t("profileInfo.ephemeral.syncUnavailable")}
+                t={t}
+              />
+            ) : (
+              <SyncSectionInline
+                profile={profile}
+                syncMode={syncMode}
+                syncStatus={syncStatus}
+                isDisabled={isDisabled}
+                t={t}
+              />
+            ))}
 
           {section === "automation" && (
             <LaunchHookEditor profile={profile} t={t} />
@@ -1128,8 +1214,8 @@ function _SectionAction({
       className={cn(
         "flex h-9 items-center gap-2 rounded-md px-3 text-left text-xs transition-colors",
         destructive
-          ? "text-destructive hover:bg-destructive/10"
-          : "hover:bg-accent",
+          ? "text-destructive-text hover:bg-destructive/10"
+          : "hover:bg-accent hover:text-accent-foreground",
         "disabled:pointer-events-none disabled:opacity-50",
       )}
     >
@@ -1201,11 +1287,11 @@ function LaunchHookEditor({
         className="font-mono text-xs"
       />
       {showInvalidHint && (
-        <p className="text-xs text-warning">
+        <p className="text-xs text-warning-text">
           {t("profileInfo.launchHook.invalidUrlHint")}
         </p>
       )}
-      {error && <p className="text-xs text-destructive">{error}</p>}
+      {error && <p className="text-xs text-destructive-text">{error}</p>}
       <div className="flex items-center gap-2">
         <Button
           size="sm"
@@ -1307,11 +1393,13 @@ function SyncSectionInline({
             {t(`profileInfo.syncStatusValue.${syncStatus.status}`)}
           </p>
           {syncStatus.error && (
-            <p className="mt-1 text-xs text-destructive">{syncStatus.error}</p>
+            <p className="mt-1 text-xs text-destructive-text">
+              {syncStatus.error}
+            </p>
           )}
         </div>
       )}
-      {error && <p className="text-xs text-destructive">{error}</p>}
+      {error && <p className="text-xs text-destructive-text">{error}</p>}
     </div>
   );
 }
@@ -1447,7 +1535,32 @@ function NetworkSectionInline({
         </Select>
       </div>
 
-      {error && <p className="text-xs text-destructive">{error}</p>}
+      {error && <p className="text-xs text-destructive-text">{error}</p>}
+    </div>
+  );
+}
+
+/// Explains why a section has nothing to offer on an ephemeral profile.
+/// Mirrors the locked-fingerprint empty state so the two read as one pattern.
+function EphemeralSectionNotice({
+  title,
+  description,
+  t,
+}: {
+  title: string;
+  description: string;
+  t: (key: string, options?: Record<string, unknown>) => string;
+}) {
+  return (
+    <div className="flex flex-col items-center gap-3 rounded-lg border p-6 text-center">
+      <LuTimer className="size-4 shrink-0 text-muted-foreground" />
+      <h3 className="text-sm font-medium text-foreground">{title}</h3>
+      <p className="max-w-[48ch] text-sm text-pretty text-muted-foreground">
+        {description}
+      </p>
+      <p className="max-w-[48ch] text-xs text-pretty text-muted-foreground">
+        {t("profileInfo.ephemeral.hint")}
+      </p>
     </div>
   );
 }
@@ -1551,7 +1664,7 @@ function ExtensionsSectionInline({
           </SelectContent>
         </Select>
       </div>
-      {error && <p className="text-xs text-destructive">{error}</p>}
+      {error && <p className="text-xs text-destructive-text">{error}</p>}
     </div>
   );
 }
@@ -1759,7 +1872,7 @@ function CookiesSectionInline({
               </ul>
             </div>
           )}
-          {error && <p className="text-xs text-destructive">{error}</p>}
+          {error && <p className="text-xs text-destructive-text">{error}</p>}
         </>
       )}
     </div>
@@ -1894,8 +2007,10 @@ function FingerprintSectionInline({
         profileBrowser={profile.browser}
       />
 
-      {error && <p className="text-xs text-destructive">{error}</p>}
-      {success && !error && <p className="text-xs text-success">{success}</p>}
+      {error && <p className="text-xs text-destructive-text">{error}</p>}
+      {success && !error && (
+        <p className="text-xs text-success-text">{success}</p>
+      )}
 
       <div className="mt-3 flex items-center gap-2 border-t border-border pt-3">
         <Button
@@ -1996,8 +2111,7 @@ function SecuritySectionInline({
     }
     if (mode === "set" || mode === "change") {
       if (password.length < 8) return t("profilePassword.errors.tooShort");
-      if (password !== confirm)
-        return t("profilePassword.errors.passwordMismatch");
+      if (password !== confirm) return t("profilePassword.errors.mismatch");
     }
     return null;
   };
@@ -2068,7 +2182,7 @@ function SecuritySectionInline({
             }}
             className={cn(
               "h-7 flex-1 rounded-md border px-2 text-xs transition-colors",
-              "border-border text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+              "border-border text-muted-foreground hover:bg-accent hover:text-accent-foreground",
             )}
           >
             {t("profilePassword.modes.validate")}
@@ -2083,7 +2197,7 @@ function SecuritySectionInline({
               "h-7 flex-1 rounded-md border px-2 text-xs transition-colors",
               mode === "change"
                 ? "border-transparent bg-accent text-accent-foreground"
-                : "border-border text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+                : "border-border text-muted-foreground hover:bg-accent hover:text-accent-foreground",
             )}
           >
             {t("profilePassword.modes.change")}
@@ -2097,8 +2211,8 @@ function SecuritySectionInline({
             className={cn(
               "h-7 flex-1 rounded-md border px-2 text-xs transition-colors",
               mode === "remove"
-                ? "border-transparent bg-destructive/10 text-destructive"
-                : "border-border text-muted-foreground hover:bg-accent/50 hover:text-foreground",
+                ? "border-transparent bg-destructive/10 text-destructive-text"
+                : "border-border text-muted-foreground hover:bg-accent hover:text-accent-foreground",
             )}
           >
             {t("profilePassword.modes.remove")}
@@ -2148,8 +2262,10 @@ function SecuritySectionInline({
         )}
       </div>
 
-      {error && <p className="text-xs text-destructive">{error}</p>}
-      {success && !error && <p className="text-xs text-success">{success}</p>}
+      {error && <p className="text-xs text-destructive-text">{error}</p>}
+      {success && !error && (
+        <p className="text-xs text-success-text">{success}</p>
+      )}
 
       {isRunning && (
         <p className="text-xs text-muted-foreground">
@@ -2343,11 +2459,10 @@ export function ProfileDnsBlocklistDialog({
 
   const options = [
     { value: "", label: t("dnsBlocklist.none") },
-    { value: "light", label: t("dnsBlocklist.light") },
-    { value: "normal", label: t("dnsBlocklist.normal") },
-    { value: "pro", label: t("dnsBlocklist.pro") },
-    { value: "pro_plus", label: t("dnsBlocklist.proPlus") },
-    { value: "ultimate", label: t("dnsBlocklist.ultimate") },
+    ...DNS_BLOCKLIST_LEVELS.map((l) => ({
+      value: l.value as string,
+      label: t(l.labelKey),
+    })),
   ];
 
   return (
@@ -2362,7 +2477,7 @@ export function ProfileDnsBlocklistDialog({
             href="https://github.com/hagezi/dns-blocklists"
             target="_blank"
             rel="noopener noreferrer"
-            className="text-primary hover:underline"
+            className="text-primary-text hover:underline"
           >
             {t("common.buttons.moreInfo")}
           </a>
@@ -2375,8 +2490,8 @@ export function ProfileDnsBlocklistDialog({
               onClick={() => setLevel(option.value)}
               className={`w-full text-left px-3 py-2 rounded-md text-sm transition-colors ${
                 level === option.value
-                  ? "bg-primary/10 text-primary border border-primary/30"
-                  : "hover:bg-accent border border-transparent"
+                  ? "border border-primary/30 bg-primary/10 text-primary-text"
+                  : "border border-transparent hover:bg-accent hover:text-accent-foreground"
               }`}
             >
               {option.label}
@@ -2498,7 +2613,7 @@ export function ProfileBypassRulesDialog({
                       onClick={() => {
                         handleRemoveRule(rule);
                       }}
-                      className="shrink-0 text-muted-foreground transition-colors hover:text-destructive"
+                      className="shrink-0 text-muted-foreground transition-colors hover:text-destructive-text"
                     >
                       <LuX className="size-3.5" />
                     </button>

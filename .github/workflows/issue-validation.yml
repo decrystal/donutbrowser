@@ -14,12 +14,15 @@ permissions:
   contents: read
   issues: write
   pull-requests: write
-  id-token: write
+  models: read
 
 env:
   # Single source of truth for the model used by both triage and composer.
-  TRIAGE_MODEL: z-ai/glm-5.1
-  COMPOSER_MODEL: z-ai/glm-5.1
+  # GitHub Models (free, billed to the repo's plan) takes `publisher/name` model
+  # ids. gpt-4.1 is the most capable model actually reachable on the free tier:
+  # the gpt-5 family returns unavailable_model and o3/o3-mini return 403.
+  TRIAGE_MODEL: openai/gpt-4.1
+  COMPOSER_MODEL: openai/gpt-4.1
 
 jobs:
   analyze-issue:
@@ -27,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
 
       - name: Check if first-time contributor
         id: check-first-time
@@ -49,8 +52,9 @@ jobs:
         env:
           ISSUE_BODY: ${{ github.event.issue.body }}
         run: |
-          node <<'EOF'
-          const fs = require('node:fs');
+          node --input-type=module <<'EOF'
+          import fs from 'node:fs';
+          import { redactIssueBody, redactSensitiveText } from './scripts/redact-sensitive-text.mjs';
           const body = process.env.ISSUE_BODY || '';
           // GitHub issue templates render fields as `### Heading\nValue` blocks.
           // Split on `###` at line start to recover them.
@@ -61,29 +65,27 @@ jobs:
             if (nl < 0) continue;
             const heading = section.slice(0, nl).trim();
             const value = section.slice(nl + 1).trim();
-            fields[heading] = value === '_No response_' ? '' : value;
+            const normalized = value === '_No response_' ? '' : value;
+            fields[heading] = heading === 'Error logs or screenshots'
+              ? '[omitted from automated processing]'
+              : redactSensitiveText(normalized);
           }
           fs.writeFileSync('/tmp/issue-fields.json', JSON.stringify(fields, null, 2));
-          // Convenience extractions for the prompt — empty string if missing.
           const get = (k) => fields[k] || '';
           fs.writeFileSync('/tmp/issue-os.txt', get('Operating System'));
           fs.writeFileSync('/tmp/issue-version.txt', get('Donut Browser version'));
           fs.writeFileSync('/tmp/issue-wayfern-version.txt', get('Wayfern version'));
           fs.writeFileSync('/tmp/issue-repro.txt', get('Steps to reproduce'));
-          fs.writeFileSync('/tmp/issue-logs.txt', get('Error logs or screenshots'));
           fs.writeFileSync('/tmp/issue-what.txt', get('What happened?') || get('What do you want?'));
+          fs.writeFileSync('/tmp/issue-body.txt', redactIssueBody(body));
           EOF
-          echo "Parsed fields:"
-          cat /tmp/issue-fields.json
 
       - name: Build repo context
         env:
           ISSUE_TITLE: ${{ github.event.issue.title }}
-          ISSUE_BODY: ${{ github.event.issue.body }}
         run: |
           cp CLAUDE.md /tmp/repo-context.txt
-          printf '%s' "$ISSUE_TITLE" > /tmp/issue-title.txt
-          printf '%s' "${ISSUE_BODY:-}" > /tmp/issue-body.txt
+          printf '%s' "$ISSUE_TITLE" | node scripts/redact-sensitive-text.mjs > /tmp/issue-title.txt
 
           # List all source files for the AI to choose from
           find . -type f \( -name "*.rs" -o -name "*.ts" -o -name "*.tsx" \) \
@@ -96,13 +98,13 @@ jobs:
           cat > /tmp/scope-and-pricing.md <<'EOF'
           # PROJECT SCOPE
 
-          - **Donut Browser** — this repo. A Tauri desktop launcher (Rust + Next.js) that
+          - Donut Browser: this repo. A Tauri desktop launcher (Rust + Next.js) that
             downloads, manages, and launches anti-detect browser profiles. In-scope for bug
             reports about profile management, downloads, sync, proxy, VPN, the launcher UI,
             its API, MCP server, and the bundled `donut-sync` self-hosted server.
-          - **Wayfern** — a Chromium fork maintained by zhom (the same maintainer). Wayfern
+          - Wayfern: a Chromium fork maintained by zhom (the same maintainer). Wayfern
             bugs are in-scope here unless they are obviously upstream Chromium issues.
-          - **Forks of Wayfern** (e.g. CloverLabsAI, VulpineOS) are NOT
+          - Forks of Wayfern (e.g. CloverLabsAI, VulpineOS) are NOT
             supported. Feature requests asking for them are out of scope.
 
           # PAID vs FREE FEATURES
@@ -117,9 +119,9 @@ jobs:
           - Profile Management API & MCP (list / create / launch / kill / config)
           - Cookie & Extension Management
           - Set as default browser
-          - **Profile sync IS FREE if the user self-hosts the `donut-sync` server**
+          - Profile sync IS FREE if the user self-hosts the `donut-sync` server
 
-          ## Pro ($16/mo) — adds:
+          ## Pro ($16/mo) adds:
           - Browser Manipulation API & MCP (`type_text`, `click_element`,
             `evaluate_javascript`, `screenshot`, `navigate`, etc.)
           - Cross-OS fingerprinting (e.g. macOS user appearing as Windows)
@@ -127,24 +129,24 @@ jobs:
           - 20 cloud profile backup (cloud sync via donutbrowser.com)
           - Commercial use license
 
-          ## Team ($80/mo) — adds:
+          ## Team ($80/mo) adds:
           - 100 cloud profile sync
           - Team collaboration, profile sharing, unlimited seats
 
           # ANTI-PATTERNS
 
-          - **Regression**: user explicitly mentions a previous version that worked
+          - Regression: user explicitly mentions a previous version that worked
             differently ("worked in 0.21", "went from 2 to 8 false positives"). Do NOT
             dismiss as "known issue" / "expected" / "false positive in Tauri apps". Ask
             which exact version was the last working one and what changed.
-          - **Fork-support request**: asks the maintainer to support an alternative
-            Wayfern fork. Acknowledge in one neutral sentence — do NOT call it
+          - Fork-support request: asks the maintainer to support an alternative
+            Wayfern fork. Acknowledge in one neutral sentence. Do NOT call it
             "clear", "reasonable", "well-thought-out", etc.
-          - **AI-generated / template-violating report**: report doesn't follow the
+          - AI-generated / template-violating report: report doesn't follow the
             template, may cite "official documentation" via context7, deepwiki, or any
             non-`donutbrowser.com` / non-`github.com/zhom` URL. The only authoritative
             sources are this GitHub repo and donutbrowser.com.
-          - **Speculation about internals**: never write a "Possible cause" / "Likely
+          - Speculation about internals: never write a "Possible cause" / "Likely
             cause" / "Root cause" section. Never cite internal file paths or line
             numbers. Never speculate about how subscription / paid-plan checks work.
 
@@ -152,27 +154,27 @@ jobs:
           # Easiest path for the user: Donut → Settings → Advanced → Copy logs
           # (puts the latest rotated log on the clipboard). If they prefer to
           # attach files directly, the active log is `DonutBrowser.log`; older
-          # rotated copies sit next to it (`DonutBrowser.log.YYYY-MM-DD-…`).
+          # rotated copies sit next to it (`DonutBrowser.log.YYYY-MM-DD-...`).
 
           - macOS:   `~/Library/Logs/com.donutbrowser/DonutBrowser.log`
           - Linux:   `~/.local/share/com.donutbrowser/logs/DonutBrowser.log`
           - Windows: `%LOCALAPPDATA%\com.donutbrowser\logs\DonutBrowser.log`
 
-          # KNOWN ERROR SIGNATURES (truth, not guesses — match these
+          # KNOWN ERROR SIGNATURES (truth, not guesses; match these
           # verbatim before suggesting anything else)
 
-          - **`CDP not ready after N attempts on port X: HTTP 5xx ...`** —
-            an HTTP 5xx (503 / 502) response from a freshly-launched
+          - `CDP not ready after N attempts on port X: HTTP 5xx ...`
+            An HTTP 5xx (503 / 502) response from a freshly-launched
             browser's `/json/version` endpoint always means *something on
             the loopback path is intercepting the connection*: a firewall,
             an antivirus web-shield (Kaspersky, Bitdefender, ESET, Avast /
             AVG, Yandex Protect on Windows; Little Snitch, LuLu on macOS),
             a VPN client that hijacks 127.0.0.1, or a corporate MDM /
             proxy (Zscaler, Cisco AnyConnect, Netskope). Chrome's
-            DevTools endpoint never returns 5xx itself — only synthetic
-            responses from interception layers do. **Do NOT speculate
+            DevTools endpoint never returns 5xx itself; only synthetic
+            responses from interception layers do. Do NOT speculate
             about Gatekeeper, first-launch verification, code signing, or
-            quarantine** — none of those cause a 5xx response, and
+            quarantine. None of those cause a 5xx response, and
             Gatekeeper never delays a launch long enough to surface as
             "120 attempts". Lead with: which AV / web-shield / firewall /
             VPN / MDM is installed, and ask the user to try with the AV's
@@ -182,9 +184,8 @@ jobs:
       - name: Build triage system prompt
         run: |
           # The static system prompt has apostrophes ("doesn't", "official docs"
-          # etc.) that collide with shell single-quoting if embedded directly in
-          # the jq filter. Build the full prompt to a file instead, then load it
-          # via --rawfile in the next step.
+          # etc.) that collide with shell single-quoting inside the jq filter.
+          # Build it to a file instead and load it via --rawfile in the next step.
           {
             cat <<'TRIAGE_HEAD'
           You are a triage classifier for the Donut Browser GitHub repo. Classify the issue and pick at most 20 source files for a composer to read.
@@ -199,7 +200,7 @@ jobs:
           Return ONLY valid JSON. No preamble, no code fences. Schema:
           {
             "language": "en" or ISO 639-1 code,
-            "classification": one of ["bug-in-scope", "bug-template-violation", "feature-request", "fork-request", "regression", "ai-generated-junk", "question", "other"],
+            "classification": one of ["bug-in-scope", "bug-template-violation", "feature-request", "fork-request", "regression", "automated-content", "question", "other"],
             "operating_system": "macos" | "windows" | "linux" | "unknown",
             "is_paid_feature": true | false,
             "user_followed_template": true | false,
@@ -211,18 +212,18 @@ jobs:
 
           Classification guidance:
           - "bug-template-violation": missing or filled-in nonsense for required template fields.
-          - "ai-generated-junk": cites fabricated "official docs" (context7, deepwiki, non-donutbrowser URLs) or has the polished AI-spam shape (long, structured, fabricated certainty).
+          - "automated-content": cites fabricated "official docs" (context7, deepwiki, non-donutbrowser URLs) or has a highly structured automated-submission pattern with fabricated certainty.
           - "fork-request": asks for support of CloverLabsAI/VulpineOS/etc. forks.
           - "regression": user names a prior version that worked.
 
-          File selection: pick files that an experienced reviewer would actually look at to act on this issue. If the issue is a fork-request or junk, set files_to_read to []. Otherwise pick concrete files relevant to the symptoms.
+          File selection: pick files that an experienced reviewer would actually look at to act on this issue. For a fork request or automated-content classification, set files_to_read to []. Otherwise pick concrete files relevant to the symptoms.
           TRIAGE_TAIL
           } > /tmp/triage-system.txt
           wc -c /tmp/triage-system.txt
 
-      - name: Stage 1 — Triage and file selection
+      - name: Stage 1 (triage and file selection)
         env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GH_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # The triage call returns ONLY JSON. It classifies the issue and picks a
           # short list of source files for the composer to read.
@@ -238,25 +239,36 @@ jobs:
               messages: [
                 { role: "system", content: $system_prompt },
                 { role: "user",
-                  content: ("Issue title: " + $title + "\n\nBody:\n" + $body + "\n\nParsed template fields:\n" + $fields + "\n\nAll source files:\n" + $files) }
+                  content: ("Issue title: " + $title + "\n\nSanitized body:\n" + $body + "\n\nSanitized template fields:\n" + $fields + "\n\nAll source files:\n" + $files) }
               ]
             }')
 
-          RESPONSE=$(curl -fsSL https://openrouter.ai/api/v1/chat/completions \
-            -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+          # Never use curl -f here: a transport or quota error (402 once the repo's
+          # GitHub Models allowance is spent) must not abort the job. Capture the
+          # status and fall through to the safe classification below.
+          STATUS=$(curl -sSL -o /tmp/triage-response.json -w '%{http_code}' \
+            https://models.github.ai/inference/chat/completions \
+            -H "Authorization: Bearer $GH_MODELS_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
             -H "Content-Type: application/json" \
-            -d "$PAYLOAD")
+            -d "$PAYLOAD" || echo "000")
 
-          jq -r '.choices[0].message.content // empty' <<< "$RESPONSE" > /tmp/triage-raw.txt
+          if [ "$STATUS" = "200" ]; then
+            jq -r '.choices[0].message.content // empty' /tmp/triage-response.json > /tmp/triage-raw.txt || : > /tmp/triage-raw.txt
+          else
+            echo "::error::GitHub Models returned HTTP $STATUS for triage"
+            printf '%s\n' "triage inference call failed with HTTP $STATUS" >> /tmp/ai-degraded
+            : > /tmp/triage-raw.txt
+          fi
 
-          # Strip ```json fences if the model couldn't help itself.
+          # Normalize optional markdown fences before parsing.
           sed -E 's/^```(json)?$//; s/```$//' /tmp/triage-raw.txt > /tmp/triage.json
 
-          # Validate; if the model returned junk, fall back to a minimal stub so the
-          # composer still gets called and produces SOMETHING.
+          # Fall back to a safe classification when the response is not JSON.
           if ! jq -e . /tmp/triage.json >/dev/null 2>&1; then
-            echo "::warning::Triage returned non-JSON; using fallback classification"
-            cat /tmp/triage-raw.txt
+            echo "::error::Triage returned non-JSON; using fallback classification"
+            printf '%s\n' "triage returned output that was not JSON" >> /tmp/ai-degraded
             jq -n '{
               language: "en",
               classification: "bug-in-scope",
@@ -270,17 +282,16 @@ jobs:
             }' > /tmp/triage.json
           fi
 
-          echo "Triage result:"
-          cat /tmp/triage.json
+          echo "Triage response validated"
 
       - name: Read files chosen by triage
         run: |
           : > /tmp/file-context.txt
-          # files_to_read may be empty (e.g. fork-request or junk) — that's fine.
+          # An empty file list is valid for classifications that need no source context.
           jq -r '.files_to_read[]? // empty' /tmp/triage.json | while IFS= read -r filepath; do
             filepath=$(echo "$filepath" | xargs)
             [ -z "$filepath" ] && continue
-            # Reject paths that escape the repo or look fishy
+            # Reject paths that escape the repository.
             case "$filepath" in
               /*|*..*|*$'\n'*) continue ;;
             esac
@@ -301,7 +312,7 @@ jobs:
           # gymnastics. Build it to a file, load via --rawfile.
           {
             cat <<'COMPOSER_HEAD'
-          You are a triage assistant for Donut Browser. You compose ONE short GitHub comment in response to a freshly opened issue. The triage step has already classified the issue — use the classification verbatim, do not re-litigate it.
+          You are a triage assistant for Donut Browser. You compose ONE short GitHub comment in response to a freshly opened issue. The triage step has already classified the issue. Use the classification verbatim, do not re-litigate it.
 
           COMPOSER_HEAD
             cat /tmp/scope-and-pricing.md
@@ -309,16 +320,17 @@ jobs:
             cat /tmp/repo-context.txt
             cat <<'COMPOSER_TAIL'
 
-          # RULES — STRICT
+          # STRICT RULES
 
           ## Output shape
           - One sentence acknowledging the report.
-          - Then **Missing information** — only if there is anything actually missing. Skip this section if the user already provided OS, Donut Browser version, Wayfern version, repro steps, and any logs the situation calls for.
+          - Then a line reading exactly `Missing information:`, only if something is actually missing. Skip this section if the user already provided OS, Donut Browser version, Wayfern version, repro steps, and any logs the situation calls for.
           - Maximum 15 lines.
-          - No labels, no `Label:` line, no markdown headings other than `**Missing information**`.
+          - No labels, no `Label:` line, no markdown headings, and no bold. `Missing information:` is a plain line, not a heading.
           - No closing pleasantries ("please let me know", "happy to help", etc.).
+          - Write plainly: no em dashes, no emoji, no bold.
 
-          ## Forbidden — never do these
+          ## Forbidden: never do these
           - NEVER include a `Possible cause` / `Likely cause` / `Root cause` / `Probably caused by` section. You do not have enough information; speculation is always wrong here.
           - NEVER cite internal file paths or line numbers in the comment. Internal references rot and confuse non-developers.
           - NEVER reference how subscription / paid-plan checks work internally. You do not know whether the user's claim is correct.
@@ -331,7 +343,7 @@ jobs:
           The triage classification (`triage.classification`) determines the response shape:
 
           - `bug-in-scope`: ask for what is missing using the user's reported OS log path. Be concrete about how to obtain logs.
-          - `bug-template-violation` or `ai-generated-junk`: politely ask the user to refile using the bug-report template (the Operating System, Donut Browser version, Wayfern version, Steps to reproduce, Error logs sections). If they cited "documentation" from any non-`donutbrowser.com`/non-`github.com/zhom` URL (e.g. context7, deepwiki), gently note that those are AI-generated third-party summaries and the only authoritative sources are this repo and donutbrowser.com.
+          - `bug-template-violation` or `automated-content`: politely ask the user to refile using the bug-report template (the Operating System, Donut Browser version, Wayfern version, Steps to reproduce, Error logs sections). If they cited "documentation" from any non-`donutbrowser.com`/non-`github.com/zhom` URL (e.g. context7, deepwiki), gently note that those are AI-generated third-party summaries and the only authoritative sources are this repo and donutbrowser.com.
           - `feature-request`: one neutral sentence acknowledging, then ask only what is genuinely needed (concrete use case, whether a workaround would suffice). Do NOT validate.
           - `fork-request`: one neutral sentence acknowledging the request. Note that this would substantially increase support burden and the maintainer evaluates such requests on a case-by-case basis. Ask whether the alternative fork supports all platforms the user uses (macOS / Windows / Linux). No "clear enhancement" language.
           - `regression`: do NOT call known/expected. Ask which exact previous version was the last working one, what changed in the user's environment between then and now, and the specific delta in symptoms.
@@ -344,8 +356,8 @@ jobs:
           If the issue body is not in English, write the comment in English (the maintainer reads English). The FIRST line must politely ask the user to communicate in English so the maintainer can help. Then continue with the normal triage response, in English.
 
           ## OS-specific log paths
-          Recommend Settings → Advanced → Copy logs first — it bundles the
-          latest rotated log onto the clipboard without the user hunting for
+          Recommend Settings → Advanced → Copy logs first. It puts the
+          latest rotated log on the clipboard without the user hunting for
           a directory. If they want to attach files directly, point at the
           path that matches `triage.operating_system`. The active log is
           always `DonutBrowser.log`; rotated copies sit next to it.
@@ -356,26 +368,27 @@ jobs:
 
           ## Known error signatures (apply BEFORE asking generic questions)
           If the issue body contains any of these, lead with the matching
-          response — do NOT speculate about other causes:
+          response. Do NOT speculate about other causes:
 
-          - `CDP not ready after N attempts on port X: HTTP 5xx ...` —
-            this is loopback interception by a firewall / antivirus
+          - `CDP not ready after N attempts on port X: HTTP 5xx ...`
+            This is loopback interception by a firewall / antivirus
             web-shield / VPN / MDM. Lead with that question (specifically:
             Kaspersky, Bitdefender, ESET, Avast/AVG, Yandex Protect on
             Windows; Little Snitch, LuLu, corporate MDM on macOS; any
             VPN). Suggest temporarily disabling the AV's web-shield
             component (NOT the whole AV) and retrying. Do NOT mention
             Gatekeeper, first-launch verification, code signing, or
-            quarantine — none of those cause an HTTP 5xx response, and
+            quarantine. None of those cause an HTTP 5xx response, and
             Gatekeeper never delays a launch long enough to produce a
             "120 attempts" failure.
           COMPOSER_TAIL
           } > /tmp/composer-system.txt
           wc -c /tmp/composer-system.txt
 
-      - name: Stage 2 — Compose response
+      - name: Stage 2 (compose response)
+        id: compose
         env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GH_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
           IS_FIRST_TIME: ${{ steps.check-first-time.outputs.is_first_time }}
         run: |
@@ -383,7 +396,7 @@ jobs:
           if [ "$IS_FIRST_TIME" = "true" ]; then
             # Use printf with %s so the apostrophe inside the string never has to
             # cross a shell single-quote boundary.
-            printf '%s' 'This is the first issue from this user — start the comment with "Thanks for opening your first issue!" on its own line.' > /tmp/greeting.txt
+            printf '%s' 'This is the first issue from this user. Start the comment with "Thanks for opening your first issue!" on its own line.' > /tmp/greeting.txt
           else
             : > /tmp/greeting.txt
           fi
@@ -408,31 +421,46 @@ jobs:
                     + "Title: " + $title
                     + "\nAuthor: " + $author
                     + "\n\n## Triage result\n" + $triage
-                    + "\n\n## Parsed template fields\n" + $fields
-                    + "\n\n## Raw issue body\n" + $body
+                    + "\n\n## Sanitized template fields\n" + $fields
+                    + "\n\n## Sanitized issue body\n" + $body
                     + "\n\n## Source files (selected by triage)\n" + $files) }
               ]
             }')
 
-          RESPONSE=$(curl -fsSL https://openrouter.ai/api/v1/chat/completions \
-            -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+          # Same as triage: a quota or transport error must not fail the run. When
+          # no comment can be composed the remaining steps are skipped instead.
+          STATUS=$(curl -sSL -o /tmp/compose-response.json -w '%{http_code}' \
+            https://models.github.ai/inference/chat/completions \
+            -H "Authorization: Bearer $GH_MODELS_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
             -H "Content-Type: application/json" \
-            -d "$PAYLOAD")
+            -d "$PAYLOAD" || echo "000")
 
-          jq -r '.choices[0].message.content // empty' <<< "$RESPONSE" > /tmp/ai-comment.txt
-
-          if [ ! -s /tmp/ai-comment.txt ]; then
-            echo "::error::Composer returned empty response"
-            echo "Raw response:"
-            echo "$RESPONSE"
-            exit 1
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::GitHub Models returned HTTP $STATUS; skipping the triage comment"
+            printf '%s\n' "composer inference call failed with HTTP $STATUS" >> /tmp/ai-degraded
+            echo "has_comment=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
+          jq -r '.choices[0].message.content // empty' /tmp/compose-response.json > /tmp/ai-comment.txt || : > /tmp/ai-comment.txt
+
+          if [ ! -s /tmp/ai-comment.txt ]; then
+            echo "::error::Composer returned empty response; skipping the triage comment"
+            printf '%s\n' "composer returned an empty response" >> /tmp/ai-degraded
+            echo "has_comment=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "has_comment=true" >> "$GITHUB_OUTPUT"
+
       - name: Strip forbidden sections (defense in depth)
+        if: steps.compose.outputs.has_comment == 'true'
         run: |
-          # Even with explicit prompt rules, LLMs sometimes still emit "Possible cause"
-          # and friends. Strip any such heading + its block. Also drop any stray
-          # `Label:` lines from earlier prompt iterations.
+          # LLMs still emit "Possible cause" and friends despite the prompt rules.
+          # Strip any such heading and its block, plus stray `Label:` lines left
+          # over from earlier prompt iterations.
           python3 - <<'EOF'
           import re
           path = '/tmp/ai-comment.txt'
@@ -451,18 +479,33 @@ jobs:
           EOF
 
       - name: Post comment (no labeling)
+        if: steps.compose.outputs.has_comment == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
           gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file /tmp/ai-comment.txt
 
+
+      # The steps above deliberately degrade rather than block: an inference
+      # outage must never close a contributor's issue or flag their pull
+      # request. But a run that skipped the check it exists to perform has not
+      # succeeded, and reporting green hides that the automation is dead.
+      - name: Fail if the AI check did not actually run
+        if: always()
+        run: |
+          if [ -f /tmp/ai-degraded ]; then
+            echo "::error::This check degraded to a no-op and its result was not verified:"
+            sed 's/^/  - /' /tmp/ai-degraded
+            exit 1
+          fi
+
   analyze-pr:
     if: github.repository == 'zhom/donutbrowser' && github.event_name == 'pull_request_target' && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
 
       - name: Check if first-time contributor
         id: check-first-time
@@ -484,8 +527,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
-          gh api "/repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" \
+          gh api --paginate "/repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
             --jq '.[] | "- \(.filename) (\(.status)) +\(.additions)/-\(.deletions)"' \
             > /tmp/pr-files.txt
 
@@ -499,19 +543,33 @@ jobs:
           cp CLAUDE.md /tmp/repo-context.txt
 
           : > /tmp/related-file-contents.txt
-          gh api "/repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --jq '.[].filename' | while IFS= read -r filepath; do
-            if [ -f "$filepath" ] && file --mime "$filepath" | grep -q "text/"; then
-              echo "=== $filepath (full file) ===" >> /tmp/related-file-contents.txt
-              cat "$filepath" >> /tmp/related-file-contents.txt
-              echo "" >> /tmp/related-file-contents.txt
+          gh api --paginate "/repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
+            --jq '.[] | select(.status != "removed") | [.filename, .sha] | @tsv' |
+          while IFS=$'\t' read -r filepath blob_sha; do
+            case "$filepath" in
+              /*|*..*|*$'\n'*) continue ;;
+            esac
+            blob_file=$(mktemp)
+            if gh api "/repos/$HEAD_REPOSITORY/git/blobs/$blob_sha" --jq .content \
+              | tr -d '\n' | base64 --decode > "$blob_file" 2>/dev/null \
+              && file --mime "$blob_file" | grep -q "text/"; then
+                echo "=== $filepath (head revision) ===" >> /tmp/related-file-contents.txt
+                cat "$blob_file" >> /tmp/related-file-contents.txt
+                echo "" >> /tmp/related-file-contents.txt
             fi
+            rm -f "$blob_file"
           done
           head -c 100000 /tmp/related-file-contents.txt > /tmp/pr-file-context.txt
+          node scripts/redact-sensitive-text.mjs < /tmp/pr-diff.txt > /tmp/pr-diff.safe.txt
+          mv /tmp/pr-diff.safe.txt /tmp/pr-diff.txt
+          node scripts/redact-sensitive-text.mjs < /tmp/pr-file-context.txt > /tmp/pr-file-context.safe.txt
+          mv /tmp/pr-file-context.safe.txt /tmp/pr-file-context.txt
 
       - name: Analyze PR with AI
+        id: analyze
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GH_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
@@ -525,8 +583,8 @@ jobs:
             GREETING='This is a first-time contributor. Start your comment with: "Thanks for your first PR!"'
           fi
 
-          printf '%s' "$PR_TITLE" > /tmp/pr-title.txt
-          printf '%s' "${PR_BODY:-}" > /tmp/pr-body.txt
+          printf '%s' "$PR_TITLE" | node scripts/redact-sensitive-text.mjs > /tmp/pr-title.txt
+          printf '%s' "${PR_BODY:-}" | node scripts/redact-sensitive-text.mjs > /tmp/pr-body.txt
           printf '%s' "$PR_AUTHOR" > /tmp/pr-author.txt
           printf '%s' "$PR_BASE" > /tmp/pr-base.txt
           printf '%s' "$PR_HEAD" > /tmp/pr-head.txt
@@ -550,7 +608,7 @@ jobs:
               messages: [
                 {
                   role: "system",
-                  content: ("You are a code review bot for Donut Browser, an open-source anti-detect browser (Tauri desktop app: Rust backend + Next.js frontend).\n\nProject guidelines and structure:\n" + $repo_context + "\n\nContributing guidelines:\n" + $contributing + "\n\nYou have access to the full changed files and the diff. Use them to give a substantive review.\n\nReview this PR and produce a single comment. Format:\n\n1. One sentence summarizing what this PR does and whether the approach is sound.\n2. **Code review** - Specific observations about the actual code changes. Mention file names and what you see in the diff. Look for:\n   - Bugs or logic errors in the changed code\n   - Security issues (SQL injection, path traversal, XSS, command injection)\n   - Missing error handling or edge cases\n   - Breaking changes to existing APIs or behavior\n   - If UI text was added/changed, check if all 7 translation files (en, es, fr, ja, pt, ru, zh) in src/i18n/locales/ were updated\n   - If Tauri commands were added/removed, the unused-commands test in lib.rs needs updating\n3. **Suggestions** - Concrete improvements if any. Skip if the PR looks good.\n\nRules:\n- Be substantive. Review the actual diff, not just the description.\n- Do NOT nitpick formatting or style — the project has automated linting (biome + clippy + rustfmt).\n- Do NOT just summarize the PR description back to the user — they wrote it, they know what it says.\n- If the PR is good, say so briefly.\n- Never exceed 20 lines.")
+                  content: ("You are a code review bot for Donut Browser, an open-source anti-detect browser (Tauri desktop app: Rust backend + Next.js frontend).\n\nProject guidelines and structure:\n" + $repo_context + "\n\nContributing guidelines:\n" + $contributing + "\n\nYou have access to sanitized head-revision contents for changed files and a sanitized diff. Use them to give a substantive review.\n\nReview this PR and produce a single comment. Format:\n\n1. One sentence summarizing what this PR does and whether the approach is sound.\n2. Code review: specific observations about the actual code changes. Mention file names and what you see in the diff. Look for:\n   - Bugs or logic errors in the changed code\n   - Security issues (SQL injection, path traversal, XSS, command injection)\n   - Missing error handling or edge cases\n   - Breaking changes to existing APIs or behavior\n   - If UI text was added or changed, verify the key exists in every JSON file under src/i18n/locales/\n   - If Tauri commands were added or removed, verify e2e/coverage-map.mjs is updated exactly once per command\n3. Suggestions: concrete improvements if any. Skip if the PR looks good.\n\nRules:\n- Be substantive. Review the actual diff, not just the description.\n- Do NOT nitpick formatting or style; the project has automated linting (biome + clippy + rustfmt).\n- Do NOT just summarize the PR description back to the user. They wrote it, they know what it says.\n- If the PR is good, say so briefly.\n- Never exceed 20 lines.\n- Write plainly: no em dashes, no emoji, no bold.")
                 },
                 {
                   role: "user",
@@ -568,31 +626,63 @@ jobs:
               ]
             }')
 
-          RESPONSE=$(curl -fsSL https://openrouter.ai/api/v1/chat/completions \
-            -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+          # A quota or transport error must not fail the run; skip the review
+          # comment instead of red-crossing an otherwise healthy pull request.
+          STATUS=$(curl -sSL -o /tmp/pr-response.json -w '%{http_code}' \
+            https://models.github.ai/inference/chat/completions \
+            -H "Authorization: Bearer $GH_MODELS_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
             -H "Content-Type: application/json" \
-            -d "$PAYLOAD")
+            -d "$PAYLOAD" || echo "000")
 
-          jq -r '.choices[0].message.content // empty' <<< "$RESPONSE" > /tmp/ai-comment.txt
-
-          if [ ! -s /tmp/ai-comment.txt ]; then
-            echo "::error::AI response was empty"
-            echo "Raw response:"
-            echo "$RESPONSE"
-            exit 1
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::GitHub Models returned HTTP $STATUS; skipping the review comment"
+            printf '%s\n' "PR review inference call failed with HTTP $STATUS" >> /tmp/ai-degraded
+            echo "has_comment=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
+          jq -r '.choices[0].message.content // empty' /tmp/pr-response.json > /tmp/ai-comment.txt || : > /tmp/ai-comment.txt
+
+          if [ ! -s /tmp/ai-comment.txt ]; then
+            echo "::error::AI response was empty; skipping the review comment"
+            printf '%s\n' "PR review returned an empty response" >> /tmp/ai-degraded
+            echo "has_comment=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "has_comment=true" >> "$GITHUB_OUTPUT"
+
       - name: Post comment
+        if: steps.analyze.outputs.has_comment == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file /tmp/ai-comment.txt
 
+
+      # The steps above deliberately degrade rather than block: an inference
+      # outage must never close a contributor's issue or flag their pull
+      # request. But a run that skipped the check it exists to perform has not
+      # succeeded, and reporting green hides that the automation is dead.
+      - name: Fail if the AI check did not actually run
+        if: always()
+        run: |
+          if [ -f /tmp/ai-degraded ]; then
+            echo "::error::This check degraded to a no-op and its result was not verified:"
+            sed 's/^/  - /' /tmp/ai-degraded
+            exit 1
+          fi
+
   opencode-command:
     if: |
       github.repository == 'zhom/donutbrowser' &&
       (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment') &&
+      (github.event.comment.author_association == 'OWNER' ||
+       github.event.comment.author_association == 'MEMBER' ||
+       github.event.comment.author_association == 'COLLABORATOR') &&
       (contains(github.event.comment.body, ' /oc') ||
        startsWith(github.event.comment.body, '/oc') ||
        contains(github.event.comment.body, ' /opencode') ||
@@ -600,10 +690,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 #v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
 
       - name: Run opencode
-        uses: anomalyco/opencode/github@10c894bdeef3618f5666fb506ef7f9491bb964d8 #v1.17.13
+        uses: anomalyco/opencode/github@02546dfc2e4515a4f90aaf9ceb3890df2ac2b479 #v1.18.17
         env:
           ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
           TOKEN: ${{ secrets.GITHUB_TOKEN }}

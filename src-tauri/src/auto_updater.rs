@@ -669,6 +669,7 @@ mod tests {
       created_by_email: None,
       dns_blocklist: None,
       password_protected: false,
+      clear_on_close: false,
       created_at: None,
       updated_at: None,
     }
@@ -803,13 +804,13 @@ mod tests {
     let test_settings_manager = TestSettingsManager::new(temp_dir.path().to_path_buf());
 
     let mut state = AutoUpdateState::default();
-    state.disabled_browsers.insert("firefox".to_string());
+    state.disabled_browsers.insert("testbrowser".to_string());
     state
       .auto_update_downloads
-      .insert("firefox-1.1.0".to_string());
+      .insert("testbrowser-1.1.0".to_string());
     state.pending_updates.push(UpdateNotification {
       id: "test".to_string(),
-      browser: "firefox".to_string(),
+      browser: "testbrowser".to_string(),
       current_version: "1.0.0".to_string(),
       new_version: "1.1.0".to_string(),
       affected_profiles: vec!["profile1".to_string()],
@@ -831,9 +832,11 @@ mod tests {
       serde_json::from_str(&content).expect("Failed to deserialize state");
 
     assert_eq!(loaded_state.disabled_browsers.len(), 1);
-    assert!(loaded_state.disabled_browsers.contains("firefox"));
+    assert!(loaded_state.disabled_browsers.contains("testbrowser"));
     assert_eq!(loaded_state.auto_update_downloads.len(), 1);
-    assert!(loaded_state.auto_update_downloads.contains("firefox-1.1.0"));
+    assert!(loaded_state
+      .auto_update_downloads
+      .contains("testbrowser-1.1.0"));
     assert_eq!(loaded_state.pending_updates.len(), 1);
     assert_eq!(loaded_state.pending_updates[0].id, "test");
   }
@@ -872,16 +875,16 @@ mod tests {
     // Initially not disabled (empty state file means default state)
     let state = AutoUpdateState::default();
     assert!(
-      !state.disabled_browsers.contains("firefox"),
-      "Firefox should not be disabled initially"
+      !state.disabled_browsers.contains("testbrowser"),
+      "testbrowser should not be disabled initially"
     );
 
     // Start update (should disable)
     let mut state = AutoUpdateState::default();
-    state.disabled_browsers.insert("firefox".to_string());
+    state.disabled_browsers.insert("testbrowser".to_string());
     state
       .auto_update_downloads
-      .insert("firefox-1.1.0".to_string());
+      .insert("testbrowser-1.1.0".to_string());
     let json = serde_json::to_string_pretty(&state).expect("Failed to serialize state");
     std::fs::write(&state_file, json).expect("Failed to write state file");
 
@@ -890,18 +893,20 @@ mod tests {
     let loaded_state: AutoUpdateState =
       serde_json::from_str(&content).expect("Failed to deserialize state");
     assert!(
-      loaded_state.disabled_browsers.contains("firefox"),
-      "Firefox should be disabled"
+      loaded_state.disabled_browsers.contains("testbrowser"),
+      "testbrowser should be disabled"
     );
     assert!(
-      loaded_state.auto_update_downloads.contains("firefox-1.1.0"),
-      "Firefox download should be tracked"
+      loaded_state
+        .auto_update_downloads
+        .contains("testbrowser-1.1.0"),
+      "testbrowser download should be tracked"
     );
 
     // Complete update (should enable)
     let mut state = loaded_state;
-    state.disabled_browsers.remove("firefox");
-    state.auto_update_downloads.remove("firefox-1.1.0");
+    state.disabled_browsers.remove("testbrowser");
+    state.auto_update_downloads.remove("testbrowser-1.1.0");
     let json = serde_json::to_string_pretty(&state).expect("Failed to serialize final state");
     std::fs::write(&state_file, json).expect("Failed to write final state file");
 
@@ -910,12 +915,14 @@ mod tests {
     let final_state: AutoUpdateState =
       serde_json::from_str(&content).expect("Failed to deserialize final state");
     assert!(
-      !final_state.disabled_browsers.contains("firefox"),
-      "Firefox should be enabled again"
+      !final_state.disabled_browsers.contains("testbrowser"),
+      "testbrowser should be enabled again"
     );
     assert!(
-      !final_state.auto_update_downloads.contains("firefox-1.1.0"),
-      "Firefox download should not be tracked anymore"
+      !final_state
+        .auto_update_downloads
+        .contains("testbrowser-1.1.0"),
+      "testbrowser download should not be tracked anymore"
     );
   }
 
@@ -946,7 +953,7 @@ mod tests {
     let mut state = AutoUpdateState::default();
     state.pending_updates.push(UpdateNotification {
       id: "test_notification".to_string(),
-      browser: "firefox".to_string(),
+      browser: "testbrowser".to_string(),
       current_version: "1.0.0".to_string(),
       new_version: "1.1.0".to_string(),
       affected_profiles: vec!["profile1".to_string()],

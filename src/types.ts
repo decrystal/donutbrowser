@@ -1,9 +1,13 @@
+import type { CookieBotSchedule } from "@/lib/cookie-bot";
+import type { RemoteSessionState } from "@/lib/remote-sessions";
+
 export interface ProxySettings {
-  proxy_type: string; // "http", "https", "socks4", "socks5", or "ss" (Shadowsocks)
+  proxy_type: string;
   host: string;
   port: number;
   username?: string;
   password?: string;
+  vless_uri?: string;
 }
 
 export interface TableSortingSettings {
@@ -33,6 +37,7 @@ export interface BrowserProfile {
   last_sync?: number; // Timestamp of last successful sync (epoch seconds)
   host_os?: string; // OS where profile was created ("macos", "windows", "linux")
   ephemeral?: boolean;
+  clear_on_close?: boolean;
   extension_group_id?: string;
   proxy_bypass_rules?: string[];
   created_by_id?: string;
@@ -58,6 +63,11 @@ export interface Extension {
   description?: string;
   author?: string;
   homepage_url?: string;
+  /** How the payload was imported: a `.crx`/`.zip` archive, or a folder. */
+  source_kind: "archive" | "unpacked";
+  /** Absolute folder the extension is loaded from in place. Set means nothing
+   * was copied into Donut, so the extension is machine-local and never syncs. */
+  linked_path?: string;
 }
 
 export interface ExtensionGroup {
@@ -81,11 +91,11 @@ export interface SyncSettings {
 
 /**
  * Capability/limit set derived from the plan by the backend. Features are gated
- * on these flags instead of a single "is paid?" check, so a plan like the future
- * "starter" tier (cross-OS fingerprints + cloud backup, no automation) is just
- * data. Mirrors `apps/backend/src/plans/entitlements.ts`. Resolve via
- * `getEntitlements()` — the desktop populates it, but it stays optional for
- * safety on older state.
+ * on these flags instead of a single "is paid?" check, so a plan like "solo"
+ * (cloud backup + nightly cookie bot, no automation, no fingerprint editing, no
+ * hands-on remote session) is just data. Mirrors
+ * `apps/backend/src/plans/entitlements.ts`. Resolve via `getEntitlements()` —
+ * the desktop populates it, but it stays optional for safety on older state.
  */
 export interface Entitlements {
   active: boolean;
@@ -93,9 +103,42 @@ export interface Entitlements {
   crossOsFingerprints: boolean;
   cloudBackup: boolean;
   teamCollaboration: boolean;
+  /** Overnight profile warming on a leased remote host. */
+  cookieBot: boolean;
+  /**
+   * May open a HANDS-ON remote session. Not implied by `cookieBot` or by a
+   * non-zero `remoteBrowserHours`: solo funds a nightly bot out of its hours and
+   * may not drive a remote browser itself, so any UI offering interactive remote
+   * control must read this flag.
+   */
+  remoteInteractive: boolean;
   profileLimit: number;
   requestsPerHour: number;
+  /**
+   * Per-seat monthly allowance for remote sessions. Reporting only: the
+   * spendable figure is whatever `get_remote_hours_quota` returns, because a
+   * team pools this across its seats and only the server knows the seat count.
+   */
+  remoteBrowserHours: number;
 }
+
+/**
+ * What a backend older than the current release actually sends. Read it through
+ * `getEntitlements()`, which fills the gaps — never off `CloudUser` directly, or
+ * a paying customer's Cookie Bot silently reads `false`.
+ *
+ * `remoteInteractive` joins the optional set for the same reason `cookieBot`
+ * did: a backend predating the solo tier omits it, and reading the absent key as
+ * `false` would take interactive remote sessions away from a Pro customer whose
+ * only mistake was a stale cached login.
+ */
+export type ServerEntitlements = Omit<
+  Entitlements,
+  "cookieBot" | "remoteBrowserHours" | "remoteInteractive"
+> &
+  Partial<
+    Pick<Entitlements, "cookieBot" | "remoteBrowserHours" | "remoteInteractive">
+  >;
 
 export interface CloudUser {
   id: string;
@@ -119,7 +162,45 @@ export interface CloudUser {
   isPrimaryDevice?: boolean | null;
   // Plan-derived capabilities. The desktop resolves this before handing CloudUser
   // to the UI; optional to stay safe on older cached state.
-  entitlements?: Entitlements;
+  entitlements?: ServerEntitlements;
+}
+
+/**
+ * Cookie Bot and remote-session wire types. Defined next to the transport that
+ * owns them (`src/lib/cookie-bot.ts`, `src/lib/remote-sessions.ts`) and
+ * re-exported here so a component reads one module. Type-only, so nothing is
+ * pulled into the bundle.
+ */
+export type {
+  CookieBotConflict,
+  CookieBotPreset,
+  CookieBotPresetList,
+  CookieBotRun,
+  CookieBotRunPage,
+  CookieBotRunStarted,
+  CookieBotSchedule,
+  CookieBotScheduleInput,
+  CookieBotScheduleList,
+  CookieBotScheduleSaved,
+  CookieBotScope,
+  CookieBotUsage,
+  CookieBotUsageMember,
+  CookieBotUsageProfile,
+  RemoteHoursMember,
+  RemoteHoursQuota,
+} from "@/lib/cookie-bot";
+export type {
+  RemoteSessionPhase,
+  RemoteSessionSnapshot,
+  RemoteSessionState,
+} from "@/lib/remote-sessions";
+
+/** Where a profile stands with the bot, as one row of the profile table reads it. */
+export interface ProfileBotState {
+  /** The stored enrolment, or null when the profile is not enrolled. */
+  schedule: CookieBotSchedule | null;
+  /** A remote session for this profile that has not closed yet. */
+  liveSession: RemoteSessionState | null;
 }
 
 export interface ProfileLockInfo {
@@ -198,6 +279,78 @@ export interface DetectedProfile {
   mapped_browser: string;
 }
 
+export interface ImportProfileItem {
+  source_path: string;
+  /**
+   * Source browser family. Selects which OS keychain entry holds the key that
+   * unlocks the source's cookies and passwords, so it decides whether secrets
+   * survive the import.
+   */
+  browser_type?: string;
+  new_profile_name: string;
+  /** Mutually exclusive with `vpn_id`; the importer rejects setting both. */
+  proxy_id?: string | null;
+  vpn_id?: string | null;
+  /** Import even though the source browser is still running. */
+  allow_running?: boolean;
+}
+
+/** Stable warning codes; each maps to `importProfile.warnings.*`. */
+export type ProfileImportWarning =
+  | "secretsNotMigrated"
+  | "appBoundEncrypted"
+  | "storeTooOld"
+  | "storeTooNew"
+  | "sourceBrowserRunning"
+  | "securePreferencesReset"
+  | "extensionsPartial"
+  | "storeUnreadable";
+
+export interface ProfileImportReport {
+  cookies_migrated: number;
+  cookies_unrecoverable: number;
+  passwords_migrated: number;
+  passwords_unrecoverable: number;
+  payment_methods_migrated: number;
+  payment_methods_unrecoverable: number;
+  extensions_migrated: number;
+  history_entries: number;
+  bookmarks: number;
+  local_storage_origins: number;
+  bytes_copied: number;
+  warnings: ProfileImportWarning[];
+}
+
+export interface ProfileImportItemResult {
+  name: string;
+  source_path: string;
+  status: "imported" | "skipped" | "failed";
+  profile_id: string | null;
+  error: string | null;
+  /** What actually came across. Present when status is "imported". */
+  report?: ProfileImportReport | null;
+}
+
+export interface ProfileImportBatchResult {
+  imported_count: number;
+  skipped_count: number;
+  failed_count: number;
+  results: ProfileImportItemResult[];
+}
+
+export interface ArchiveScanResult {
+  extracted_dir: string;
+  profiles: DetectedProfile[];
+}
+
+export interface ProfileImportProgress {
+  total: number;
+  completed: number;
+  index: number;
+  name: string;
+  status: "importing" | "imported" | "skipped" | "failed";
+}
+
 export interface BrowserReleaseTypes {
   stable?: string;
 }
@@ -212,6 +365,10 @@ export interface AppUpdateInfo {
   manual_update_required: boolean;
   release_page_url?: string;
   repo_update: boolean;
+  /** URL of the release's SHA256SUMS.txt; downloads are verified against it. */
+  checksums_url?: string | null;
+  /** GitHub-computed digest of the chosen asset ("sha256:<hex>"). */
+  asset_digest?: string | null;
 }
 
 export interface AppUpdateProgress {
@@ -521,6 +678,7 @@ export interface ParsedProxyLine {
   port: number;
   username?: string;
   password?: string;
+  vless_uri?: string;
   original_line: string;
 }
 
@@ -558,4 +716,56 @@ export interface VpnStatus {
   bytes_sent?: number;
   bytes_received?: number;
   last_handshake?: number;
+}
+
+/** Result of comparing a proxy's exit node against a profile's fingerprint. */
+export interface ConsistencyResult {
+  consistent: boolean;
+  checked: boolean;
+  exit_ip: string | null;
+  exit_country_code: string | null;
+  exit_timezone: string | null;
+  fingerprint_timezone: string | null;
+  fingerprint_language: string | null;
+  /** Which dimensions disagree: "timezone", "language". */
+  mismatches: string[];
+}
+
+/**
+ * How strongly an extension is believed to be a VPN or proxy tool.
+ * "capability" is not such a claim: it means only that the extension holds
+ * Chromium's `proxy` permission, which download managers do too.
+ */
+export type VpnExtensionConfidence = "confirmed" | "likely" | "capability";
+
+/** How much of a profile's extension set could be read. */
+export type ExtensionScanState =
+  | "scanned"
+  | "partial"
+  | "encrypted"
+  | "ephemeral"
+  | "missing";
+
+/** An extension found in a profile that could change where the browser connects. */
+export interface DetectedVpnExtension {
+  /** Acknowledgement identity: `donut:<uuid>` or `crx:<id>`. */
+  key: string;
+  name: string;
+  version: string | null;
+  /** "donut" (managed by Donut) or "browser" (installed in the profile). */
+  source: string;
+  confidence: VpnExtensionConfidence;
+  /** Holds the `proxy` permission outright, so it can change the proxy today. */
+  proxy_control: boolean;
+  signals: string[];
+}
+
+/** Local-only checks answered before a launch starts any worker. */
+export interface PreLaunchChecks {
+  vpn_extensions: DetectedVpnExtension[];
+  scan_state: ExtensionScanState;
+  consistency: ConsistencyResult;
+  exit_probe_pending: boolean;
+  exit_measurement_unreliable: boolean;
+  consent_token: string | null;
 }

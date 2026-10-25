@@ -3,14 +3,17 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrent } from "@tauri-apps/plugin-deep-link";
+import { motion } from "motion/react";
 import { useOnborda } from "onborda";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { AboutDialog } from "@/components/about-dialog";
 import { AccountPage } from "@/components/account-page";
 import { CloneProfileDialog } from "@/components/clone-profile-dialog";
 import { CloseConfirmDialog } from "@/components/close-confirm-dialog";
 import { CommandPalette } from "@/components/command-palette";
 import { CommercialTrialModal } from "@/components/commercial-trial-modal";
+import { CookieBotPage, type CookieBotTab } from "@/components/cookie-bot-page";
 import { CookieCopyDialog } from "@/components/cookie-copy-dialog";
 import { CookieManagementDialog } from "@/components/cookie-management-dialog";
 import { CreateProfileDialog } from "@/components/create-profile-dialog";
@@ -25,6 +28,11 @@ import { ImportProfileDialog } from "@/components/import-profile-dialog";
 import { IntegrationsDialog } from "@/components/integrations-dialog";
 import { ONBOARDING_TOUR } from "@/components/onboarding-provider";
 import { PermissionDialog } from "@/components/permission-dialog";
+import {
+  type GateDecision,
+  type GateFindings,
+  PreLaunchGateDialog,
+} from "@/components/pre-launch-gate-dialog";
 import { ProfilesDataTable } from "@/components/profile-data-table";
 import {
   type PasswordDialogMode,
@@ -48,6 +56,7 @@ import { WindowResizeWarningDialog } from "@/components/window-resize-warning-di
 import { useAppUpdateNotifications } from "@/hooks/use-app-update-notifications";
 import { useCloudAuth } from "@/hooks/use-cloud-auth";
 import { useCommercialTrial } from "@/hooks/use-commercial-trial";
+import { cookieBotScopeFor, useCookieBot } from "@/hooks/use-cookie-bot";
 import { useGroupEvents } from "@/hooks/use-group-events";
 import type { PermissionType } from "@/hooks/use-permissions";
 import { usePermissions } from "@/hooks/use-permissions";
@@ -58,9 +67,11 @@ import { useUpdateNotifications } from "@/hooks/use-update-notifications";
 import { useVersionUpdater } from "@/hooks/use-version-updater";
 import { useVpnEvents } from "@/hooks/use-vpn-events";
 import { useWayfernTerms } from "@/hooks/use-wayfern-terms";
-import { translateBackendError } from "@/lib/backend-errors";
-import { getEntitlements } from "@/lib/entitlements";
+import { parseBackendError, translateBackendError } from "@/lib/backend-errors";
+import { canUseCookieBot, getEntitlements } from "@/lib/entitlements";
+import { MOTION_EASE_OUT } from "@/lib/motion";
 import {
+  ONBOARDING_TOUR_CLOSED_EVENT,
   ONBOARDING_TOUR_FINISHED_EVENT,
   setOnboardingActive,
 } from "@/lib/onboarding-signal";
@@ -77,7 +88,42 @@ import {
   showSyncProgressToast,
   showToast,
 } from "@/lib/toast-utils";
-import type { BrowserProfile, SyncSettings, WayfernConfig } from "@/types";
+import type {
+  BrowserProfile,
+  ConsistencyResult,
+  PreLaunchChecks,
+  SyncSettings,
+  WayfernConfig,
+} from "@/types";
+
+type GateRequest = {
+  profile: BrowserProfile;
+  findings: GateFindings;
+};
+
+type LaunchResult = {
+  status: "launched" | "cancelled" | "blocked";
+};
+
+/**
+ * Rebuild the mismatch detail the gate dialog renders from a
+ * FINGERPRINT_EXIT_MISMATCH error's params. Every param is a string, because
+ * backend error params always are.
+ */
+function consistencyFromErrorParams(
+  params?: Record<string, string>,
+): ConsistencyResult {
+  return {
+    consistent: false,
+    checked: true,
+    exit_ip: params?.exitIp || null,
+    exit_country_code: params?.exitCountry || null,
+    exit_timezone: params?.exitTimezone || null,
+    fingerprint_timezone: params?.fingerprintTimezone || null,
+    fingerprint_language: params?.fingerprintLanguage || null,
+    mismatches: (params?.mismatches ?? "").split(",").filter(Boolean),
+  };
+}
 
 type BrowserTypeString = "fingerprint_chromium" | "wayfern";
 
@@ -105,31 +151,46 @@ export default function Home() {
   const onboardingHandledRef = useRef(false);
   const [welcomeOpen, setWelcomeOpen] = useState(false);
   const [thankYouOpen, setThankYouOpen] = useState(false);
-  // null = onboarding decision pending; false = not a first-run onboarding (run
-  // the normal permission checks); true = first-run onboarding, so the welcome
-  // flow drives permissions and the standalone permission dialog is suppressed.
+  // null = onboarding decision pending; false = not a first-run session (run
+  // normal permission checks); true = first-run session, so "Not now" really
+  // defers the standalone permission dialog until a later launch.
   const [firstRunOnboarding, setFirstRunOnboarding] = useState<boolean | null>(
     null,
   );
+
+  const persistOnboardingComplete = useCallback(() => {
+    void invoke("complete_onboarding").catch((err: unknown) => {
+      console.error("Failed to persist onboarding completion:", err);
+    });
+  }, []);
 
   // Welcome flow finished. Existing-profile users are done after the welcome +
   // commercial-use steps; users with no profile yet continue into the in-app
   // product tour that walks them through creating their first profile.
   const handleWelcomeComplete = useCallback(() => {
     setWelcomeOpen(false);
-    setFirstRunOnboarding(false);
     if (profiles.length === 0) {
       startOnborda(ONBOARDING_TOUR);
+    } else {
+      persistOnboardingComplete();
     }
-  }, [startOnborda, profiles.length]);
+  }, [persistOnboardingComplete, profiles.length, startOnborda]);
 
-  // The product tour finished (user clicked "Finish", not "Skip") → celebrate.
+  // Finishing or explicitly skipping the product tour completes the one-shot
+  // onboarding. Only reaching the end triggers the celebration.
   useEffect(() => {
-    const handler = () => setThankYouOpen(true);
-    window.addEventListener(ONBOARDING_TOUR_FINISHED_EVENT, handler);
-    return () =>
-      window.removeEventListener(ONBOARDING_TOUR_FINISHED_EVENT, handler);
-  }, []);
+    const handleClosed = () => persistOnboardingComplete();
+    const handleFinished = () => setThankYouOpen(true);
+    window.addEventListener(ONBOARDING_TOUR_CLOSED_EVENT, handleClosed);
+    window.addEventListener(ONBOARDING_TOUR_FINISHED_EVENT, handleFinished);
+    return () => {
+      window.removeEventListener(ONBOARDING_TOUR_CLOSED_EVENT, handleClosed);
+      window.removeEventListener(
+        ONBOARDING_TOUR_FINISHED_EVENT,
+        handleFinished,
+      );
+    };
+  }, [persistOnboardingComplete]);
 
   // Suppress the global browser-download toasts while onboarding (welcome or
   // tour) is active — the welcome dialog shows setup progress itself.
@@ -154,8 +215,9 @@ export default function Home() {
     return () => window.removeEventListener("scroll", pin, true);
   }, [isOnbordaVisible]);
 
-  // On the very first launch, always show the welcome + commercial-use steps
-  // (one-shot: the backend flag is set immediately so it can't trigger again).
+  // On the very first launch, always show the welcome + commercial-use steps.
+  // The completion flag is only persisted after the user finishes or skips the
+  // full flow, so an interrupted setup can recover on the next launch.
   // The welcome dialog itself decides whether to continue into the browser
   // download + profile-creation flow — only when the user has no profile yet.
   useEffect(() => {
@@ -168,7 +230,6 @@ export default function Home() {
           setFirstRunOnboarding(false);
           return;
         }
-        await invoke("complete_onboarding");
         setFirstRunOnboarding(true);
         setWelcomeOpen(true);
       } catch (err) {
@@ -183,8 +244,11 @@ export default function Home() {
   useEffect(() => {
     if (isOnbordaVisible && currentStep === 0 && profiles.length > 0) {
       // Small delay so the new profile row (and its DNS dropdown target) has
-      // mounted before Onborda re-points at it.
-      setCurrentStep(1, 300);
+      // mounted before Onborda re-points at it. Owning the timeout here lets
+      // cleanup cancel it if the tour closes, instead of reopening a dismissed
+      // tour when Onborda's delayed setter eventually fires.
+      const timeout = window.setTimeout(() => setCurrentStep(1), 300);
+      return () => window.clearTimeout(timeout);
     }
   }, [isOnbordaVisible, currentStep, profiles.length, setCurrentStep]);
 
@@ -223,9 +287,17 @@ export default function Home() {
   const { user: cloudUser } = useCloudAuth();
   const crossOsUnlocked = getEntitlements(cloudUser).crossOsFingerprints;
   // Bulk run/stop is a paid (browser automation) feature, matching the
-  // /v1/profiles/batch/run API gate. Free/starter users see the bulk Run/Stop
+  // /v1/profiles/batch/run API gate. Free/solo users see the bulk Run/Stop
   // actions disabled with a Pro badge.
   const automationUnlocked = getEntitlements(cloudUser).browserAutomation;
+  // The rail needs to show a live run from every page, so the shell subscribes
+  // to the shared cookie-bot store too. It is a module singleton, so this costs
+  // one more listener and no extra request. This is also what starts the event
+  // stream for a user who signs in without restarting the app.
+  const { liveSessions: cookieBotLiveSessions } = useCookieBot(
+    canUseCookieBot(cloudUser),
+    cookieBotScopeFor(cloudUser),
+  );
 
   const [selfHostedSyncConfigured, setSelfHostedSyncConfigured] =
     useState(false);
@@ -242,7 +314,12 @@ export default function Home() {
     }
   }, [cloudUser]);
 
-  const syncUnlocked = crossOsUnlocked || selfHostedSyncConfigured;
+  // Cloud sync follows `cloudBackup`, NOT `crossOsFingerprints`. They agreed on
+  // every plan until Solo, which buys 20 cloud backups and deliberately has no
+  // fingerprint editing — so deriving sync from the fingerprint capability put a
+  // Pro badge on the one feature a Solo customer is paying for.
+  const cloudBackupUnlocked = getEntitlements(cloudUser).cloudBackup;
+  const syncUnlocked = cloudBackupUnlocked || selfHostedSyncConfigured;
 
   const [currentPage, setCurrentPage] = useState<AppPage>("profiles");
   const [accountDialogOpen, setAccountDialogOpen] = useState(false);
@@ -256,6 +333,9 @@ export default function Home() {
   const [integrationsInitialTab, setIntegrationsInitialTab] = useState<
     "api" | "mcp"
   >("api");
+  const [cookieBotDialogOpen, setCookieBotDialogOpen] = useState(false);
+  const [cookieBotInitialTab, setCookieBotInitialTab] =
+    useState<CookieBotTab>("overview");
   const [createProfileDialogOpen, setCreateProfileDialogOpen] = useState(false);
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false);
   const [integrationsDialogOpen, setIntegrationsDialogOpen] = useState(false);
@@ -324,6 +404,41 @@ export default function Home() {
   const [currentProfileForSync, setCurrentProfileForSync] =
     useState<BrowserProfile | null>(null);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [aboutDialogOpen, setAboutDialogOpen] = useState(false);
+  // Pre-launch gate. Requests queue instead of overwriting a single resolver:
+  // a bulk run enqueues one per profile, and every waiter must settle or the
+  // Promise.allSettled below it never resolves and the bulk spinner sticks.
+  const gateQueueRef = useRef<
+    Array<{
+      id: number;
+      req: GateRequest;
+      /// The bulk run this request belongs to, or undefined for a single
+      /// launch. Carried per entry so a blanket "apply to the rest" can only
+      /// ever claim the run its own dialog came from.
+      runId: number | undefined;
+      resolve: (decision: GateDecision) => void;
+    }>
+  >([]);
+  const gateRequestSeqRef = useRef(0);
+  const [gateState, setGateState] = useState<{
+    id: number;
+    req: GateRequest;
+    remaining: number;
+  } | null>(null);
+  // Set when the user ticks "apply to the remaining profiles" during a bulk
+  // run, so the rest are answered without prompting again. Scoped to one bulk
+  // run and to the severity it was given for.
+  const blanketGateDecisionRef = useRef<{
+    decision: GateDecision;
+    /// Only auto-answers gates no more severe than the one the user saw. A
+    /// choice made on an extension warning must never silently bypass a hard
+    /// block on a later profile.
+    coversBlocking: boolean;
+    /// Identifies the bulk run, so a single launch started while a bulk run is
+    /// in flight still gets its own dialog.
+    runId: number;
+  } | null>(null);
+  const bulkRunIdRef = useRef(0);
   // Owned by page.tsx so the command palette can request opening the profile
   // info dialog. ProfilesDataTable consumes it through controlled props.
   const [profileInfoDialog, setProfileInfoDialog] =
@@ -347,6 +462,7 @@ export default function Home() {
     setIntegrationsDialogOpen(false);
     setImportProfileDialogOpen(false);
     setAccountDialogOpen(false);
+    setCookieBotDialogOpen(false);
 
     setCurrentPage(page);
     switch (page) {
@@ -364,6 +480,9 @@ export default function Home() {
         break;
       case "groups":
         setGroupManagementDialogOpen(true);
+        break;
+      case "cookieBot":
+        setCookieBotDialogOpen(true);
         break;
       case "integrations":
         setIntegrationsDialogOpen(true);
@@ -430,6 +549,19 @@ export default function Home() {
         case "goGroups":
           handleRailNavigate("groups");
           break;
+        case "goCookieBot": {
+          // Mod+B: navigate first time; flip overview↔activity while already
+          // there, matching how Mod+I flips the integrations tabs.
+          if (currentPage === "cookieBot") {
+            setCookieBotInitialTab((cur) =>
+              cur === "overview" ? "activity" : "overview",
+            );
+          } else {
+            setCookieBotInitialTab("overview");
+            handleRailNavigate("cookieBot");
+          }
+          break;
+        }
         case "goIntegrations": {
           // Mod+I: flip api↔mcp tab when already on integrations.
           if (currentPage === "integrations") {
@@ -871,8 +1003,153 @@ export default function Home() {
     [selectedGroupId, t],
   );
 
+  // Unattended launches — REST and MCP automation — are the only ones the
+  // backend gate lets past a measured mismatch, because there is no dialog for
+  // them to answer. Without a listener that finding was emitted into the void.
+  useEffect(() => {
+    const unlisten = listen<ConsistencyResult>(
+      "fingerprint-consistency-warning",
+      (event) => {
+        const { exit_timezone, fingerprint_timezone } = event.payload;
+        showErrorToast(t("backendErrors.fingerprintExitMismatch"), {
+          description:
+            exit_timezone && fingerprint_timezone
+              ? t("consistencyWarning.timezoneDetail", {
+                  exit: exit_timezone,
+                  fingerprint: fingerprint_timezone,
+                })
+              : undefined,
+          id: `fingerprint-mismatch-${exit_timezone ?? "unknown"}`,
+        });
+      },
+    );
+    return () => {
+      void unlisten.then((fn) => {
+        fn();
+      });
+    };
+  }, [t]);
+
+  // Show the queue's head, and how many are waiting behind it.
+  const syncGateUi = useCallback(() => {
+    const queue = gateQueueRef.current;
+    setGateState(
+      queue.length > 0
+        ? { id: queue[0].id, req: queue[0].req, remaining: queue.length - 1 }
+        : null,
+    );
+  }, []);
+
+  const requestGateDecision = useCallback(
+    (req: GateRequest, runId?: number): Promise<GateDecision> => {
+      const blanket = blanketGateDecisionRef.current;
+      const isBlocking = req.findings.fingerprint !== null;
+      if (
+        blanket &&
+        blanket.runId === runId &&
+        (blanket.coversBlocking || !isBlocking)
+      ) {
+        // A blanket answer covers only whether to launch. The acknowledgements
+        // it carried were about the first profile's specific mismatch and
+        // extensions, and must not be persisted against profiles the user
+        // never saw.
+        return Promise.resolve({
+          ...blanket.decision,
+          ackFingerprint: false,
+          ackExtensionKeys: [],
+        });
+      }
+      return new Promise<GateDecision>((resolve) => {
+        gateRequestSeqRef.current += 1;
+        gateQueueRef.current.push({
+          id: gateRequestSeqRef.current,
+          req,
+          runId,
+          resolve,
+        });
+        syncGateUi();
+      });
+    },
+    [syncGateUi],
+  );
+
+  const settleGate = useCallback(
+    (decision: GateDecision) => {
+      const entry = gateQueueRef.current.shift();
+      if (!entry) {
+        return;
+      }
+      entry.resolve(decision);
+      if (decision.applyToRemaining) {
+        const coversBlocking = entry.req.findings.fingerprint !== null;
+        // Only a bulk run gets a standing blanket, and it claims the run the
+        // answered dialog belonged to — never whichever run happens to be in
+        // flight when the dialog is settled. Outside a run there is nothing to
+        // scope one to, and a session-wide blanket would silently answer
+        // unrelated launches later. The queue is still drained either way,
+        // which is what the checkbox actually promises.
+        if (entry.runId !== undefined) {
+          blanketGateDecisionRef.current = {
+            decision,
+            coversBlocking,
+            runId: entry.runId,
+          };
+        }
+        // Drain the queue rather than leaving promises pending forever — but
+        // only those the blanket actually covers. A hard block still deserves
+        // its own dialog even after the user blanket-approved a warning, and a
+        // launch started outside this run was never part of the answer.
+        const remaining = gateQueueRef.current.splice(0);
+        const kept = [];
+        for (const queued of remaining) {
+          const covered =
+            queued.runId === entry.runId &&
+            (coversBlocking || queued.req.findings.fingerprint === null);
+          if (!covered) {
+            kept.push(queued);
+            continue;
+          }
+          queued.resolve({
+            ...decision,
+            ackFingerprint: false,
+            ackExtensionKeys: [],
+          });
+        }
+        gateQueueRef.current = kept;
+      }
+      syncGateUi();
+    },
+    [syncGateUi],
+  );
+
+  const persistGateAcks = useCallback(
+    async (profileId: string, decision: GateDecision) => {
+      // Only on proceed. Cancel is the autofocused default action, so a stray
+      // Enter would otherwise permanently disarm the gate for this profile.
+      if (!decision.proceed) {
+        return;
+      }
+      if (!decision.ackFingerprint && decision.ackExtensionKeys.length === 0) {
+        return;
+      }
+      try {
+        await invoke("ack_launch_gate", {
+          profileId,
+          ackFingerprint: decision.ackFingerprint,
+          ackExtensionKeys: decision.ackExtensionKeys,
+        });
+      } catch (err) {
+        console.warn("Failed to persist launch gate acknowledgement:", err);
+      }
+    },
+    [],
+  );
+
   const launchProfile = useCallback(
-    async (profile: BrowserProfile) => {
+    async (
+      profile: BrowserProfile,
+      opts?: { bulkRunId?: number },
+    ): Promise<LaunchResult> => {
       console.log("Starting launch for profile:", profile.name);
 
       // Password-protected: must be unlocked before launch
@@ -885,7 +1162,7 @@ export default function Home() {
             pendingLaunchAfterUnlockRef.current = profile;
             setPasswordDialogMode("unlock");
             setPasswordDialogProfile(profile);
-            return;
+            return { status: "cancelled" };
           }
         } catch (err) {
           console.error("Failed to check profile lock state:", err);
@@ -907,7 +1184,7 @@ export default function Home() {
               setWindowResizeWarningOpen(true);
             });
             if (!proceed) {
-              return;
+              return { status: "cancelled" };
             }
           }
         } catch (error) {
@@ -915,21 +1192,126 @@ export default function Home() {
         }
       }
 
+      // Tier 1: purely local checks — an extension scan and a cached exit
+      // verdict. No network, no worker started, so a profile whose exit is
+      // already known blocks before the launch touches anything.
+      let consentToken: string | null = null;
+      // Kept for the tier-2 dialog below: the extensions are the same ones,
+      // and a mismatch measured mid-launch is exactly when knowing that one of
+      // them can change the proxy matters most. Minus anything the user just
+      // acknowledged, so a box they ticked seconds ago is not shown again.
+      let localChecks: PreLaunchChecks | null = null;
+      let ackedExtensionKeys: string[] = [];
+      try {
+        // One-shot migration of the old per-profile "don't warn again" flag,
+        // so a user who already dismissed this profile isn't hard-blocked by
+        // the new gate. Granted against the profile's current exit, which is
+        // the mismatch they were looking at when they dismissed it.
+        const legacySkipKey = `consistency-warn-skip-${profile.id}`;
+        if (localStorage.getItem(legacySkipKey) === "1") {
+          await invoke("ack_launch_gate", {
+            profileId: profile.id,
+            ackFingerprint: true,
+            ackExtensionKeys: [],
+          }).catch((err: unknown) => {
+            console.warn("Failed to migrate consistency skip flag:", err);
+          });
+          localStorage.removeItem(legacySkipKey);
+        }
+
+        const checks = await invoke<PreLaunchChecks>(
+          "get_profile_pre_launch_checks",
+          { profileId: profile.id },
+        );
+        localChecks = checks;
+        const blocked =
+          checks.consistency.checked && !checks.consistency.consistent;
+        if (blocked || checks.vpn_extensions.length > 0) {
+          const decision = await requestGateDecision(
+            {
+              profile,
+              findings: {
+                vpnExtensions: checks.vpn_extensions,
+                scanState: checks.scan_state,
+                fingerprint: blocked ? checks.consistency : null,
+                measurementUnreliable: checks.exit_measurement_unreliable,
+                probePending: checks.exit_probe_pending,
+              },
+            },
+            opts?.bulkRunId,
+          );
+          await persistGateAcks(profile.id, decision);
+          if (!decision.proceed) {
+            return { status: "cancelled" };
+          }
+          ackedExtensionKeys = decision.ackExtensionKeys;
+          consentToken = checks.consent_token;
+        }
+      } catch (err) {
+        // Same posture as the password and window-resize gates: a check that
+        // cannot run must not make profiles unlaunchable.
+        console.warn("Pre-launch checks failed, launching anyway:", err);
+      }
+
       try {
         const result = await invoke<BrowserProfile>("launch_browser_profile", {
           profile,
+          consentToken,
         });
         console.log("Successfully launched profile:", result.name);
+        return { status: "launched" };
       } catch (err: unknown) {
+        // Tier 2: the enforcing gate measured the exit mid-launch and stopped
+        // before spawning the browser. Offer the same decision, then retry
+        // exactly once with the token it minted — bounded, so a gate loop is
+        // structurally impossible.
+        const parsed = parseBackendError(err);
+        if (parsed?.code === "FINGERPRINT_EXIT_MISMATCH") {
+          const decision = await requestGateDecision(
+            {
+              profile,
+              findings: {
+                vpnExtensions: (localChecks?.vpn_extensions ?? []).filter(
+                  (ext) => !ackedExtensionKeys.includes(ext.key),
+                ),
+                scanState: localChecks?.scan_state ?? "scanned",
+                fingerprint: consistencyFromErrorParams(parsed.params),
+                measurementUnreliable:
+                  localChecks?.exit_measurement_unreliable ?? false,
+                probePending: false,
+              },
+            },
+            opts?.bulkRunId,
+          );
+          await persistGateAcks(profile.id, decision);
+          if (!decision.proceed) {
+            return { status: "cancelled" };
+          }
+          try {
+            await invoke<BrowserProfile>("launch_browser_profile", {
+              profile,
+              consentToken: parsed.params?.token ?? null,
+            });
+            return { status: "launched" };
+          } catch (retryErr: unknown) {
+            showErrorToast(
+              t("errors.launchBrowserFailed", {
+                error: translateBackendError(t, retryErr),
+              }),
+            );
+            return { status: "blocked" };
+          }
+        }
+
         console.error("Failed to launch browser:", err);
-        const errorMessage = err instanceof Error ? err.message : String(err);
+        const errorMessage = translateBackendError(t, err);
         showErrorToast(
           t("errors.launchBrowserFailed", { error: errorMessage }),
         );
         throw err;
       }
     },
-    [t],
+    [persistGateAcks, requestGateDecision, t],
   );
 
   const handleCloneProfile = useCallback((profile: BrowserProfile) => {
@@ -1128,15 +1510,34 @@ export default function Home() {
   const executeBulkRun = useCallback(
     async (targets: BrowserProfile[]) => {
       setIsBulkActing(true);
+      blanketGateDecisionRef.current = null;
+      bulkRunIdRef.current += 1;
+      const runId = bulkRunIdRef.current;
       try {
-        await Promise.allSettled(targets.map((p) => launchProfile(p)));
+        const results = await Promise.allSettled(
+          targets.map((p) => launchProfile(p, { bulkRunId: runId })),
+        );
+        const stopped = results.filter(
+          (r) => r.status === "fulfilled" && r.value.status !== "launched",
+        ).length;
+        if (stopped > 0) {
+          // Previously a declined launch resolved to undefined, so allSettled
+          // reported success and the user was told nothing.
+          showErrorToast(
+            t("prelaunchGate.cancelledSummary", {
+              cancelled: stopped,
+              total: targets.length,
+            }),
+          );
+        }
         setSelectedProfiles([]);
       } finally {
+        blanketGateDecisionRef.current = null;
         setIsBulkActing(false);
         setPendingBulkAction(null);
       }
     },
-    [launchProfile],
+    [launchProfile, t],
   );
 
   const executeBulkStop = useCallback(
@@ -1585,12 +1986,25 @@ export default function Home() {
         pageTitle={subPageTitle}
       />
       <div className="flex min-h-0 flex-1">
-        <RailNav currentPage={currentPage} onNavigate={handleRailNavigate} />
+        <RailNav
+          currentPage={currentPage}
+          onNavigate={handleRailNavigate}
+          onOpenAbout={() => {
+            setAboutDialogOpen(true);
+          }}
+          cookieBotRunning={Object.keys(cookieBotLiveSessions).length > 0}
+        />
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
           {currentPage === "profiles" && (
-            <div className="flex min-h-0 flex-1 flex-col px-3 pt-2.5">
-              {isLoading && groupsData.length === 0 ? null : null}
+            <motion.div
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.25, ease: MOTION_EASE_OUT }}
+              className="flex min-h-0 flex-1 flex-col px-3 pt-2.5"
+            >
               <ProfilesDataTable
+                isLoading={isLoading && profiles.length === 0}
+                showOnboardingEmptyState={profiles.length === 0}
                 profiles={filteredProfiles}
                 infoDialogProfile={profileInfoDialog}
                 onInfoDialogProfileChange={setProfileInfoDialog}
@@ -1609,6 +2023,7 @@ export default function Home() {
                 isUpdating={isUpdating}
                 onDeleteSelectedProfiles={handleDeleteSelectedProfiles}
                 onAssignProfilesToGroup={handleAssignProfilesToGroup}
+                onAssignProfilesToProxy={handleAssignProfilesToProxy}
                 selectedGroupId={selectedGroupId}
                 selectedProfiles={selectedProfiles}
                 onSelectedProfilesChange={setSelectedProfiles}
@@ -1631,12 +2046,25 @@ export default function Home() {
                 onLaunchWithSync={(profile) => {
                   setSyncLeaderProfile(profile);
                 }}
+                onCreateProfile={() => {
+                  setCreateProfileDialogOpen(true);
+                }}
+                onImportProfiles={() => {
+                  handleRailNavigate("import");
+                }}
               />
-            </div>
+            </motion.div>
           )}
 
           {currentPage === "shortcuts" && (
-            <ShortcutsPage groupTargets={orderedGroupTargets} />
+            <motion.div
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.25, ease: MOTION_EASE_OUT }}
+              className="flex min-h-0 flex-1 flex-col"
+            >
+              <ShortcutsPage groupTargets={orderedGroupTargets} />
+            </motion.div>
           )}
 
           {settingsDialogOpen && (
@@ -1716,6 +2144,22 @@ export default function Home() {
             />
           )}
 
+          {cookieBotDialogOpen && (
+            <CookieBotPage
+              isOpen={cookieBotDialogOpen}
+              onClose={() => {
+                setCookieBotDialogOpen(false);
+                setCurrentPage("profiles");
+              }}
+              subPage={currentPage === "cookieBot"}
+              initialTab={cookieBotInitialTab}
+              profiles={profiles}
+              cloudUser={cloudUser}
+              onOpenProfileSync={handleOpenProfileSyncDialog}
+              onAssignProxy={handleAssignProfilesToProxy}
+            />
+          )}
+
           {accountDialogOpen && (
             <AccountPage
               isOpen={accountDialogOpen}
@@ -1765,6 +2209,29 @@ export default function Home() {
           handleRailNavigate("profiles");
           setProfileInfoDialog(profile);
         }}
+        onCreateProfile={() => {
+          setCreateProfileDialogOpen(true);
+        }}
+        onOpenAbout={() => {
+          setAboutDialogOpen(true);
+        }}
+      />
+
+      <AboutDialog
+        isOpen={aboutDialogOpen}
+        onClose={() => {
+          setAboutDialogOpen(false);
+        }}
+      />
+
+      <PreLaunchGateDialog
+        isOpen={gateState !== null}
+        profileName={gateState?.req.profile.name ?? ""}
+        profileId={gateState?.req.profile.id ?? ""}
+        requestId={gateState?.id ?? 0}
+        findings={gateState?.req.findings ?? null}
+        remainingCount={gateState?.remaining ?? 0}
+        onResult={settleGate}
       />
 
       {pendingUrls.map((pendingUrl) => (

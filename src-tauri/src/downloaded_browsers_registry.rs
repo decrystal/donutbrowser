@@ -26,6 +26,29 @@ pub struct DownloadedBrowsersRegistry {
   geoip_downloader: &'static GeoIPDownloader,
 }
 
+/// Filename suffixes that identify a *downloaded artifact* — the container we
+/// fetched from the network — rather than a file belonging to the extracted
+/// install. Cleanup preserves these so a manually placed archive survives.
+///
+/// `.exe` and `.AppImage` are deliberately absent even though both can be
+/// downloaded. On Windows the extracted Wayfern payload is flat at the version
+/// root (`extraction::ensure_correct_directory_structure` returns early rather
+/// than nesting it), so preserving `.exe` kept `chrome.exe` while deleting every
+/// sibling `.dll`, the `.manifest`, `.pak` and `locales/` — a gutted install
+/// that then failed to launch with os error 14001. On Linux the `.AppImage`
+/// *is* the extracted payload. Cleanup must never leave behind something that
+/// still reads as an installed browser; the archive is deleted right after a
+/// successful download anyway, so nothing of value is lost.
+const DOWNLOAD_ARTIFACT_SUFFIXES: [&str; 7] =
+  ["zip", "dmg", "tar.xz", "tar.gz", "tar.bz2", "pkg", "msi"];
+
+fn is_download_artifact(file_name: &str) -> bool {
+  let lowered = file_name.to_lowercase();
+  DOWNLOAD_ARTIFACT_SUFFIXES
+    .iter()
+    .any(|suffix| lowered.ends_with(suffix))
+}
+
 impl DownloadedBrowsersRegistry {
   fn new() -> Self {
     Self {
@@ -174,15 +197,19 @@ impl DownloadedBrowsersRegistry {
     browser: &str,
     version: &str,
   ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Never delete files out from under a live download or extraction. Both the
+    // detached task that runs the moment a download completes and the periodic
+    // maintenance task land here, and a freshly downloaded version is referenced
+    // by no persisted profile while profile creation is still in flight.
+    if crate::downloader::is_downloading(browser, version) {
+      log::info!("Skipping cleanup of {browser} {version}: a download is in progress");
+      return Ok(());
+    }
+
     if let Some(info) = self.remove_browser(browser, version) {
       // Clean up extracted binaries but preserve downloaded archives
       if info.file_path.exists() {
         if info.file_path.is_dir() {
-          // Allowed archive extensions to preserve
-          let archive_exts = [
-            "zip", "dmg", "tar.xz", "tar.gz", "tar.bz2", "AppImage", "exe", "pkg", "msi",
-          ];
-
           for entry in fs::read_dir(&info.file_path)? {
             let entry = entry?;
             let path = entry.path();
@@ -192,16 +219,11 @@ impl DownloadedBrowsersRegistry {
               continue;
             }
 
-            // For files, preserve if they look like downloaded archives/installers
+            // For files, preserve only genuine downloaded archives/installers
             let keep = path
               .file_name()
               .and_then(|n| n.to_str())
-              .map(|name| {
-                // Match suffixes (handles multi-part extensions like .tar.xz)
-                archive_exts
-                  .iter()
-                  .any(|ext| name.to_lowercase().ends_with(&ext.to_lowercase()))
-              })
+              .map(is_download_artifact)
               .unwrap_or(false);
 
             if !keep {
@@ -215,13 +237,7 @@ impl DownloadedBrowsersRegistry {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");
-          let archive_exts = [
-            "zip", "dmg", "tar.xz", "tar.gz", "tar.bz2", "AppImage", "exe", "pkg", "msi",
-          ];
-          let is_archive = archive_exts
-            .iter()
-            .any(|ext| file_name.to_lowercase().ends_with(&ext.to_lowercase()));
-          if !is_archive {
+          if !is_download_artifact(file_name) {
             fs::remove_file(&info.file_path)?;
           }
         }
@@ -1057,15 +1073,15 @@ mod tests {
   fn test_add_and_get_browser() {
     let registry = DownloadedBrowsersRegistry::new();
     let info = DownloadedBrowserInfo {
-      browser: "firefox".to_string(),
+      browser: "testbrowser".to_string(),
       version: "139.0".to_string(),
       file_path: PathBuf::from("/test/path"),
     };
 
     registry.add_browser(info.clone());
 
-    assert!(registry.is_browser_registered("firefox", "139.0"));
-    assert!(!registry.is_browser_registered("firefox", "140.0"));
+    assert!(registry.is_browser_registered("testbrowser", "139.0"));
+    assert!(!registry.is_browser_registered("testbrowser", "140.0"));
     assert!(!registry.is_browser_registered("chrome", "139.0"));
   }
 
@@ -1074,19 +1090,19 @@ mod tests {
     let registry = DownloadedBrowsersRegistry::new();
 
     let info1 = DownloadedBrowserInfo {
-      browser: "firefox".to_string(),
+      browser: "testbrowser".to_string(),
       version: "139.0".to_string(),
       file_path: PathBuf::from("/test/path1"),
     };
 
     let info2 = DownloadedBrowserInfo {
-      browser: "firefox".to_string(),
+      browser: "testbrowser".to_string(),
       version: "140.0".to_string(),
       file_path: PathBuf::from("/test/path2"),
     };
 
     let info3 = DownloadedBrowserInfo {
-      browser: "firefox".to_string(),
+      browser: "testbrowser".to_string(),
       version: "141.0".to_string(),
       file_path: PathBuf::from("/test/path3"),
     };
@@ -1095,7 +1111,7 @@ mod tests {
     registry.add_browser(info2);
     registry.add_browser(info3);
 
-    let versions = registry.get_downloaded_versions("firefox");
+    let versions = registry.get_downloaded_versions("testbrowser");
     assert_eq!(versions.len(), 3);
     assert!(versions.contains(&"139.0".to_string()));
     assert!(versions.contains(&"140.0".to_string()));
@@ -1107,22 +1123,22 @@ mod tests {
     let registry = DownloadedBrowsersRegistry::new();
 
     // Mark download started
-    registry.mark_download_started("firefox", "139.0", PathBuf::from("/test/path"));
+    registry.mark_download_started("testbrowser", "139.0", PathBuf::from("/test/path"));
 
     // Should NOT be registered until verification completes
     assert!(
-      !registry.is_browser_registered("firefox", "139.0"),
+      !registry.is_browser_registered("testbrowser", "139.0"),
       "Browser should NOT be registered after marking as started (only after verification)"
     );
 
     // Mark as completed (after verification)
     registry
-      .mark_download_completed("firefox", "139.0", PathBuf::from("/test/path"))
+      .mark_download_completed("testbrowser", "139.0", PathBuf::from("/test/path"))
       .expect("Failed to mark download as completed");
 
     // Should now be registered
     assert!(
-      registry.is_browser_registered("firefox", "139.0"),
+      registry.is_browser_registered("testbrowser", "139.0"),
       "Browser should be registered after verification completes"
     );
   }
@@ -1131,24 +1147,24 @@ mod tests {
   fn test_remove_browser() {
     let registry = DownloadedBrowsersRegistry::new();
     let info = DownloadedBrowserInfo {
-      browser: "firefox".to_string(),
+      browser: "testbrowser".to_string(),
       version: "139.0".to_string(),
       file_path: PathBuf::from("/test/path"),
     };
 
     registry.add_browser(info);
     assert!(
-      registry.is_browser_registered("firefox", "139.0"),
+      registry.is_browser_registered("testbrowser", "139.0"),
       "Browser should be registered after adding"
     );
 
-    let removed = registry.remove_browser("firefox", "139.0");
+    let removed = registry.remove_browser("testbrowser", "139.0");
     assert!(
       removed.is_some(),
       "Remove operation should return the removed browser info"
     );
     assert!(
-      !registry.is_browser_registered("firefox", "139.0"),
+      !registry.is_browser_registered("testbrowser", "139.0"),
       "Browser should not be registered after removal"
     );
   }
@@ -1182,11 +1198,11 @@ mod tests {
   fn test_last_version_kept_during_cleanup() {
     let registry = DownloadedBrowsersRegistry::new();
 
-    // Add a single version for "firefox"
+    // Add a single version for "testbrowser"
     registry.add_browser(DownloadedBrowserInfo {
-      browser: "firefox".to_string(),
+      browser: "testbrowser".to_string(),
       version: "139.0".to_string(),
-      file_path: PathBuf::from("/test/firefox/139.0"),
+      file_path: PathBuf::from("/test/testbrowser/139.0"),
     });
 
     // Add two versions for "chromium"
@@ -1206,11 +1222,11 @@ mod tests {
       .cleanup_unused_binaries_internal(&[], &[])
       .expect("cleanup should succeed");
 
-    // firefox 139.0 should be kept (last version), chromium should lose one but keep one
+    // testbrowser 139.0 should be kept (last version), chromium should lose one but keep one
     // The exact one kept depends on iteration order, but at least one must remain
     assert!(
-      !result.contains(&"firefox 139.0".to_string()),
-      "Last version of firefox should not be cleaned up"
+      !result.contains(&"testbrowser 139.0".to_string()),
+      "Last version of testbrowser should not be cleaned up"
     );
     // At most one chromium version should have been cleaned up
     let chromium_cleaned: Vec<_> = result
@@ -1223,10 +1239,134 @@ mod tests {
       chromium_cleaned
     );
 
-    // Verify firefox is still registered
+    // Verify testbrowser is still registered
     assert!(
-      registry.is_browser_registered("firefox", "139.0"),
-      "Last firefox version should still be registered"
+      registry.is_browser_registered("testbrowser", "139.0"),
+      "Last testbrowser version should still be registered"
+    );
+  }
+
+  /// The Windows payload is extracted flat at the version root, so preserving
+  /// every `*.exe` used to leave `chrome.exe` behind while deleting the `.dll`
+  /// files and the `.manifest` next to it. That gutted directory still passed
+  /// the "is it downloaded?" check, was re-registered as healthy, and launching
+  /// it failed in the Windows loader with os error 14001.
+  #[test]
+  fn test_cleanup_removes_the_browser_executable_not_just_its_libraries() {
+    use tempfile::TempDir;
+    let temp = TempDir::new().unwrap();
+    let version_dir = temp.path().join("wayfern").join("140.0");
+    std::fs::create_dir_all(&version_dir).unwrap();
+
+    for name in [
+      "chrome.exe",
+      "wayfern.exe",
+      "notification_helper.exe",
+      "chrome.dll",
+      "chrome_elf.dll",
+      "chrome.exe.manifest",
+      "resources.pak",
+    ] {
+      std::fs::File::create(version_dir.join(name)).unwrap();
+    }
+    std::fs::create_dir_all(version_dir.join("locales")).unwrap();
+
+    let registry = DownloadedBrowsersRegistry::new();
+    registry.add_browser(DownloadedBrowserInfo {
+      browser: "wayfern".to_string(),
+      version: "140.0".to_string(),
+      file_path: version_dir.clone(),
+    });
+
+    registry
+      .cleanup_failed_download("wayfern", "140.0")
+      .expect("cleanup should succeed");
+
+    let leftovers: Vec<String> = std::fs::read_dir(&version_dir)
+      .unwrap()
+      .flatten()
+      .map(|e| e.file_name().to_string_lossy().into_owned())
+      .collect();
+    assert!(
+      leftovers.is_empty(),
+      "cleanup must not leave a half-deleted install behind, found: {leftovers:?}"
+    );
+  }
+
+  /// The preserve rule still exists for its actual purpose: a downloaded
+  /// archive (including one placed there by hand) survives the cleanup.
+  #[test]
+  fn test_cleanup_preserves_a_downloaded_archive() {
+    use tempfile::TempDir;
+    let temp = TempDir::new().unwrap();
+    let version_dir = temp.path().join("wayfern").join("141.0");
+    std::fs::create_dir_all(&version_dir).unwrap();
+
+    std::fs::File::create(version_dir.join("wayfern-win64.zip")).unwrap();
+    std::fs::File::create(version_dir.join("wayfern-mac.tar.xz")).unwrap();
+    std::fs::File::create(version_dir.join("chrome.exe")).unwrap();
+    std::fs::File::create(version_dir.join("chrome.dll")).unwrap();
+
+    let registry = DownloadedBrowsersRegistry::new();
+    registry.add_browser(DownloadedBrowserInfo {
+      browser: "wayfern".to_string(),
+      version: "141.0".to_string(),
+      file_path: version_dir.clone(),
+    });
+
+    registry
+      .cleanup_failed_download("wayfern", "141.0")
+      .expect("cleanup should succeed");
+
+    assert!(
+      version_dir.join("wayfern-win64.zip").exists(),
+      "a downloaded archive must be preserved"
+    );
+    assert!(
+      version_dir.join("wayfern-mac.tar.xz").exists(),
+      "multi-part archive extensions must still be recognised"
+    );
+    assert!(
+      !version_dir.join("chrome.exe").exists(),
+      "the extracted executable must be removed"
+    );
+    assert!(
+      !version_dir.join("chrome.dll").exists(),
+      "the extracted libraries must be removed"
+    );
+  }
+
+  /// Cleanup runs on a detached task the moment a download completes and again
+  /// on a periodic timer, either of which can land while an install is still
+  /// being written. It must stand down instead of deleting live files.
+  #[test]
+  fn test_cleanup_stands_down_while_a_download_is_in_progress() {
+    use tempfile::TempDir;
+    let temp = TempDir::new().unwrap();
+    let version_dir = temp.path().join("wayfern").join("142.0");
+    std::fs::create_dir_all(&version_dir).unwrap();
+    std::fs::File::create(version_dir.join("chrome.exe")).unwrap();
+    std::fs::File::create(version_dir.join("chrome.dll")).unwrap();
+
+    let registry = DownloadedBrowsersRegistry::new();
+    registry.add_browser(DownloadedBrowserInfo {
+      browser: "wayfern".to_string(),
+      version: "142.0".to_string(),
+      file_path: version_dir.clone(),
+    });
+
+    crate::downloader::mark_downloading_for_test("wayfern", "142.0");
+    let result = registry.cleanup_failed_download("wayfern", "142.0");
+    crate::downloader::clear_download_state_for_browser("wayfern");
+    result.expect("cleanup should succeed");
+
+    assert!(
+      version_dir.join("chrome.exe").exists() && version_dir.join("chrome.dll").exists(),
+      "an in-flight download must not be deleted out from under itself"
+    );
+    assert!(
+      registry.is_browser_registered("wayfern", "142.0"),
+      "the registry entry must survive too, the version is still being installed"
     );
   }
 
@@ -1234,7 +1374,7 @@ mod tests {
   fn test_is_browser_registered_vs_downloaded() {
     let registry = DownloadedBrowsersRegistry::new();
     let info = DownloadedBrowserInfo {
-      browser: "firefox".to_string(),
+      browser: "testbrowser".to_string(),
       version: "139.0".to_string(),
       file_path: PathBuf::from("/test/path"),
     };
@@ -1244,14 +1384,14 @@ mod tests {
 
     // Should be registered (in-memory check)
     assert!(
-      registry.is_browser_registered("firefox", "139.0"),
+      registry.is_browser_registered("testbrowser", "139.0"),
       "Browser should be registered after adding to registry"
     );
 
     // is_browser_downloaded should return false in test environment because files don't exist
     // This tests the difference between registered (in registry) vs downloaded (files exist)
     assert!(
-      !registry.is_browser_downloaded("firefox", "139.0"),
+      !registry.is_browser_downloaded("testbrowser", "139.0"),
       "Browser should not be considered downloaded when files don't exist on disk"
     );
   }
@@ -1261,6 +1401,14 @@ mod tests {
 pub async fn ensure_active_browsers_downloaded(
   app_handle: tauri::AppHandle,
 ) -> Result<Vec<String>, String> {
+  #[cfg(feature = "e2e")]
+  if crate::e2e_automation_enabled()
+    && std::env::var_os("DONUT_E2E_DISABLE_STARTUP_NETWORK").is_some()
+  {
+    log::info!("E2E: skipping proactive browser download");
+    return Ok(Vec::new());
+  }
+
   let registry = DownloadedBrowsersRegistry::instance();
   let version_manager = crate::browser_version_manager::BrowserVersionManager::instance();
   let mut downloaded = Vec::new();
@@ -1277,21 +1425,38 @@ pub async fn ensure_active_browsers_downloaded(
     }
     log::info!("ensure_active: No {browser} versions found, will download");
 
-    // Get the latest release type for this browser
-    let release_types = match version_manager.get_browser_release_types(browser).await {
-      Ok(rt) => rt,
-      Err(e) => {
-        log::warn!("Failed to get release types for {browser}: {e}");
-        continue;
+    // Resolve the version to download. For wayfern, only the currently
+    // published version is downloadable, so ask the API fresh — the release-type
+    // cache can be stale right after a new version is published, and the
+    // downloader rejects requests for versions that are no longer available.
+    let version = if *browser == "wayfern" {
+      match crate::api_client::ApiClient::instance()
+        .fetch_wayfern_version_with_caching(true)
+        .await
+      {
+        Ok(info) => info.version,
+        Err(e) => {
+          log::warn!("Failed to resolve current {browser} version: {e}");
+          continue;
+        }
       }
-    };
+    } else {
+      // Get the latest release type for this browser
+      let release_types = match version_manager.get_browser_release_types(browser).await {
+        Ok(rt) => rt,
+        Err(e) => {
+          log::warn!("Failed to get release types for {browser}: {e}");
+          continue;
+        }
+      };
 
-    // Use stable version (the only release type for these browsers)
-    let version = match release_types.stable {
-      Some(v) => v,
-      None => {
-        log::debug!("No stable version available for {browser} on this platform, skipping");
-        continue;
+      // Use stable version (the only release type for these browsers)
+      match release_types.stable {
+        Some(v) => v,
+        None => {
+          log::debug!("No stable version available for {browser} on this platform, skipping");
+          continue;
+        }
       }
     };
 
@@ -1330,8 +1495,8 @@ pub async fn ensure_active_browsers_downloaded(
         Err(_) => {
           // The download future itself hung past the overall timeout and was dropped,
           // so its own cleanup never ran. Clear any leftover in-progress bookkeeping
-          // (the future may have re-resolved to a different version, so clear by
-          // browser prefix) and emit a terminal error event so the UI stops spinning.
+          // (by browser prefix, as a catch-all for whatever key was in flight) and
+          // emit a terminal error event so the UI stops spinning.
           log::warn!(
             "Auto-download of {browser} {version} timed out after {}s (attempt {attempt}/{MAX_ATTEMPTS})",
             ATTEMPT_TIMEOUT.as_secs()
@@ -1393,6 +1558,14 @@ pub async fn check_missing_binaries() -> Result<Vec<(String, String, String)>, S
 pub async fn ensure_all_binaries_exist(
   app_handle: tauri::AppHandle,
 ) -> Result<Vec<String>, String> {
+  #[cfg(feature = "e2e")]
+  if crate::e2e_automation_enabled()
+    && std::env::var_os("DONUT_E2E_DISABLE_STARTUP_NETWORK").is_some()
+  {
+    log::info!("E2E: skipping proactive binary and GeoIP downloads");
+    return Ok(Vec::new());
+  }
+
   let registry = DownloadedBrowsersRegistry::instance();
   registry
     .ensure_all_binaries_exist(&app_handle)

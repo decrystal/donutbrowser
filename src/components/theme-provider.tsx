@@ -8,7 +8,11 @@ import {
   useMemo,
   useState,
 } from "react";
-import { applyThemeColors, clearThemeColors } from "@/lib/themes";
+import {
+  applyThemeColors,
+  clearThemeColors,
+  withThemeTransition,
+} from "@/lib/themes";
 
 interface AppSettings {
   set_as_default_browser: boolean;
@@ -18,7 +22,9 @@ interface AppSettings {
 
 interface ThemeContextValue {
   theme: string;
-  setTheme: (theme: string) => void;
+  /// `animate: false` applies the theme without a view transition, for the
+  /// restore paths where nothing visually changes.
+  setTheme: (theme: string, options?: { animate?: boolean }) => void;
 }
 
 const ThemeContext = createContext<ThemeContextValue>({
@@ -52,14 +58,26 @@ export function CustomThemeProvider({ children }: CustomThemeProviderProps) {
   const [isLoading, setIsLoading] = useState(true);
   const [theme, setThemeState] = useState("system");
 
-  const setTheme = useCallback((newTheme: string) => {
-    setThemeState(newTheme);
-    if (newTheme === "custom") {
-      applyClassToHtml("dark");
-    } else {
-      applyClassToHtml(newTheme);
-    }
-  }, []);
+  // `animate: false` is for restoring the theme the app is already showing —
+  // opening or leaving Settings re-applies the current theme, and cross-fading
+  // the whole document to the palette already on screen animates nothing while
+  // still paying for a full-document snapshot.
+  const setTheme = useCallback(
+    (newTheme: string, options?: { animate?: boolean }) => {
+      setThemeState(newTheme);
+      const apply = () => {
+        if (newTheme !== "custom") {
+          applyClassToHtml(newTheme);
+        }
+      };
+      if (options?.animate === false) {
+        apply();
+        return;
+      }
+      withThemeTransition(apply);
+    },
+    [],
+  );
 
   // Load initial theme from Tauri settings
   useEffect(() => {
@@ -71,7 +89,6 @@ export function CustomThemeProvider({ children }: CustomThemeProviderProps) {
 
         if (themeValue === "custom") {
           setThemeState("custom");
-          applyClassToHtml("dark");
           if (
             settings.custom_theme &&
             Object.keys(settings.custom_theme).length > 0
@@ -81,6 +98,8 @@ export function CustomThemeProvider({ children }: CustomThemeProviderProps) {
             } catch (error) {
               console.warn("Failed to apply custom theme variables:", error);
             }
+          } else {
+            applyClassToHtml("dark");
           }
         } else if (
           themeValue === "light" ||

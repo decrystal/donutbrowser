@@ -284,7 +284,11 @@ impl WayfernManager {
     vpn_id: Option<&str>,
     geoip: Option<&serde_json::Value>,
   ) -> String {
-    match geoip {
+    // The "v2:" prefix invalidates every signature stamped before geolocation
+    // failures stopped being stamped: those may describe fingerprints that
+    // silently carry the host's location, so each pre-v2 profile gets one
+    // launch-time refresh and is re-stamped in the current format.
+    let base = match geoip {
       Some(serde_json::Value::Bool(false)) => "off".to_string(),
       Some(serde_json::Value::String(ip)) if !ip.is_empty() => format!("ip:{ip}"),
       _ => {
@@ -302,7 +306,8 @@ impl WayfernManager {
           "direct".to_string()
         }
       }
-    }
+    };
+    format!("v2:{base}")
   }
 
   /// Apply timezone/geolocation fields to a fingerprint object from the proxy's
@@ -397,12 +402,44 @@ impl WayfernManager {
     }
   }
 
+  /// True when `url` is a socks proxy on a remote (non-loopback) host — the
+  /// case where reqwest's SOCKS connector can't be trusted with the
+  /// geolocation fetch. Loopback socks URLs are the app's own donut-proxy
+  /// workers, whose single-segment replies don't trigger the connector bug.
+  fn is_remote_socks_url(url: &str) -> bool {
+    url.starts_with("socks")
+      && url::Url::parse(url)
+        .ok()
+        .and_then(|u| match u.host() {
+          Some(url::Host::Ipv4(ip)) => Some(!ip.is_loopback()),
+          Some(url::Host::Ipv6(ip)) => Some(!ip.is_loopback()),
+          // socks is a non-special scheme, so the url crate keeps even
+          // IP-literal hosts as Domain — parse them before comparing.
+          Some(url::Host::Domain(domain)) => Some(
+            domain != "localhost"
+              && domain
+                .parse::<std::net::IpAddr>()
+                .map(|ip| !ip.is_loopback())
+                .unwrap_or(true),
+          ),
+          None => None,
+        })
+        .unwrap_or(false)
+  }
+
+  /// Generate a fingerprint for `config`, returning the fingerprint JSON and
+  /// whether fresh geolocation was applied to it. Callers must only stamp
+  /// `geo_proxy_signature` when geolocation succeeded: the base fingerprint
+  /// comes from a headless Wayfern launched without a proxy, so on failure it
+  /// silently carries the HOST timezone/locale — stamping the signature then
+  /// would tell the launch-time refresh the location is already correct for
+  /// this proxy and permanently disable the one path that can repair it.
   pub async fn generate_fingerprint_config(
     &self,
     _app_handle: &AppHandle,
     profile: &BrowserProfile,
     config: &WayfernConfig,
-  ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+  ) -> Result<(String, bool), Box<dyn std::error::Error + Send + Sync>> {
     let executable_path = BrowserRunner::instance()
       .get_browser_executable_path(profile)
       .map_err(|e| format!("Failed to get Wayfern executable path: {e}"))?;
@@ -549,7 +586,7 @@ impl WayfernManager {
       .send_cdp_command(&ws_url, "Wayfern.getFingerprint", json!({}))
       .await;
 
-    let fingerprint = match get_result {
+    let (fingerprint, geolocation_applied) = match get_result {
       Ok(result) => {
         // Wayfern.getFingerprint returns { fingerprint: {...} }
         // We need to extract just the fingerprint object
@@ -557,16 +594,57 @@ impl WayfernManager {
         // Normalize the fingerprint: convert JSON string fields to proper types
         let mut normalized = Self::normalize_fingerprint(fp);
 
+        // reqwest's SOCKS connector (hyper-util) corrupts its parse buffer
+        // when a proxy splits a handshake reply across TCP segments, so a
+        // socks upstream here can fail even though the proxy is healthy.
+        // Route the geolocation lookup through a temporary local donut-proxy
+        // worker — the same path the browser itself uses — and fall back to
+        // the upstream URL only if the worker can't start. Two exclusions:
+        // no worker when geolocation won't fetch through the proxy at all
+        // (disabled, or a fixed geoip IP), and none for loopback socks URLs —
+        // launch-time callers pass the already-running local worker's
+        // socks5://127.0.0.1 URL, whose single-segment replies don't trigger
+        // the bug, so chaining a second worker would only add latency.
+        let needs_proxied_geo_fetch = !matches!(
+          config.geoip.as_ref(),
+          Some(serde_json::Value::Bool(false)) | Some(serde_json::Value::String(_))
+        );
+        let remote_socks_upstream = config
+          .proxy
+          .as_deref()
+          .filter(|url| Self::is_remote_socks_url(url));
+        let (geo_proxy, temp_worker_id) = match remote_socks_upstream {
+          Some(url) if needs_proxied_geo_fetch => {
+            match crate::proxy_runner::start_proxy_process(Some(url.to_string()), None)
+              .await
+              .map_err(|e| e.to_string())
+            {
+              Ok(worker) => {
+                let local_url = format!("http://127.0.0.1:{}", worker.local_port.unwrap_or(0));
+                (Some(local_url), Some(worker.id))
+              }
+              Err(e) => {
+                log::warn!(
+                  "Could not start local proxy worker for geolocation ({e}); using the socks upstream directly"
+                );
+                (config.proxy.clone(), None)
+              }
+            }
+          }
+          _ => (config.proxy.clone(), None),
+        };
+
         // Apply timezone/geolocation for the proxy this fingerprint is being
         // generated against. Shared with the launch-time location refresh.
-        Self::apply_geolocation(
-          &mut normalized,
-          config.proxy.as_deref(),
-          config.geoip.as_ref(),
-        )
-        .await;
+        let geolocation_applied =
+          Self::apply_geolocation(&mut normalized, geo_proxy.as_deref(), config.geoip.as_ref())
+            .await;
 
-        normalized
+        if let Some(worker_id) = temp_worker_id {
+          let _ = crate::proxy_runner::stop_proxy_process(&worker_id).await;
+        }
+
+        (normalized, geolocation_applied)
       }
       Err(e) => {
         cleanup().await;
@@ -579,9 +657,13 @@ impl WayfernManager {
     let fingerprint_json = serde_json::to_string(&fingerprint)
       .map_err(|e| format!("Failed to serialize fingerprint: {e}"))?;
 
+    // Report the platform the engine actually produced alongside the one that
+    // was asked for. Logging only the request made this line useless for
+    // diagnosing a fingerprint that came back as something else.
     log::info!(
-      "Generated Wayfern fingerprint for OS: {}, fields: {:?}",
+      "Generated Wayfern fingerprint for requested OS: {}, produced platform: {:?}, fields: {:?}",
       os,
+      fingerprint.get("platform").and_then(|p| p.as_str()),
       fingerprint
         .as_object()
         .map(|o| o.keys().collect::<Vec<_>>())
@@ -599,7 +681,7 @@ impl WayfernManager {
       );
     }
 
-    Ok(fingerprint_json)
+    Ok((fingerprint_json, geolocation_applied))
   }
 
   #[allow(clippy::too_many_arguments)]
@@ -813,6 +895,92 @@ impl WayfernManager {
     };
     log::info!("Launching Wayfern on CDP port {port} (detached)");
 
+    // Diagnostic: verify critical profile files and test cookie decryption
+    {
+      let profile_path_buf = std::path::PathBuf::from(profile_path);
+      let key_path = profile_path_buf.join("os_crypt_key");
+      let cookies_path = {
+        let network = profile_path_buf
+          .join("Default")
+          .join("Network")
+          .join("Cookies");
+        if network.exists() {
+          network
+        } else {
+          profile_path_buf.join("Default").join("Cookies")
+        }
+      };
+
+      if key_path.exists() {
+        // Length only. The contents are the profile's encryption key, and this
+        // log is the first thing a user attaches to a bug report.
+        let key_len = std::fs::metadata(&key_path).map(|m| m.len()).unwrap_or(0);
+        log::info!("Pre-launch: os_crypt_key present ({key_len} bytes)");
+      } else {
+        log::warn!("Pre-launch: os_crypt_key NOT FOUND");
+      }
+
+      if cookies_path.exists() {
+        // Try to open Cookies DB and check if encrypted cookies can be decrypted
+        if let Ok(conn) = rusqlite::Connection::open_with_flags(
+          &cookies_path,
+          rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) {
+          let cookie_count: i64 = conn
+            .query_row(
+              "SELECT COUNT(*) FROM cookies WHERE length(encrypted_value) > 0",
+              [],
+              |r| r.get(0),
+            )
+            .unwrap_or(0);
+          let total_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cookies", [], |r| r.get(0))
+            .unwrap_or(0);
+          log::info!(
+            "Pre-launch: Cookies DB has {} total cookies, {} encrypted",
+            total_count,
+            cookie_count
+          );
+
+          // Try decrypting one cookie using the cookie_manager
+          if let Some(encryption_key) =
+            crate::cookie_manager::chrome_decrypt::get_encryption_key(&profile_path_buf)
+          {
+            if let Ok(mut stmt) = conn.prepare(
+              "SELECT name, host_key, encrypted_value FROM cookies WHERE length(encrypted_value) > 0 LIMIT 1",
+            ) {
+              if let Ok(mut rows) = stmt.query([]) {
+                if let Ok(Some(row)) = rows.next() {
+                  let name: String = row.get(0).unwrap_or_default();
+                  let host: String = row.get(1).unwrap_or_default();
+                  let encrypted: Vec<u8> = row.get(2).unwrap_or_default();
+                  let decrypted = crate::cookie_manager::chrome_decrypt::decrypt(
+                    &encrypted,
+                    &host,
+                    &encryption_key,
+                  );
+                  match decrypted {
+                    Some(val) => log::info!(
+                      "Pre-launch: Cookie decryption SUCCEEDED for '{}' (host: {}, decrypted {} bytes)",
+                      name, host, val.len()
+                    ),
+                    None => log::error!(
+                      "Pre-launch: Cookie decryption FAILED for '{}' (host: {}, encrypted {} bytes)",
+                      name, host, encrypted.len()
+                    ),
+                  }
+                }
+              }
+            }
+          } else {
+            log::error!("Pre-launch: Failed to derive encryption key from os_crypt_key");
+          }
+        }
+      } else {
+        log::warn!("Pre-launch: Cookies NOT FOUND");
+      }
+    }
+
     let mut args = vec![
       format!("--remote-debugging-port={port}"),
       "--remote-debugging-address=127.0.0.1".to_string(),
@@ -906,9 +1074,12 @@ impl WayfernManager {
     args.push(format!("--wayfern-profile-color={profile_color}"));
 
     let mut wayfern_token = crate::cloud_auth::CLOUD_AUTH.get_wayfern_token().await;
+    // Waiting is only meaningful for a plan a token can actually be minted for.
+    // On "any active plan" this stalled every Solo launch by the full three
+    // seconds waiting for a token the backend will never issue to them.
     if wayfern_token.is_none()
       && crate::cloud_auth::CLOUD_AUTH
-        .has_active_paid_subscription()
+        .is_entitled_to_wayfern_token()
         .await
     {
       // Brief wait for the background token fetch — when the API is healthy
@@ -931,11 +1102,6 @@ impl WayfernManager {
         );
       }
     }
-    if let Some(ref token) = wayfern_token {
-      args.push(format!("--wayfern-token={token}"));
-      log::info!("Wayfern token passed as CLI flag (length: {})", token.len());
-    }
-
     if let Some(proxy) = proxy_url {
       // Map the local proxy scheme to the matching PAC directive. SOCKS5 lets
       // Chromium route UDP (QUIC/WebRTC) and resolve DNS through the proxy;
@@ -963,6 +1129,10 @@ impl WayfernManager {
       .stdin(Stdio::null())
       .stdout(Stdio::null())
       .stderr(Stdio::null());
+    if let Some(ref token) = wayfern_token {
+      command.env("WAYFERN_TOKEN", token);
+      log::info!("Wayfern authorization configured for browser process");
+    }
 
     let child = command
       .spawn()
@@ -1061,16 +1231,13 @@ impl WayfernManager {
 
       for target in &page_targets {
         if let Some(ws_url) = &target.websocket_debugger_url {
-          log::info!("Applying fingerprint to target via WebSocket: {}", ws_url);
+          log::info!("Applying fingerprint to page target");
           match self
             .send_cdp_command(ws_url, "Wayfern.setFingerprint", fingerprint_params.clone())
             .await
           {
             Ok(result) => {
-              log::info!(
-                "Successfully applied fingerprint to page target: {:?}",
-                result
-              );
+              log::info!("Successfully applied fingerprint to page target");
               // Wayfern.setFingerprint echoes back the fingerprint it actually
               // used, which may be UPGRADED from what we sent (e.g. when the
               // stored fingerprint targets an older browser version). Capture
@@ -1101,7 +1268,7 @@ impl WayfernManager {
     // Geolocation is handled internally by the browser binary.
 
     if let Some(url) = url {
-      log::info!("Navigating to URL via CDP: {}", url);
+      log::info!("Navigating to URL via CDP");
       if let Some(target) = page_targets.first() {
         if let Some(ws_url) = &target.websocket_debugger_url {
           if let Err(e) = self
@@ -1233,7 +1400,7 @@ impl WayfernManager {
       return Err(format!("CDP /json/new returned HTTP {}", resp.status()).into());
     }
 
-    log::info!("Opened URL in new tab via CDP: {}", url);
+    log::info!("Opened URL in new tab via CDP");
     Ok(())
   }
 
@@ -1516,6 +1683,37 @@ fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (u8, u8, u8) {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn remote_socks_url_detection() {
+    // Remote socks upstreams (the hyper-util-affected case) are detected...
+    assert!(WayfernManager::is_remote_socks_url(
+      "socks5://user:pass@gw.dataimpulse.com:10000"
+    ));
+    assert!(WayfernManager::is_remote_socks_url("socks5://1.2.3.4:1080"));
+    assert!(WayfernManager::is_remote_socks_url("socks4://1.2.3.4:1080"));
+
+    // ...but the app's own loopback workers are not. socks is a non-special
+    // URL scheme, so the IP literal parses as Host::Domain — the launch-time
+    // randomize path depends on this returning false.
+    assert!(!WayfernManager::is_remote_socks_url(
+      "socks5://127.0.0.1:24001"
+    ));
+    assert!(!WayfernManager::is_remote_socks_url("socks5://[::1]:24001"));
+    assert!(!WayfernManager::is_remote_socks_url(
+      "socks5://localhost:24001"
+    ));
+
+    // Non-socks schemes and unparsable URLs never need the workaround.
+    assert!(!WayfernManager::is_remote_socks_url(
+      "http://gw.dataimpulse.com:10000"
+    ));
+    assert!(!WayfernManager::is_remote_socks_url(
+      "https://gw.dataimpulse.com:10000"
+    ));
+    assert!(!WayfernManager::is_remote_socks_url("socks5://"));
+    assert!(!WayfernManager::is_remote_socks_url("not a url"));
+  }
 
   #[test]
   fn window_size_prefers_outer_window_dimensions() {

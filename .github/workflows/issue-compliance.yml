@@ -7,13 +7,17 @@ on:
 permissions:
   contents: read
   issues: write
+  models: read
 
 env:
-  MODEL: z-ai/glm-5.1
+  # GitHub Models (free, billed to the repo's plan). gpt-4.1 is the most capable
+  # model reachable on the free tier: the gpt-5 family returns
+  # unavailable_model and o3/o3-mini return 403.
+  MODEL: openai/gpt-4.1
 
 jobs:
   check-compliance:
-    # Maintainers' own issues are exempt — they open quick tracking issues
+    # Maintainers' own issues are exempt: they open quick tracking issues
     # without the template on purpose. Everyone else is checked.
     if: >-
       github.repository == 'zhom/donutbrowser' &&
@@ -22,15 +26,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Gather context
         env:
           ISSUE_TITLE: ${{ github.event.issue.title }}
           ISSUE_BODY: ${{ github.event.issue.body }}
         run: |
-          printf '%s' "$ISSUE_TITLE" > /tmp/issue-title.txt
-          printf '%s' "${ISSUE_BODY:-}" > /tmp/issue-body.txt
+          printf '%s' "$ISSUE_TITLE" | node scripts/redact-sensitive-text.mjs > /tmp/issue-title.txt
+          printf '%s' "${ISSUE_BODY:-}" | node scripts/redact-sensitive-text.mjs --issue-body > /tmp/issue-body.txt
 
       - name: Build prompt
         run: |
@@ -42,14 +46,14 @@ jobs:
           - Feature Request (description + verification checkbox)
           - Question (free form)
 
-          ## Compliance — flag NON-compliant ONLY when at least one of these is true
+          ## Compliance: flag NON-compliant ONLY when at least one of these is true
           - The issue body is empty or contains only placeholder text from the template
           - The issue is an obvious AI-generated wall of text with no real specifics
           - A bug report has no reproduction information or no error description
           - A feature request gives no use case at all
           - The author left required fields empty (Operating System, Donut Browser version, Which browser is affected, Steps to reproduce on bug reports)
 
-          Do NOT flag for missing optional fields, missing screenshots, short titles, or stylistic issues. Be conservative — a non-compliant verdict closes the issue, so only flag a genuine template violation.
+          Do NOT flag for missing optional fields, missing screenshots, short titles, or stylistic issues. Be conservative. A non-compliant verdict closes the issue, so only flag a genuine template violation.
 
           ## Output schema
           {
@@ -61,9 +65,9 @@ jobs:
           {"is_compliant": true, "non_compliance_reasons": []}
           PROMPT
 
-      - name: Call OpenRouter
+      - name: Call GitHub Models
         env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GH_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           PAYLOAD=$(jq -n \
             --arg model "$MODEL" \
@@ -80,23 +84,35 @@ jobs:
               response_format: { type: "json_object" }
             }')
 
-          RESPONSE=$(curl -fsSL https://openrouter.ai/api/v1/chat/completions \
-            -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+          # Never use curl -f here: a transport or quota error (402 once the repo's
+          # GitHub Models allowance is spent) must not abort the job. The whole
+          # step is fail-open, so capture the status and degrade instead.
+          STATUS=$(curl -sSL -o /tmp/response.json -w '%{http_code}' \
+            https://models.github.ai/inference/chat/completions \
+            -H "Authorization: Bearer $GH_MODELS_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
             -H "Content-Type: application/json" \
-            -d "$PAYLOAD")
+            -d "$PAYLOAD" || echo "000")
 
-          jq -r '.choices[0].message.content // empty' <<< "$RESPONSE" > /tmp/raw.txt
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::GitHub Models returned HTTP $STATUS; treating as compliant"
+            printf '%s\n' "inference call failed with HTTP $STATUS" >> /tmp/ai-degraded
+            echo '{"is_compliant": true, "non_compliance_reasons": []}' > /tmp/result.json
+            exit 0
+          fi
+
+          jq -r '.choices[0].message.content // empty' /tmp/response.json > /tmp/raw.txt || : > /tmp/raw.txt
 
           # Strip accidental markdown fences and parse. On parse failure, fall back
           # to a compliant result so a flaky model never closes a legitimate issue.
           sed -E 's/^```(json)?$//; s/```$//' /tmp/raw.txt > /tmp/result.json
           if ! jq -e . /tmp/result.json >/dev/null 2>&1; then
-            echo "::warning::Model returned non-JSON; treating as compliant"
-            cat /tmp/raw.txt
+            echo "::error::Model returned non-JSON; treating as compliant"
+            printf '%s\n' "model returned output that was not JSON" >> /tmp/ai-degraded
             echo '{"is_compliant": true, "non_compliance_reasons": []}' > /tmp/result.json
           fi
-          echo "Result:"
-          cat /tmp/result.json
+          echo "Compliance response validated"
 
       - name: Build comment
         id: build
@@ -111,11 +127,11 @@ jobs:
           if not compliant:
               parts.append("This issue was automatically closed because it doesn't follow our [issue templates](../issues/new/choose).")
               parts.append('')
-              parts.append('**What was missing:**')
+              parts.append('What was missing:')
               for reason in reasons:
                   parts.append(f'- {reason}')
               parts.append('')
-              parts.append('If this is a real bug or feature request, please open a new issue using the **Bug Report** or **Feature Request** template and fill in the required fields. Issues that ignore the template are not triaged.')
+              parts.append('If this is a real bug or feature request, open a new issue using the Bug Report or Feature Request template and fill in the required fields. Issues that ignore the template are not triaged.')
 
           comment = '\n'.join(parts).strip()
           open('/tmp/comment.md', 'w').write(comment)
@@ -131,3 +147,16 @@ jobs:
         run: |
           gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file /tmp/comment.md
           gh issue close "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --reason "not planned"
+
+      # The steps above deliberately degrade rather than block: an inference
+      # outage must never close a contributor's issue or flag their pull
+      # request. But a run that skipped the check it exists to perform has not
+      # succeeded, and reporting green hides that the automation is dead.
+      - name: Fail if the AI check did not actually run
+        if: always()
+        run: |
+          if [ -f /tmp/ai-degraded ]; then
+            echo "::error::This check degraded to a no-op and its result was not verified:"
+            sed 's/^/  - /' /tmp/ai-degraded
+            exit 1
+          fi

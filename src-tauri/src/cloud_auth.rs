@@ -23,15 +23,14 @@ pub const CLOUD_API_URL: &str = "https://api.donutbrowser.com";
 pub const CLOUD_SYNC_URL: &str = "https://sync.donutbrowser.com";
 
 /// Default per-hour cap on local automation API / MCP requests. Mirrors the
-/// backend's DEFAULT_REQUESTS_PER_HOUR. Not enforced yet — see the inert
-/// rate-limit chokepoints in api_server / mcp_server.
+/// backend's DEFAULT_REQUESTS_PER_HOUR.
 const DEFAULT_REQUESTS_PER_HOUR: i64 = 100;
 
 /// Capability + limit set the account is entitled to, derived from its plan.
 /// Mirrors `apps/backend/src/plans/entitlements.ts`. Features are gated on these
-/// flags instead of a single "is paid?" boolean, so a plan like the future
-/// "starter" tier (cross-OS fingerprints + cloud backup, no automation) is just
-/// data here.
+/// flags instead of a single "is paid?" boolean, so a plan like "solo" (cloud
+/// backup + nightly cookie bot, no automation, no fingerprint editing, no
+/// hands-on remote session) is just data here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entitlements {
   #[serde(default)]
@@ -44,10 +43,26 @@ pub struct Entitlements {
   pub cloud_backup: bool,
   #[serde(rename = "teamCollaboration", default)]
   pub team_collaboration: bool,
+  /// Overnight profile warming on a leased remote host. Present on the wire
+  /// since the cookie-bot release; a field missing here is silently dropped on
+  /// the way to the UI, which is why every mirror of this struct has to move
+  /// together.
+  #[serde(rename = "cookieBot", default)]
+  pub cookie_bot: bool,
+  /// Whether the plan may open a HANDS-ON remote session. Distinct from
+  /// `cookie_bot`: solo funds a nightly bot out of its remote hours but may not
+  /// drive a remote browser itself, so anything that offers interactive remote
+  /// control must read THIS rather than `remote_browser_hours > 0`.
+  #[serde(rename = "remoteInteractive", default)]
+  pub remote_interactive: bool,
   #[serde(rename = "profileLimit", default)]
   pub profile_limit: i64,
   #[serde(rename = "requestsPerHour", default)]
   pub requests_per_hour: i64,
+  /// Per-seat monthly remote-session allowance. Reporting only — a team pools
+  /// it across seats, so the spendable figure comes from the quota route.
+  #[serde(rename = "remoteBrowserHours", default)]
+  pub remote_browser_hours: i64,
 }
 
 /// Local fallback mirror of the backend plan -> capability matrix, used only when
@@ -67,15 +82,30 @@ fn derive_entitlements(
       cross_os_fingerprints: false,
       cloud_backup: false,
       team_collaboration: false,
+      cookie_bot: false,
+      remote_interactive: false,
       profile_limit: 0,
       requests_per_hour: 0,
+      remote_browser_hours: 0,
     };
   }
-  // pro and any unrecognized paid plan -> pro-level (never team).
-  let (browser_automation, cross_os_fingerprints, cloud_backup, team_collaboration) = match plan {
-    "starter" => (false, true, true, false),
-    "team" | "enterprise" => (true, true, true, true),
-    _ => (true, true, true, false),
+  // Tuple order: (browser_automation, cross_os_fingerprints, cloud_backup,
+  // team_collaboration, cookie_bot, remote_interactive).
+  //
+  // pro and any unrecognized paid plan -> pro-level (never team). Solo is the
+  // one row where cookie_bot and browser_automation disagree, which is why
+  // cookie_bot can no longer be derived from browser_automation below.
+  let (
+    browser_automation,
+    cross_os_fingerprints,
+    cloud_backup,
+    team_collaboration,
+    cookie_bot,
+    remote_interactive,
+  ) = match plan {
+    "solo" => (false, false, true, false, true, false),
+    "team" | "enterprise" => (true, true, true, true, true, true),
+    _ => (true, true, true, false, true, true),
   };
   Entitlements {
     active,
@@ -83,12 +113,17 @@ fn derive_entitlements(
     cross_os_fingerprints,
     cloud_backup,
     team_collaboration,
+    cookie_bot,
+    remote_interactive,
     profile_limit,
     requests_per_hour: if browser_automation {
       DEFAULT_REQUESTS_PER_HOUR
     } else {
       0
     },
+    // Deliberately 0 in the fallback: the allowance is the server's to state and
+    // guessing it here would show a customer hours they may not have.
+    remote_browser_hours: 0,
   }
 }
 
@@ -138,6 +173,13 @@ impl CloudUser {
   /// locally from the plan fields (keeps older cached state / backends working).
   pub fn entitlements(&self) -> Entitlements {
     if let Some(e) = &self.entitlements {
+      // Returned verbatim, INCLUDING the `#[serde(default)]` false that a
+      // backend older than this release leaves on `cookie_bot` /
+      // `remote_interactive`. Repairing it here is impossible anyway — serde's
+      // default erases the difference between "sent false" and "not sent" — and
+      // it is not this layer's job: nothing in Rust gates on either flag, and
+      // `getEntitlements()` in `src/lib/entitlements.ts` fills both gaps at the
+      // single point every UI consumer already goes through.
       return e.clone();
     }
     derive_entitlements(
@@ -609,9 +651,8 @@ impl CloudAuthManager {
 
     if !response.status().is_success() {
       let status = response.status();
-      let body = response.text().await.unwrap_or_default();
-      log::warn!("Token refresh failed ({status}): {body}");
-      return Err(format!("Token refresh failed ({status}): {body}"));
+      log::warn!("Token refresh failed ({status})");
+      return Err(format!("Token refresh failed ({status})"));
     }
 
     let result: RefreshTokenResponse = response
@@ -761,9 +802,37 @@ impl CloudAuthManager {
   }
 
   /// Account is in a paid/active state. Used for the "any active plan" gates
-  /// (sync token, wayfern token); per-feature access uses the capability helpers.
+  /// (sync token); per-feature access uses the capability helpers.
   pub async fn has_active_paid_subscription(&self) -> bool {
+    #[cfg(feature = "e2e")]
+    if crate::e2e_automation_enabled()
+      && std::env::var_os("WAYFERN_TEST_TOKEN").is_some_and(|token| !token.is_empty())
+    {
+      return true;
+    }
+
     self.entitlements().await.map(|e| e.active).unwrap_or(false)
+  }
+
+  /// Whether this session's plan entitles it to a Wayfern automation token.
+  ///
+  /// The token IS the automation entitlement, so this is `browser_automation`
+  /// and NOT `has_active_paid_subscription`. Gating the mint on "any active
+  /// plan" meant a Solo account — active, paying, and deliberately sold without
+  /// automation or fingerprint editing — asked for a token on every startup,
+  /// every login and every 10-hour refresh, collected a 403 each time, and got
+  /// the "account temporarily restricted" toast that belongs to the
+  /// multiple-device rule. Nothing was restricted; the plan simply does not
+  /// include the feature.
+  ///
+  /// Reads the entitlement directly rather than going through
+  /// `can_use_browser_automation`, whose e2e override would send the browser
+  /// suite off to the live API for a token it already has as a test value.
+  pub async fn is_entitled_to_wayfern_token(&self) -> bool {
+    self
+      .entitlements()
+      .await
+      .is_some_and(|e| e.active && e.browser_automation)
   }
 
   /// Non-async version that uses try_lock, defaults to false if lock can't be acquired.
@@ -777,9 +846,31 @@ impl CloudAuthManager {
     }
   }
 
+  /// Whether this account may run the nightly Cookie Bot.
+  ///
+  /// NOT `can_use_browser_automation`. Solo is exactly the plan where the two
+  /// disagree — it pays for a nightly bot and has `browser_automation: false` —
+  /// so gating the bot on automation refused a Solo customer the one feature
+  /// their plan is sold on, and answered 402 while their scheduled runs kept
+  /// working server-side.
+  pub async fn can_use_cookie_bot(&self) -> bool {
+    self
+      .entitlements()
+      .await
+      .map(|e| e.cookie_bot)
+      .unwrap_or(false)
+  }
+
   /// Launch/drive profiles programmatically (local API + MCP automation).
   pub async fn can_use_browser_automation(&self) -> bool {
     if cfg!(feature = "self-hosted-browser-automation") {
+      return true;
+    }
+
+    #[cfg(feature = "e2e")]
+    if crate::e2e_automation_enabled()
+      && std::env::var_os("WAYFERN_TEST_TOKEN").is_some_and(|token| !token.is_empty())
+    {
       return true;
     }
 
@@ -792,6 +883,13 @@ impl CloudAuthManager {
 
   /// Edit fingerprints / use a non-native OS fingerprint.
   pub async fn can_use_cross_os_fingerprints(&self) -> bool {
+    #[cfg(feature = "e2e")]
+    if crate::e2e_automation_enabled()
+      && std::env::var_os("WAYFERN_TEST_TOKEN").is_some_and(|token| !token.is_empty())
+    {
+      return true;
+    }
+
     self
       .entitlements()
       .await
@@ -819,14 +917,24 @@ impl CloudAuthManager {
     }
   }
 
-  /// Per-hour cap on automation requests (0 when automation is unavailable).
-  /// Carried for the future local rate limiter; read by the inert chokepoints.
-  pub async fn requests_per_hour(&self) -> i64 {
-    self
-      .entitlements()
-      .await
-      .map(|e| e.requests_per_hour)
-      .unwrap_or(0)
+  /// Identity and positive per-hour cap for the shared REST/MCP automation
+  /// limiter. No active automation entitlement means no limiter entry; the
+  /// capability gates still reject paid operations independently.
+  pub async fn automation_rate_limit(&self) -> Option<(String, u64)> {
+    #[cfg(feature = "e2e")]
+    if crate::e2e_automation_enabled() {
+      if let Ok(limit) = std::env::var("DONUT_E2E_REQUESTS_PER_HOUR") {
+        if let Ok(limit) = limit.parse::<u64>() {
+          if limit > 0 {
+            return Some(("e2e-automation".to_string(), limit));
+          }
+        }
+      }
+    }
+
+    let state = self.get_user().await?;
+    let limit = state.user.entitlements().requests_per_hour;
+    (limit > 0).then_some((state.user.id, limit as u64))
   }
 
   pub async fn is_fingerprint_os_allowed(&self, fingerprint_os: Option<&str>) -> bool {
@@ -913,14 +1021,12 @@ impl CloudAuthManager {
 
           let status = response.status();
           if status == reqwest::StatusCode::FORBIDDEN {
-            let body = response.text().await.unwrap_or_default();
-            log::warn!("Proxy config returned 403: {body}");
+            log::warn!("Proxy config returned 403");
             return Err("__403__".to_string());
           }
 
           if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(format!("Proxy config fetch failed ({status}): {body}"));
+            return Err(format!("Proxy config fetch failed ({status})"));
           }
 
           response
@@ -957,6 +1063,7 @@ impl CloudAuthManager {
           port: config.port,
           username: config.username,
           password: config.password,
+          vless_uri: None,
         };
         match PROXY_MANAGER.upsert_cloud_proxy(settings) {
           Ok(_) => {
@@ -1033,129 +1140,20 @@ impl CloudAuthManager {
       .await
   }
 
-  /// Fetch region list for a country from the cloud backend
-  pub async fn fetch_regions(&self, country: &str) -> Result<Vec<LocationItem>, String> {
-    let country = country.to_string();
-    self
-      .api_call_with_retry(move |access_token| {
-        let url = format!(
-          "{CLOUD_API_URL}/api/proxy/locations/regions?country={}",
-          country
-        );
-        let client = reqwest::Client::new();
-        async move {
-          let response = client
-            .get(&url)
-            .header("Authorization", format!("Bearer {access_token}"))
-            .send()
-            .await
-            .map_err(|e| format!("Failed to fetch regions: {e}"))?;
-
-          if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(format!("Regions fetch failed ({status}): {body}"));
-          }
-
-          response
-            .json::<Vec<LocationItem>>()
-            .await
-            .map_err(|e| format!("Failed to parse regions: {e}"))
-        }
-      })
-      .await
-  }
-
-  /// Fetch city list for a country, optionally filtered by region
-  pub async fn fetch_cities(
-    &self,
-    country: &str,
-    region: Option<&str>,
-  ) -> Result<Vec<LocationItem>, String> {
-    let country = country.to_string();
-    let region = region.map(|s| s.to_string());
-    self
-      .api_call_with_retry(move |access_token| {
-        let mut url = format!(
-          "{CLOUD_API_URL}/api/proxy/locations/cities?country={}",
-          country
-        );
-        if let Some(ref r) = region {
-          url.push_str(&format!("&region={}", r));
-        }
-        let client = reqwest::Client::new();
-        async move {
-          let response = client
-            .get(&url)
-            .header("Authorization", format!("Bearer {access_token}"))
-            .send()
-            .await
-            .map_err(|e| format!("Failed to fetch cities: {e}"))?;
-
-          if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(format!("Cities fetch failed ({status}): {body}"));
-          }
-
-          response
-            .json::<Vec<LocationItem>>()
-            .await
-            .map_err(|e| format!("Failed to parse cities: {e}"))
-        }
-      })
-      .await
-  }
-
-  /// Fetch ISP list for a country, optionally filtered by region and city
-  pub async fn fetch_isps(
-    &self,
-    country: &str,
-    region: Option<&str>,
-    city: Option<&str>,
-  ) -> Result<Vec<LocationItem>, String> {
-    let country = country.to_string();
-    let region = region.map(|s| s.to_string());
-    let city = city.map(|s| s.to_string());
-    self
-      .api_call_with_retry(move |access_token| {
-        let mut url = format!(
-          "{CLOUD_API_URL}/api/proxy/locations/isps?country={}",
-          country
-        );
-        if let Some(ref r) = region {
-          url.push_str(&format!("&region={}", r));
-        }
-        if let Some(ref c) = city {
-          url.push_str(&format!("&city={}", c));
-        }
-        let client = reqwest::Client::new();
-        async move {
-          let response = client
-            .get(&url)
-            .header("Authorization", format!("Bearer {access_token}"))
-            .send()
-            .await
-            .map_err(|e| format!("Failed to fetch ISPs: {e}"))?;
-
-          if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(format!("ISPs fetch failed ({status}): {body}"));
-          }
-
-          response
-            .json::<Vec<LocationItem>>()
-            .await
-            .map_err(|e| format!("Failed to parse ISPs: {e}"))
-        }
-      })
-      .await
-  }
-
-  /// Request a wayfern token from the cloud API. Only succeeds for paid users.
+  /// Request a wayfern token from the cloud API. Only succeeds for plans that
+  /// include browser automation.
+  ///
+  /// Self-gating on purpose: every caller used to repeat the check, and the one
+  /// they repeated was the wrong one. A plan without automation is not an error
+  /// state here — it clears any stale token and reports success, because there
+  /// is nothing to fetch and nothing wrong.
   pub async fn request_wayfern_token(&self) -> Result<(), String> {
-    if !self.has_active_paid_subscription().await {
+    if !self.is_entitled_to_wayfern_token().await {
+      // Ok(()) here means callers log nothing, so a session that declined to
+      // mint left no trace at all and looked identical to one that succeeded.
+      log::info!(
+        "Skipping wayfern token request: the cached plan does not include browser automation"
+      );
       self.clear_wayfern_token().await;
       return Ok(());
     }
@@ -1182,6 +1180,9 @@ impl CloudAuthManager {
 
           if !response.status().is_success() {
             let status = response.status();
+            // The body carries WHICH rule refused: a device-family conflict or
+            // a plan that lacks automation. They need different handling, so
+            // keep the text instead of collapsing every failure to a status.
             let body = response.text().await.unwrap_or_default();
             return Err(format!("Wayfern token request failed ({status}): {body}"));
           }
@@ -1199,22 +1200,24 @@ impl CloudAuthManager {
     let token = match result {
       Ok(token) => token,
       Err(e) => {
-        // The backend returns 403 (ForbiddenException) for paid-feature blocks:
-        // token-reuse throttle, "active subscription required", and the
-        // primary-device restriction (see donutbrowser-infra wayfern.service.ts).
-        // This is distinct from a 401 (dead access token) — the session is still
-        // valid, the user is just temporarily/conditionally not entitled. So we
-        // do NOT invalidate the session. Instead: drop the stale wayfern token so
-        // no browser launches half-authenticated, re-fetch the profile so the
-        // cached plan reflects the backend's real state (it may have changed),
-        // and signal the UI so the user learns why automation stopped working.
+        // A 403 rejects the entitlement without invalidating the login session.
+        // Clear the browser token and refresh account state before notifying UI.
         if e.contains("(403") || e.contains("Forbidden") {
           log::warn!("Wayfern token blocked by backend (403): {e}");
           self.clear_wayfern_token().await;
           if let Err(fetch_err) = self.fetch_profile().await {
             log::warn!("Profile re-fetch after wayfern block failed: {fetch_err}");
           }
-          let _ = crate::events::emit_empty("wayfern-paid-blocked");
+          // Only the device rules produce a restriction the user can lift, and
+          // the toast tells them to sign other devices out — so only those may
+          // raise it. A plan-level refusal that slipped past the gate above
+          // (cached entitlements the re-fetch just corrected) must stay silent:
+          // telling a Solo customer they are "temporarily restricted" describes
+          // a lockout that does not exist and hides the real answer, which is
+          // that their plan does not include browser automation.
+          if is_device_restriction(&e) {
+            let _ = crate::events::emit_empty("wayfern-paid-blocked");
+          }
         }
         return Err(e);
       }
@@ -1228,6 +1231,16 @@ impl CloudAuthManager {
 
   /// Get the current wayfern token, if any.
   pub async fn get_wayfern_token(&self) -> Option<String> {
+    #[cfg(feature = "e2e")]
+    if crate::e2e_automation_enabled() {
+      if let Some(token) = std::env::var_os("WAYFERN_TEST_TOKEN")
+        .filter(|token| !token.is_empty())
+        .and_then(|token| token.into_string().ok())
+      {
+        return Some(token);
+      }
+    }
+
     let wt = self.wayfern_token.lock().await;
     wt.clone()
   }
@@ -1276,9 +1289,11 @@ impl CloudAuthManager {
         }
       }
 
-      // Refresh profile data periodically
+      // Refresh profile data periodically. A failure here leaves the cached
+      // plan stale, which silently gates paid features, so it belongs at warn
+      // rather than debug where the shipped log level hides it.
       if let Err(e) = CLOUD_AUTH.fetch_profile().await {
-        log::debug!("Failed to refresh cloud profile: {e}");
+        log::warn!("Failed to refresh cloud profile: {e}");
       }
 
       // Reconnect profile lock manager if needed
@@ -1291,21 +1306,37 @@ impl CloudAuthManager {
       // Sync cloud proxy credentials
       CLOUD_AUTH.sync_cloud_proxy().await;
 
-      // Refresh wayfern token every 10 hours (60 iterations of 10-minute loop)
-      if wayfern_refresh_counter >= 60 {
+      // Refresh wayfern token every 10 hours (60 iterations of 10-minute loop).
+      // request_wayfern_token owns the entitlement check and clears the cached
+      // token when the plan doesn't include automation.
+      //
+      // Also mint one as soon as the plan starts granting it. `fetch_profile`
+      // above picks up an upgrade within ten minutes, but nothing watched that
+      // transition, so a session that signed in before upgrading stayed
+      // tokenless for up to ten hours while reporting the feature as unlocked.
+      let missing_entitled_token = CLOUD_AUTH.is_entitled_to_wayfern_token().await
+        && CLOUD_AUTH.get_wayfern_token().await.is_none();
+      if wayfern_refresh_counter >= 60 || missing_entitled_token {
         wayfern_refresh_counter = 0;
-        if CLOUD_AUTH.has_active_paid_subscription().await {
-          if let Err(e) = CLOUD_AUTH.request_wayfern_token().await {
-            log::warn!("Failed to refresh wayfern token: {e}");
-          }
-        } else {
-          CLOUD_AUTH.clear_wayfern_token().await;
+        if let Err(e) = CLOUD_AUTH.request_wayfern_token().await {
+          log::warn!("Failed to refresh wayfern token: {e}");
         }
       }
 
       let _ = &app_handle; // keep app_handle alive
     }
   }
+}
+
+/// Whether a rejected wayfern-token request was refused by one of the
+/// device-family rules (automation is pinned to the primary desktop session)
+/// rather than by the plan's capabilities.
+///
+/// Matches on the backend's message because that is the only thing that
+/// distinguishes them: both arrive as a bare 403. Only these two are a state
+/// the user can clear themselves, which is what the toast asks them to do.
+fn is_device_restriction(error: &str) -> bool {
+  error.contains("primary device") || error.contains("requires the desktop app")
 }
 
 fn solve_pow(prefix: &str, difficulty: u32) -> Option<String> {
@@ -1405,6 +1436,20 @@ pub async fn cloud_get_user() -> Result<Option<CloudAuthState>, String> {
 pub async fn cloud_refresh_profile() -> Result<CloudUser, String> {
   let mut user = CLOUD_AUTH.fetch_profile().await?;
   user.entitlements = Some(user.entitlements());
+
+  // Minting the token is what actually unlocks cross-OS fingerprints, and it
+  // only happened at login, at startup and once every 10 hours. An account
+  // that upgraded after its last sign-in therefore refreshed into the correct
+  // entitlements while still holding no token, and "Refresh" did not fix it.
+  // Only mint when one is genuinely missing, so this stays a no-op afterwards.
+  if CLOUD_AUTH.is_entitled_to_wayfern_token().await
+    && CLOUD_AUTH.get_wayfern_token().await.is_none()
+  {
+    if let Err(e) = CLOUD_AUTH.request_wayfern_token().await {
+      log::warn!("Refresh could not obtain a wayfern token: {e}");
+    }
+  }
+
   Ok(user)
 }
 
@@ -1448,30 +1493,6 @@ pub async fn cloud_refresh_wayfern_token() -> Result<Option<String>, String> {
 #[tauri::command]
 pub async fn cloud_get_countries() -> Result<Vec<LocationItem>, String> {
   CLOUD_AUTH.fetch_countries().await
-}
-
-#[tauri::command]
-pub async fn cloud_get_regions(country: String) -> Result<Vec<LocationItem>, String> {
-  CLOUD_AUTH.fetch_regions(&country).await
-}
-
-#[tauri::command]
-pub async fn cloud_get_cities(
-  country: String,
-  region: Option<String>,
-) -> Result<Vec<LocationItem>, String> {
-  CLOUD_AUTH.fetch_cities(&country, region.as_deref()).await
-}
-
-#[tauri::command]
-pub async fn cloud_get_isps(
-  country: String,
-  region: Option<String>,
-  city: Option<String>,
-) -> Result<Vec<LocationItem>, String> {
-  CLOUD_AUTH
-    .fetch_isps(&country, region.as_deref(), city.as_deref())
-    .await
 }
 
 #[tauri::command]
@@ -1671,5 +1692,54 @@ mod tests {
       manager.can_use_browser_automation().await,
       cfg!(feature = "self-hosted-browser-automation")
     );
+  }
+
+  fn active_solo() -> Entitlements {
+    derive_entitlements("solo", Some("monthly"), "active", 20)
+  }
+
+  #[test]
+  fn solo_is_active_without_browser_automation() {
+    let solo = active_solo();
+    assert!(solo.active, "solo is a paid, active plan");
+    assert!(solo.cloud_backup, "solo buys cloud profile backups");
+    assert!(solo.cookie_bot, "solo buys the nightly cookie bot");
+    assert!(
+      !solo.browser_automation,
+      "solo is sold without browser automation"
+    );
+    assert!(
+      !solo.cross_os_fingerprints,
+      "solo is sold without fingerprint editing"
+    );
+  }
+
+  #[test]
+  fn wayfern_token_is_gated_on_automation_not_on_being_paid() {
+    // The regression this guards: gating the mint on `active` asked for a token
+    // on behalf of a Solo account, which the backend answers with a 403.
+    let solo = active_solo();
+    assert!(!(solo.active && solo.browser_automation));
+
+    let pro = derive_entitlements("pro", Some("monthly"), "active", 50);
+    assert!(pro.active && pro.browser_automation);
+  }
+
+  #[test]
+  fn only_the_device_rules_read_as_a_restriction() {
+    assert!(is_device_restriction(
+      "Wayfern token request failed (403 Forbidden): {\"message\":\"Browser automation is restricted to your primary device. Log out other devices to use it here.\",\"statusCode\":403}"
+    ));
+    assert!(is_device_restriction(
+      "Wayfern token request failed (403 Forbidden): {\"message\":\"Browser automation requires the desktop app. Open Donut Browser and try again.\",\"statusCode\":403}"
+    ));
+    // A plan-level refusal is not a restriction, and must not raise the toast
+    // that tells the user to sign other devices out.
+    assert!(!is_device_restriction(
+      "Wayfern token request failed (403 Forbidden): {\"message\":\"Browser automation subscription required\",\"statusCode\":403}"
+    ));
+    assert!(!is_device_restriction(
+      "Wayfern token request failed (500 Internal Server Error): "
+    ));
   }
 }

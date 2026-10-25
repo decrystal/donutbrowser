@@ -32,6 +32,8 @@ pub struct ExportedProxy {
   pub username: Option<String>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub password: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub vless_uri: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +51,8 @@ pub struct ParsedProxyLine {
   pub port: u16,
   pub username: Option<String>,
   pub password: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub vless_uri: Option<String>,
   pub original_line: String,
 }
 
@@ -135,6 +139,56 @@ pub fn now_secs() -> u64 {
     .duration_since(UNIX_EPOCH)
     .unwrap_or_default()
     .as_secs()
+}
+
+/// Keys in `active_proxies` at or above this value are in-flight launch
+/// placeholders, not real browser PIDs. Real OS PIDs never reach this range
+/// (Linux pid_max caps at 2^22, macOS at ~100k, Windows PIDs are small DWORD
+/// multiples of 4), so a placeholder can never shadow a live process ID.
+pub const LAUNCH_PLACEHOLDER_PID_MIN: u32 = u32::MAX - 0x00FF_FFFF;
+
+static NEXT_LAUNCH_PLACEHOLDER_PID: std::sync::atomic::AtomicU32 =
+  std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Allocate a unique `active_proxies` key for a launch in flight, so concurrent
+/// launches can never overwrite each other's placeholder entry.
+pub fn next_launch_placeholder_pid() -> u32 {
+  NEXT_LAUNCH_PLACEHOLDER_PID.fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn is_launch_placeholder_pid(pid: u32) -> bool {
+  pid >= LAUNCH_PLACEHOLDER_PID_MIN
+}
+
+/// Write the exact browser process identity (PID plus its start time) onto a
+/// worker's on-disk config. Both halves matter: the PID says which process to
+/// watch, the start time pins it to THAT process so a recycled PID can never
+/// read as "my browser is still alive".
+///
+/// Rejects launch placeholders and 0 — neither is a real browser — so a caller
+/// can treat `false` as "this worker has no verified owner" and abort rather
+/// than leave a worker nothing will reap.
+pub(crate) fn persist_browser_identity(proxy_id: &str, browser_pid: u32) -> bool {
+  if browser_pid == 0 || is_launch_placeholder_pid(browser_pid) {
+    return false;
+  }
+  let Some(mut cfg) = crate::proxy_storage::get_proxy_config(proxy_id) else {
+    return false;
+  };
+  let Some(start_time) = crate::proxy_storage::resolve_process_start_time(browser_pid) else {
+    log::warn!("Could not resolve start time for browser PID {browser_pid} (proxy {proxy_id})");
+    return false;
+  };
+
+  cfg.browser_pid = Some(browser_pid);
+  cfg.browser_pid_start_time = Some(start_time);
+  if crate::proxy_storage::update_proxy_config(&cfg) {
+    log::info!("Recorded browser PID {browser_pid} on proxy config {proxy_id} for self-reaping");
+    true
+  } else {
+    log::warn!("Failed to persist browser_pid {browser_pid} to proxy config {proxy_id}");
+    false
+  }
 }
 
 impl StoredProxy {
@@ -260,7 +314,7 @@ impl ProxyManager {
   ) -> Result<(), Box<dyn std::error::Error>> {
     let cache_file = self.get_proxy_check_cache_file(proxy_id)?;
     let content = serde_json::to_string_pretty(result)?;
-    fs::write(&cache_file, content)?;
+    crate::app_dirs::write_owner_only(&cache_file, content.as_bytes())?;
     Ok(())
   }
 
@@ -385,7 +439,7 @@ impl ProxyManager {
 
     let proxy_file = self.get_proxy_file_path(&proxy.id);
     let content = serde_json::to_string_pretty(proxy)?;
-    fs::write(&proxy_file, content)?;
+    crate::app_dirs::write_owner_only(&proxy_file, content.as_bytes())?;
 
     Ok(())
   }
@@ -399,6 +453,31 @@ impl ProxyManager {
     Ok(())
   }
 
+  fn normalize_proxy_settings(mut proxy_settings: ProxySettings) -> Result<ProxySettings, String> {
+    if !proxy_settings.proxy_type.eq_ignore_ascii_case("vless") {
+      proxy_settings.vless_uri = None;
+      return Ok(proxy_settings);
+    }
+
+    let uri = proxy_settings
+      .vless_uri
+      .as_deref()
+      .filter(|uri| !uri.is_empty())
+      .ok_or_else(|| crate::backend_error("VLESS_CONFIG_INVALID"))?;
+    let parsed =
+      crate::xray::parse_vless_uri(uri).map_err(|error| crate::vless_config_error(&error))?;
+    let canonical_uri = crate::xray::export_vless_uri(&parsed.config, parsed.name.as_deref())
+      .map_err(|error| crate::vless_config_error(&error))?;
+
+    proxy_settings.proxy_type = "vless".to_string();
+    proxy_settings.host = parsed.config.address;
+    proxy_settings.port = parsed.config.port;
+    proxy_settings.username = None;
+    proxy_settings.password = None;
+    proxy_settings.vless_uri = Some(canonical_uri);
+    Ok(proxy_settings)
+  }
+
   // Create a new stored proxy
   pub fn create_stored_proxy(
     &self,
@@ -406,6 +485,10 @@ impl ProxyManager {
     name: String,
     proxy_settings: ProxySettings,
   ) -> Result<StoredProxy, String> {
+    if name.trim().is_empty() {
+      return Err(serde_json::json!({ "code": "NAME_CANNOT_BE_EMPTY" }).to_string());
+    }
+
     // Check if name already exists
     {
       let stored_proxies = self.stored_proxies.lock().unwrap();
@@ -414,6 +497,7 @@ impl ProxyManager {
       }
     }
 
+    let proxy_settings = Self::normalize_proxy_settings(proxy_settings)?;
     let stored_proxy = StoredProxy::new(name, proxy_settings);
 
     {
@@ -647,6 +731,7 @@ impl ProxyManager {
       port: base_proxy.proxy_settings.port,
       username: Some(geo_username),
       password: base_proxy.proxy_settings.password.clone(),
+      vless_uri: None,
     };
 
     // Check if name already exists
@@ -795,6 +880,14 @@ impl ProxyManager {
     name: Option<String>,
     proxy_settings: Option<ProxySettings>,
   ) -> Result<StoredProxy, String> {
+    if name.as_deref().is_some_and(|n| n.trim().is_empty()) {
+      return Err(serde_json::json!({ "code": "NAME_CANNOT_BE_EMPTY" }).to_string());
+    }
+
+    let proxy_settings = proxy_settings
+      .map(Self::normalize_proxy_settings)
+      .transpose()?;
+
     // First, check for conflicts without holding a mutable reference
     {
       let stored_proxies = self.stored_proxies.lock().unwrap();
@@ -1032,8 +1125,14 @@ impl ProxyManager {
     format!("Proxy check failed for {proxy_addr}. Could not connect through the proxy.")
   }
 
-  // Build proxy URL string from ProxySettings
-  fn build_proxy_url(proxy_settings: &ProxySettings) -> String {
+  // Build proxy URL string from ProxySettings. Credentials are percent-encoded:
+  // a password containing `/`, `#`, `?` or `@` otherwise breaks the URL
+  // authority and silently retargets the request at the wrong host.
+  pub fn build_proxy_url(proxy_settings: &ProxySettings) -> String {
+    if proxy_settings.proxy_type.eq_ignore_ascii_case("vless") {
+      return proxy_settings.vless_uri.clone().unwrap_or_default();
+    }
+
     let mut url = format!("{}://", proxy_settings.proxy_type);
 
     if let (Some(username), Some(password)) = (&proxy_settings.username, &proxy_settings.password) {
@@ -1053,6 +1152,21 @@ impl ProxyManager {
     url
   }
 
+  /// Proxy URL for a diagnostic probe made by the app itself (reqwest), as
+  /// opposed to `build_proxy_url`, which feeds the browser.
+  ///
+  /// SOCKS5 becomes `socks5h://` so the probe endpoint's hostname resolves at
+  /// the exit rather than on this machine. Resolving locally would leak the
+  /// real DNS and, behind a split-horizon resolver, can reach a different host
+  /// than the browser would.
+  pub fn build_probe_proxy_url(proxy_settings: &ProxySettings) -> String {
+    let url = Self::build_proxy_url(proxy_settings);
+    if proxy_settings.proxy_type.eq_ignore_ascii_case("socks5") {
+      return url.replacen("socks5://", "socks5h://", 1);
+    }
+    url
+  }
+
   // Check if a proxy is valid by routing through a temporary donut-proxy process.
   // This tests the exact same code path the browser uses.
   // Falls back to direct reqwest check if the proxy worker fails to start.
@@ -1061,9 +1175,22 @@ impl ProxyManager {
     proxy_id: &str,
     proxy_settings: &ProxySettings,
   ) -> Result<ProxyCheckResult, String> {
-    let upstream_url = Self::build_proxy_url(proxy_settings);
+    let mut xray_worker_id = None;
+    let effective_proxy_settings = if proxy_settings.proxy_type.eq_ignore_ascii_case("vless") {
+      let uri = proxy_settings
+        .vless_uri
+        .as_deref()
+        .ok_or_else(|| crate::backend_error("VLESS_CONFIG_INVALID"))?;
+      let worker = crate::xray_worker_runner::start_xray_worker(None, uri)
+        .await
+        .map_err(|error| error.to_string())?;
+      xray_worker_id = Some(worker.id.clone());
+      worker.local_proxy_settings()
+    } else {
+      proxy_settings.clone()
+    };
+    let upstream_url = Self::build_proxy_url(&effective_proxy_settings);
 
-    // Try process-based check first (identical to browser launch path)
     // Try process-based check first (identical to browser launch path).
     // If the proxy worker fails to start (e.g. Gatekeeper, antivirus, signing
     // restrictions), fall back to a direct reqwest check.
@@ -1076,6 +1203,13 @@ impl ProxyManager {
       Ok(proxy_config) => {
         let local_url = format!("http://127.0.0.1:{}", proxy_config.local_port.unwrap_or(0));
         let config_id = proxy_config.id.clone();
+        // Tie the check worker's lifetime to this GUI process: the worker's
+        // owner watchdog self-exits when that identity dies, so if the app is
+        // killed mid-check the worker follows instead of idling until the
+        // next app launch.
+        if !persist_browser_identity(&config_id, std::process::id()) {
+          log::warn!("Failed to tag check worker {config_id} with app PID for self-expiry");
+        }
         // Wrap in a timeout so the check worker doesn't stay alive indefinitely
         // if the upstream is slow or unreachable.
         let result = tokio::time::timeout(
@@ -1093,13 +1227,21 @@ impl ProxyManager {
         result
       }
       Err(err_msg) => {
-        log::warn!(
-          "Proxy worker failed to start ({}), falling back to direct check",
-          err_msg
-        );
-        ip_utils::fetch_public_ip(Some(&upstream_url)).await
+        if xray_worker_id.is_some() {
+          log::warn!("Local proxy worker failed to start in front of Xray-core: {err_msg}");
+          Err(ip_utils::IpError::Network(err_msg))
+        } else {
+          log::warn!(
+            "Proxy worker failed to start ({}), falling back to direct check",
+            err_msg
+          );
+          ip_utils::fetch_public_ip(Some(&upstream_url)).await
+        }
       }
     };
+    if let Some(worker_id) = xray_worker_id {
+      let _ = crate::xray_worker_runner::stop_xray_worker(&worker_id).await;
+    }
 
     let ip = match ip_result {
       Ok(ip) => ip,
@@ -1158,6 +1300,7 @@ impl ProxyManager {
         port: p.proxy_settings.port,
         username: p.proxy_settings.username.clone(),
         password: p.proxy_settings.password.clone(),
+        vless_uri: p.proxy_settings.vless_uri.clone(),
       })
       .collect();
 
@@ -1211,6 +1354,7 @@ impl ProxyManager {
             port,
             username: None,
             password: None,
+            vless_uri: None,
             original_line: line.to_string(),
           });
         }
@@ -1231,51 +1375,7 @@ impl ProxyManager {
         }
       }
       // 4 parts: could be host:port:user:pass OR user:pass:host:port
-      4 => {
-        // Try to detect which format
-        let port_at_1 = parts[1].parse::<u16>().is_ok();
-        let port_at_3 = parts[3].parse::<u16>().is_ok();
-
-        match (port_at_1, port_at_3) {
-          // host:port:user:pass
-          (true, false) => {
-            let port = parts[1].parse::<u16>().unwrap();
-            ProxyParseResult::Parsed(ParsedProxyLine {
-              proxy_type: "http".to_string(),
-              host: parts[0].to_string(),
-              port,
-              username: Some(parts[2].to_string()),
-              password: Some(parts[3].to_string()),
-              original_line: line.to_string(),
-            })
-          }
-          // user:pass:host:port
-          (false, true) => {
-            let port = parts[3].parse::<u16>().unwrap();
-            ProxyParseResult::Parsed(ParsedProxyLine {
-              proxy_type: "http".to_string(),
-              host: parts[2].to_string(),
-              port,
-              username: Some(parts[0].to_string()),
-              password: Some(parts[1].to_string()),
-              original_line: line.to_string(),
-            })
-          }
-          // Both could be ports - ambiguous
-          (true, true) => ProxyParseResult::Ambiguous {
-            line: line.to_string(),
-            possible_formats: vec![
-              "host:port:username:password".to_string(),
-              "username:password:host:port".to_string(),
-            ],
-          },
-          // Neither is a valid port
-          (false, false) => ProxyParseResult::Invalid {
-            line: line.to_string(),
-            reason: "No valid port number found".to_string(),
-          },
-        }
-      }
+      4 => Self::parse_colon_separated_quad(&parts, "http", line),
       _ => ProxyParseResult::Invalid {
         line: line.to_string(),
         reason: format!("Unexpected format with {} parts", parts.len()),
@@ -1283,8 +1383,71 @@ impl ProxyManager {
     }
   }
 
+  // Resolve a four-part colon-separated body, which is either
+  // host:port:username:password or username:password:host:port. The port
+  // position tells the two apart; when both positions parse as a port the
+  // caller has to ask the user.
+  fn parse_colon_separated_quad(parts: &[&str], proxy_type: &str, line: &str) -> ProxyParseResult {
+    let port_at_1 = parts[1].parse::<u16>().ok();
+    let port_at_3 = parts[3].parse::<u16>().ok();
+
+    match (port_at_1, port_at_3) {
+      // host:port:user:pass
+      (Some(port), None) => ProxyParseResult::Parsed(ParsedProxyLine {
+        proxy_type: proxy_type.to_string(),
+        host: parts[0].to_string(),
+        port,
+        username: Some(parts[2].to_string()),
+        password: Some(parts[3].to_string()),
+        vless_uri: None,
+        original_line: line.to_string(),
+      }),
+      // user:pass:host:port
+      (None, Some(port)) => ProxyParseResult::Parsed(ParsedProxyLine {
+        proxy_type: proxy_type.to_string(),
+        host: parts[2].to_string(),
+        port,
+        username: Some(parts[0].to_string()),
+        password: Some(parts[1].to_string()),
+        vless_uri: None,
+        original_line: line.to_string(),
+      }),
+      // Both could be ports - ambiguous
+      (Some(_), Some(_)) => ProxyParseResult::Ambiguous {
+        line: line.to_string(),
+        possible_formats: vec![
+          "host:port:username:password".to_string(),
+          "username:password:host:port".to_string(),
+        ],
+      },
+      // Neither is a valid port
+      (None, None) => ProxyParseResult::Invalid {
+        line: line.to_string(),
+        reason: "No valid port number found".to_string(),
+      },
+    }
+  }
+
   // Try to parse URL format: protocol://username:password@host:port
   fn try_parse_url_format(line: &str) -> Option<ProxyParseResult> {
+    if line.starts_with("vless://") {
+      return Some(match crate::xray::parse_vless_uri(line) {
+        Ok(parsed) => ProxyParseResult::Parsed(ParsedProxyLine {
+          proxy_type: "vless".to_string(),
+          host: parsed.config.address,
+          port: parsed.config.port,
+          username: None,
+          password: None,
+          vless_uri: Some(line.to_string()),
+          original_line: line.to_string(),
+        }),
+        Err(error) => ProxyParseResult::Invalid {
+          line: line.to_string(),
+          reason: error.to_string(),
+        },
+      });
+    }
+
     // Check for protocol prefix using strip_prefix
     let (protocol, rest) = if let Some(rest) = line.strip_prefix("http://") {
       ("http", rest)
@@ -1298,10 +1461,9 @@ impl ProxyManager {
       ("socks5", rest) // Default socks to socks5
     } else if let Some(rest) = line.strip_prefix("ss://") {
       ("ss", rest)
-    } else if let Some(rest) = line.strip_prefix("shadowsocks://") {
-      ("ss", rest)
     } else {
-      return None;
+      let rest = line.strip_prefix("shadowsocks://")?;
+      ("ss", rest)
     };
 
     // Check if there's auth (contains @)
@@ -1331,11 +1493,21 @@ impl ProxyManager {
             port,
             username,
             password,
+            vless_uri: None,
             original_line: line.to_string(),
           }));
         }
       }
     } else {
+      // Vendors also hand out the colon-separated body behind a scheme, as in
+      // socks5://host:port:user:pass, so try that before plain host:port. An
+      // IPv6 literal splits into four too ("[", "", "1]", "8080" for [::1]:8080),
+      // so require every field to be populated before reading it that way.
+      let parts: Vec<&str> = rest.split(':').collect();
+      if parts.len() == 4 && parts.iter().all(|part| !part.is_empty()) {
+        return Some(Self::parse_colon_separated_quad(&parts, protocol, line));
+      }
+
       // No auth, just host:port
       if let Some(colon_pos) = rest.rfind(':') {
         let host = &rest[..colon_pos];
@@ -1346,6 +1518,7 @@ impl ProxyManager {
             port,
             username: None,
             password: None,
+            vless_uri: None,
             original_line: line.to_string(),
           }));
         }
@@ -1365,13 +1538,12 @@ impl ProxyManager {
       let host_port = &line[at_pos + 1..];
 
       // Parse auth
-      let (username, password) = if let Some(colon_pos) = auth.find(':') {
+      let (username, password) = {
+        let colon_pos = auth.find(':')?;
         (
           Some(auth[..colon_pos].to_string()),
           Some(auth[colon_pos + 1..].to_string()),
         )
-      } else {
-        return None;
       };
 
       // Parse host:port
@@ -1384,6 +1556,7 @@ impl ProxyManager {
             port,
             username,
             password,
+            vless_uri: None,
             original_line: line.to_string(),
           }));
         }
@@ -1412,6 +1585,7 @@ impl ProxyManager {
         port: exported.port,
         username: exported.username,
         password: exported.password,
+        vless_uri: exported.vless_uri,
       };
 
       match self.create_stored_proxy(app_handle, exported.name.clone(), proxy_settings) {
@@ -1454,6 +1628,7 @@ impl ProxyManager {
         port: parsed.port,
         username: parsed.username,
         password: parsed.password,
+        vless_uri: parsed.vless_uri,
       };
 
       match self.create_stored_proxy(app_handle, proxy_name.clone(), proxy_settings) {
@@ -1487,6 +1662,7 @@ impl ProxyManager {
     profile_id: Option<&str>,
     bypass_rules: Vec<String>,
     blocklist_file: Option<String>,
+    dns_allowlist_mode: bool,
     // Protocol the local worker serves the browser: "socks5" (Wayfern). Reflected in
     // the returned ProxySettings.proxy_type so the caller formats the right local proxy URL scheme.
     local_protocol: &str,
@@ -1528,6 +1704,7 @@ impl ProxyManager {
                 port: existing.local_port,
                 username: None,
                 password: None,
+                vless_uri: None,
               });
             }
             // Need to add this PID to the mapping - we'll do that after starting
@@ -1568,6 +1745,7 @@ impl ProxyManager {
               port: existing.local_port,
               username: None,
               password: None,
+              vless_uri: None,
             });
           }
           // Profile ID changed - we'll create a new proxy but don't stop the old one
@@ -1577,6 +1755,10 @@ impl ProxyManager {
         // It will be cleaned up by periodic cleanup if it becomes dead
       }
     }
+
+    crate::proxy_runner::ensure_sidecar_version()
+      .await
+      .map_err(|e| e.to_string())?;
 
     // Start a new proxy using the donut-proxy binary with the correct CLI interface
     let mut proxy_cmd = app_handle
@@ -1596,12 +1778,13 @@ impl ProxyManager {
         .arg("--type")
         .arg(&proxy_settings.proxy_type);
 
-      // Add credentials if provided
+      // Keep credentials out of process arguments. The short-lived sidecar
+      // removes these variables before it spawns the detached worker.
       if let Some(username) = &proxy_settings.username {
-        proxy_cmd = proxy_cmd.arg("--username").arg(username);
+        proxy_cmd = proxy_cmd.env("DONUT_PROXY_USERNAME", username);
       }
       if let Some(password) = &proxy_settings.password {
-        proxy_cmd = proxy_cmd.arg("--password").arg(password);
+        proxy_cmd = proxy_cmd.env("DONUT_PROXY_PASSWORD", password);
       }
     }
 
@@ -1620,6 +1803,9 @@ impl ProxyManager {
     // Add blocklist file path if provided
     if let Some(ref path) = blocklist_file {
       proxy_cmd = proxy_cmd.arg("--blocklist-file").arg(path);
+      if dns_allowlist_mode {
+        proxy_cmd = proxy_cmd.arg("--dns-allowlist-mode");
+      }
     }
 
     // Tell the worker which protocol to serve the browser (http or socks5)
@@ -1690,6 +1876,10 @@ impl ProxyManager {
         }
       }
       if !ready {
+        // The detached worker is already running with its config on disk, but
+        // it was never registered in active_proxies — no cleanup pass could
+        // ever find it, so it must be killed before this error propagates.
+        let _ = crate::proxy_runner::stop_proxy_process(&proxy_info.id).await;
         return Err(format!(
           "Local proxy on 127.0.0.1:{} did not become ready in time",
           proxy_info.local_port
@@ -1721,6 +1911,7 @@ impl ProxyManager {
       port: proxy_info.local_port,
       username: None,
       password: None,
+      vless_uri: None,
     })
   }
 
@@ -1849,46 +2040,77 @@ impl ProxyManager {
   }
 
   // Update the PID mapping for an existing proxy
+  /// Re-key the in-memory map when a profile's browser PID changes, and rewrite
+  /// the worker's on-disk owner identity to match.
+  ///
+  /// Persisting is not optional bookkeeping. The detached worker reaps itself by
+  /// watching the identity on disk, so a re-key that only touched memory left
+  /// the worker watching the PREVIOUS process: once that PID was recycled the
+  /// worker saw a live "browser" forever and outlived both its browser and the
+  /// GUI. Callers on the status-sync path (`profile::manager`) hit this every
+  /// time a browser re-execs or restarts itself.
   pub fn update_proxy_pid(&self, old_pid: u32, new_pid: u32) -> Result<(), String> {
-    let mut proxies = self.active_proxies.lock().unwrap();
-    if let Some(proxy_info) = proxies.remove(&old_pid) {
-      proxies.insert(new_pid, proxy_info);
-      Ok(())
-    } else {
-      Err(format!("No proxy found for PID {old_pid}"))
+    let proxy_id = {
+      let mut proxies = self.active_proxies.lock().unwrap();
+      match proxies.remove(&old_pid) {
+        Some(proxy_info) => {
+          let id = proxy_info.id.clone();
+          proxies.insert(new_pid, proxy_info);
+          id
+        }
+        None => return Err(format!("No proxy found for PID {old_pid}")),
+      }
+    };
+
+    if !persist_browser_identity(&proxy_id, new_pid) {
+      log::warn!(
+        "Re-keyed proxy {proxy_id} to browser PID {new_pid} in memory but could not persist it; \
+         the detached worker is still watching the previous process"
+      );
     }
+    Ok(())
   }
 
   /// Persist the real browser PID onto the worker's on-disk config so the
   /// detached worker can self-terminate when that browser dies, independent of
   /// the GUI being alive. Resolved via the profile→proxy_id map rather than the
-  /// PID-keyed `active_proxies` map: the latter uses a placeholder key 0 during
-  /// launch that collides across concurrent launches, which could tag a live
-  /// worker with the wrong (dead) PID and make it self-exit. Safe on the reuse
+  /// PID-keyed `active_proxies` map: the latter is keyed by a per-launch
+  /// placeholder until `update_proxy_pid` runs, so it is not a reliable way to
+  /// find the worker for a profile mid-launch. Safe on the reuse
   /// path — it simply rewrites `browser_pid` to the new live PID. A `browser_pid`
-  /// of 0 (launch failed to report a PID) is ignored so the worker never
-  /// self-exits against a bogus PID.
-  pub fn set_browser_pid_for_profile(&self, profile_id: &str, browser_pid: u32) {
+  /// of 0 (launch failed to report a PID) is rejected so the caller can abort
+  /// the launch instead of leaving a worker without a verified browser owner.
+  pub fn set_browser_pid_for_profile(&self, profile_id: &str, browser_pid: u32) -> bool {
     if browser_pid == 0 {
-      return;
+      return false;
     }
-    let proxy_id = {
-      let map = self.profile_active_proxy_ids.lock().unwrap();
-      match map.get(profile_id) {
-        Some(id) => id.clone(),
-        None => return, // No local worker for this profile — nothing to tag.
-      }
+    let Some(proxy_id) = self.resolve_proxy_id_for_profile(profile_id) else {
+      return false;
     };
-    if let Some(mut cfg) = crate::proxy_storage::get_proxy_config(&proxy_id) {
-      cfg.browser_pid = Some(browser_pid);
-      if crate::proxy_storage::update_proxy_config(&cfg) {
-        log::info!(
-          "Recorded browser PID {browser_pid} on proxy config {proxy_id} for self-reaping"
-        );
-      } else {
-        log::warn!("Failed to persist browser_pid {browser_pid} to proxy config {proxy_id}");
-      }
+    persist_browser_identity(&proxy_id, browser_pid)
+  }
+
+  /// Find the worker serving a profile. Prefers the in-memory map, then falls
+  /// back to the newest matching config on disk: after a GUI restart the map is
+  /// empty, but a browser (and its worker) launched by the PREVIOUS GUI can
+  /// still be running, and that worker's owner identity must stay refreshable.
+  fn resolve_proxy_id_for_profile(&self, profile_id: &str) -> Option<String> {
+    if let Some(id) = self
+      .profile_active_proxy_ids
+      .lock()
+      .unwrap()
+      .get(profile_id)
+      .cloned()
+    {
+      return Some(id);
     }
+
+    // Smallest age = most recently created worker for this profile.
+    crate::proxy_storage::list_proxy_configs()
+      .into_iter()
+      .filter(|config| config.profile_id.as_deref() == Some(profile_id))
+      .min_by_key(|config| crate::proxy_storage::proxy_config_age_secs(&config.id))
+      .map(|config| config.id)
   }
 
   // Clean up proxies for dead browser processes
@@ -1908,19 +2130,12 @@ impl ProxyManager {
     // The user doesn't care if proxy processes run indefinitely as long as they're not consuming CPU
     let orphaned_configs = {
       use crate::proxy_storage::{is_process_running, list_proxy_configs};
-      use std::time::{SystemTime, UNIX_EPOCH};
 
       let all_configs = list_proxy_configs();
       let tracked_proxy_ids: std::collections::HashSet<String> = {
         let proxies = self.active_proxies.lock().unwrap();
         proxies.values().map(|p| p.id.clone()).collect()
       };
-
-      // Get current time for grace period check
-      let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
 
       all_configs
         .into_iter()
@@ -1930,15 +2145,9 @@ impl ProxyManager {
             return false;
           }
 
-          // Extract creation time from proxy ID (format: proxy_{timestamp}_{random})
-          // This gives us a grace period for newly created proxies
-          let proxy_age = config
-            .id
-            .strip_prefix("proxy_")
-            .and_then(|s| s.split('_').next())
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|created_at| now.saturating_sub(created_at))
-            .unwrap_or(0);
+          // Creation time comes from the proxy ID (format: proxy_{timestamp}_{random}),
+          // giving newly created proxies a grace period.
+          let proxy_age = crate::proxy_storage::proxy_config_age_secs(&config.id);
 
           // Grace period: don't clean up proxies created in the last 120 seconds
           // This prevents race conditions during startup (increased from 60 to 120 for safety)
@@ -2001,12 +2210,6 @@ impl ProxyManager {
     // proxies for running browsers (due to launcher-vs-browser PID mismatch).
     {
       use crate::proxy_storage::{is_process_running, list_proxy_configs};
-      use std::time::{SystemTime, UNIX_EPOCH};
-
-      let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
 
       let all_configs = list_proxy_configs();
       for config in all_configs {
@@ -2022,13 +2225,7 @@ impl ProxyManager {
         }
 
         // Check age: only kill if older than 5 minutes
-        let proxy_age = config
-          .id
-          .strip_prefix("proxy_")
-          .and_then(|s| s.split('_').next())
-          .and_then(|s| s.parse::<u64>().ok())
-          .map(|created_at| now.saturating_sub(created_at))
-          .unwrap_or(0);
+        let proxy_age = crate::proxy_storage::proxy_config_age_secs(&config.id);
 
         if proxy_age > 300 {
           log::info!(
@@ -2045,12 +2242,13 @@ impl ProxyManager {
     // Kill proxy workers whose browser process has died.
     //
     // active_proxies is keyed by the EXACT browser PID that was recorded in
-    // update_proxy_pid(). Checking that PID against a single process-table
-    // snapshot is deterministic: either the PID refers to a live process or
-    // it doesn't. This avoids the fuzzy launcher-vs-browser detection used
-    // by check_browser_status (which historically had false negatives on
-    // Linux and was the reason profile-associated workers were left alone
-    // in the other cleanup branches).
+    // update_proxy_pid(). That PID is matched against a single process-table
+    // snapshot AND, when the worker's config records one, against the browser's
+    // start time — existence alone would let a recycled PID keep a dead
+    // browser's worker alive indefinitely. This avoids the fuzzy
+    // launcher-vs-browser detection used by check_browser_status (which
+    // historically had false negatives on Linux and was the reason
+    // profile-associated workers were left alone in the other cleanup branches).
     //
     // Without this, every time a user closes their browser via the window's
     // X button (bypassing Donut's stop flow) or the browser crashes, the
@@ -2084,15 +2282,27 @@ impl ProxyManager {
         let mut snapshot_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for (browser_pid, proxy_id, profile_id) in snapshot {
           snapshot_pids.insert(browser_pid);
-          // The sentinel PID=0 is used as a placeholder during launch,
-          // before update_proxy_pid has recorded the real browser PID.
-          if browser_pid == 0 {
+          // Launch placeholders (and the legacy 0 sentinel) are not real
+          // browser PIDs — update_proxy_pid hasn't recorded the real one yet.
+          if browser_pid == 0 || is_launch_placeholder_pid(browser_pid) {
             continue;
           }
-          if system
-            .process(sysinfo::Pid::from_u32(browser_pid))
-            .is_some()
-          {
+          // Reuse the single scan rather than re-querying per PID, but hold the
+          // entry to the recorded identity when the worker has one.
+          let expected_start_time = crate::proxy_storage::get_proxy_config(&proxy_id)
+            .and_then(|config| config.browser_pid_start_time);
+          let still_the_same_browser = match system.process(sysinfo::Pid::from_u32(browser_pid)) {
+            // An exited-but-unreaped browser still occupies its PID in this
+            // snapshot; only a genuinely live process counts.
+            Some(process) if crate::proxy_storage::snapshot_process_is_alive(process) => {
+              expected_start_time.is_none_or(|expected| {
+                // Same PID, different process: the browser died and its PID was reused.
+                process.start_time() == expected
+              })
+            }
+            _ => false,
+          };
+          if still_the_same_browser {
             alive_pids.push(browser_pid);
           } else {
             dead_candidates.push((browser_pid, proxy_id, profile_id));
@@ -2168,6 +2378,24 @@ impl ProxyManager {
             let _ = std::fs::remove_file(&worker.config_file_path);
             delete_vpn_worker_config(&worker.id);
           }
+        }
+      }
+    }
+
+    {
+      use crate::proxy_storage::process_identity_matches;
+      use crate::xray_worker_storage::{list_xray_worker_configs, unstarted_worker_is_stale};
+
+      for worker in list_xray_worker_configs() {
+        let dead = worker
+          .pid
+          .is_some_and(|pid| !process_identity_matches(pid, worker.pid_start_time));
+        if dead || unstarted_worker_is_stale(&worker) {
+          log::info!(
+            "Cleaning up orphaned Xray-core worker config: {}",
+            worker.id
+          );
+          let _ = crate::xray_worker_runner::stop_xray_worker(&worker.id).await;
         }
       }
     }
@@ -2307,6 +2535,7 @@ mod tests {
       port: 8080,
       username: Some("user".to_string()),
       password: Some("pass".to_string()),
+      vless_uri: None,
     };
 
     assert!(
@@ -2334,6 +2563,7 @@ mod tests {
       port: 0,
       username: None,
       password: None,
+      vless_uri: None,
     };
 
     assert!(
@@ -2479,7 +2709,7 @@ mod tests {
     Ok(())
   }
 
-  // Test that validates the command line arguments are constructed correctly
+  // Validate that non-secret proxy settings remain command arguments.
   #[test]
   fn test_proxy_command_construction() {
     let proxy_settings = ProxySettings {
@@ -2488,6 +2718,7 @@ mod tests {
       port: 8080,
       username: Some("user".to_string()),
       password: Some("pass".to_string()),
+      vless_uri: None,
     };
 
     // Test command arguments match expected format
@@ -2500,10 +2731,6 @@ mod tests {
       "8080",
       "--type",
       "http",
-      "--username",
-      "user",
-      "--password",
-      "pass",
     ];
 
     // This test verifies the argument structure without actually running the command
@@ -2627,61 +2854,6 @@ mod tests {
     Ok(())
   }
 
-  // Test that validates URL encoding for special characters in credentials
-  #[tokio::test]
-  async fn test_proxy_credentials_encoding() -> Result<(), Box<dyn std::error::Error>> {
-    let proxy_path = ensure_donut_proxy_binary().await?;
-
-    // Test with credentials that include special characters
-    let mut cmd = Command::new(&proxy_path);
-    cmd
-      .arg("proxy")
-      .arg("start")
-      .arg("--host")
-      .arg("test.example.com")
-      .arg("--proxy-port")
-      .arg("8080")
-      .arg("--type")
-      .arg("http")
-      .arg("--username")
-      .arg("user@domain.com")
-      .arg("--password")
-      .arg("pass word!");
-
-    let output = tokio::time::timeout(Duration::from_secs(10), cmd.output()).await??;
-
-    if output.status.success() {
-      let stdout = String::from_utf8(output.stdout)?;
-      let config: serde_json::Value = serde_json::from_str(&stdout)?;
-
-      let upstream_url = config["upstreamUrl"].as_str().unwrap();
-
-      println!("Generated upstream URL: {upstream_url}");
-
-      // Verify that special characters are properly encoded
-      assert!(upstream_url.contains("user%40domain.com"));
-      assert!(upstream_url.contains("pass%20word"));
-
-      println!("URL encoding test passed - special characters handled correctly");
-
-      // Clean up
-      let proxy_id = config["id"].as_str().unwrap();
-      let mut stop_cmd = Command::new(&proxy_path);
-      stop_cmd.arg("proxy").arg("stop").arg("--id").arg(proxy_id);
-      let _ = stop_cmd.output().await;
-    } else {
-      let stdout = String::from_utf8(output.stdout)?;
-      let stderr = String::from_utf8(output.stderr)?;
-      println!("Command failed (expected for non-existent upstream):");
-      println!("Stdout: {stdout}");
-      println!("Stderr: {stderr}");
-
-      println!("URL encoding test completed - credentials should be properly encoded");
-    }
-
-    Ok(())
-  }
-
   // ──────────────────────────────────────────────────────────────────────
   // Complex proxy process monitoring tests
   // ──────────────────────────────────────────────────────────────────────
@@ -2744,12 +2916,178 @@ mod tests {
     assert_eq!(info.profile_id.as_deref(), Some("prof_a"));
   }
 
+  /// Save a worker config for a profile in an isolated cache dir and return its id.
+  fn saved_worker_config(profile_id: Option<&str>) -> String {
+    let id = crate::proxy_storage::generate_proxy_id();
+    let config = crate::proxy_storage::ProxyConfig::new(id.clone(), "DIRECT".to_string(), Some(0))
+      .with_profile_id(profile_id.map(str::to_string));
+    crate::proxy_storage::save_proxy_config(&config).unwrap();
+    id
+  }
+
+  #[test]
+  fn browser_identity_records_the_pid_and_its_start_time() {
+    let temp = tempfile::tempdir().unwrap();
+    let _cache_guard = crate::app_dirs::set_test_cache_dir(temp.path().to_path_buf());
+    let id = saved_worker_config(Some("prof_identity"));
+
+    let pid = std::process::id();
+    assert!(persist_browser_identity(&id, pid));
+
+    let saved = crate::proxy_storage::get_proxy_config(&id).unwrap();
+    assert_eq!(saved.browser_pid, Some(pid));
+    assert_eq!(
+      saved.browser_pid_start_time,
+      crate::proxy_storage::process_start_time(pid),
+      "the start time must pin the PID to this exact process"
+    );
+    assert!(crate::proxy_storage::browser_owner_is_alive(&saved));
+  }
+
+  #[test]
+  fn browser_identity_refuses_owners_that_are_not_real_browsers() {
+    let temp = tempfile::tempdir().unwrap();
+    let _cache_guard = crate::app_dirs::set_test_cache_dir(temp.path().to_path_buf());
+    let id = saved_worker_config(Some("prof_reject"));
+
+    // 0 and launch placeholders mean "no browser reported yet". Recording one
+    // would leave a worker whose owner can never die, so it must fail loudly
+    // enough for the caller to abort the launch.
+    assert!(!persist_browser_identity(&id, 0));
+    assert!(!persist_browser_identity(
+      &id,
+      next_launch_placeholder_pid()
+    ));
+    // A PID with no process behind it can't be pinned to an identity either.
+    assert!(!persist_browser_identity(&id, u32::MAX));
+    // An unknown worker is not silently created.
+    assert!(!persist_browser_identity(
+      "proxy_1_missing",
+      std::process::id()
+    ));
+
+    let saved = crate::proxy_storage::get_proxy_config(&id).unwrap();
+    assert_eq!(saved.browser_pid, None);
+    assert_eq!(saved.browser_pid_start_time, None);
+  }
+
+  /// The regression behind the orphaned-worker reports: the status synchronizer
+  /// re-keys a profile's browser PID whenever the browser re-execs, and that
+  /// change has to reach the worker's config. When it only landed in memory the
+  /// detached worker kept watching the PREVIOUS process — and once that PID was
+  /// recycled it saw a live "browser" forever and outlived everything.
+  #[test]
+  fn remapping_a_browser_pid_rewrites_the_workers_on_disk_owner() {
+    let temp = tempfile::tempdir().unwrap();
+    let _cache_guard = crate::app_dirs::set_test_cache_dir(temp.path().to_path_buf());
+    let id = saved_worker_config(Some("prof_remap"));
+
+    let pm = ProxyManager::new();
+    pm.insert_active_proxy(100, make_proxy_info(&id, 9010, Some("prof_remap")));
+    let stale_start_time = 1;
+    let mut seeded = crate::proxy_storage::get_proxy_config(&id).unwrap();
+    seeded.browser_pid = Some(100);
+    seeded.browser_pid_start_time = Some(stale_start_time);
+    assert!(crate::proxy_storage::update_proxy_config(&seeded));
+
+    let live_pid = std::process::id();
+    pm.update_proxy_pid(100, live_pid).unwrap();
+
+    let saved = crate::proxy_storage::get_proxy_config(&id).unwrap();
+    assert_eq!(saved.browser_pid, Some(live_pid));
+    assert_ne!(saved.browser_pid_start_time, Some(stale_start_time));
+    assert!(
+      crate::proxy_storage::browser_owner_is_alive(&saved),
+      "the worker must now be watching the browser that is actually running"
+    );
+  }
+
+  /// After a GUI restart the profile→proxy map is empty, but a browser launched
+  /// by the previous GUI can still be running with its worker attached. That
+  /// worker's owner still has to be refreshable, so the lookup falls back to disk.
+  #[test]
+  fn the_worker_for_a_profile_is_found_on_disk_when_memory_is_empty() {
+    let temp = tempfile::tempdir().unwrap();
+    let _cache_guard = crate::app_dirs::set_test_cache_dir(temp.path().to_path_buf());
+    let id = saved_worker_config(Some("prof_restart"));
+    let _other = saved_worker_config(Some("prof_unrelated"));
+
+    let pm = ProxyManager::new();
+    assert_eq!(
+      pm.resolve_proxy_id_for_profile("prof_restart").as_deref(),
+      Some(id.as_str())
+    );
+    assert!(pm.resolve_proxy_id_for_profile("prof_absent").is_none());
+
+    let live_pid = std::process::id();
+    assert!(pm.set_browser_pid_for_profile("prof_restart", live_pid));
+    let saved = crate::proxy_storage::get_proxy_config(&id).unwrap();
+    assert_eq!(saved.browser_pid, Some(live_pid));
+    assert!(crate::proxy_storage::browser_owner_is_alive(&saved));
+  }
+
+  #[test]
+  fn the_in_memory_mapping_wins_over_the_on_disk_scan() {
+    let temp = tempfile::tempdir().unwrap();
+    let _cache_guard = crate::app_dirs::set_test_cache_dir(temp.path().to_path_buf());
+    let stale = saved_worker_config(Some("prof_both"));
+    let current = saved_worker_config(Some("prof_both"));
+
+    let pm = ProxyManager::new();
+    pm.profile_active_proxy_ids
+      .lock()
+      .unwrap()
+      .insert("prof_both".to_string(), current.clone());
+
+    assert_eq!(
+      pm.resolve_proxy_id_for_profile("prof_both").as_deref(),
+      Some(current.as_str())
+    );
+    assert!(pm.set_browser_pid_for_profile("prof_both", std::process::id()));
+    assert_eq!(
+      crate::proxy_storage::get_proxy_config(&stale)
+        .unwrap()
+        .browser_pid,
+      None,
+      "only the tracked worker may be re-pointed"
+    );
+  }
+
   #[test]
   fn test_update_proxy_pid_error_for_unknown_pid() {
     let pm = ProxyManager::new();
     let result = pm.update_proxy_pid(777, 888);
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("No proxy found for PID 777"));
+  }
+
+  #[test]
+  fn test_launch_placeholder_pids_unique_and_reconcile_independently() {
+    let a = next_launch_placeholder_pid();
+    let b = next_launch_placeholder_pid();
+    assert_ne!(a, b);
+    assert!(is_launch_placeholder_pid(a));
+    assert!(is_launch_placeholder_pid(b));
+    // Real PIDs (and the legacy 0 sentinel) are never in the placeholder range.
+    assert!(!is_launch_placeholder_pid(0));
+    assert!(!is_launch_placeholder_pid(1));
+    assert!(!is_launch_placeholder_pid(4_194_304)); // Linux pid_max
+    assert!(!is_launch_placeholder_pid(std::process::id()));
+
+    // Two concurrent launches with distinct placeholder keys: finishing
+    // launch A must not remap or evict launch B's in-flight entry.
+    let pm = ProxyManager::new();
+    pm.insert_active_proxy(a, make_proxy_info("px_launch_a", 9201, Some("prof_a")));
+    pm.insert_active_proxy(b, make_proxy_info("px_launch_b", 9202, Some("prof_b")));
+
+    pm.update_proxy_pid(a, 3001).unwrap();
+    assert_eq!(pm.get_active_proxy(3001).unwrap().id, "px_launch_a");
+    assert_eq!(pm.get_active_proxy(b).unwrap().id, "px_launch_b");
+
+    pm.update_proxy_pid(b, 3002).unwrap();
+    assert_eq!(pm.get_active_proxy(3002).unwrap().id, "px_launch_b");
+    assert!(pm.get_active_proxy(a).is_none());
+    assert!(pm.get_active_proxy(b).is_none());
   }
 
   #[test]
@@ -2924,8 +3262,10 @@ mod tests {
       profile_id: None,
       bypass_rules: Vec::new(),
       blocklist_file: None,
+      dns_allowlist_mode: false,
       local_protocol: None,
       browser_pid: None,
+      browser_pid_start_time: None,
     };
     let dead_config = ProxyConfig {
       id: dead_id.clone(),
@@ -2937,8 +3277,10 @@ mod tests {
       profile_id: None,
       bypass_rules: Vec::new(),
       blocklist_file: None,
+      dns_allowlist_mode: false,
       local_protocol: None,
       browser_pid: None,
+      browser_pid_start_time: None,
     };
 
     save_proxy_config(&live_config).unwrap();
@@ -2978,12 +3320,26 @@ mod tests {
       profile_id: Some("prof_abc".to_string()),
       bypass_rules: vec!["*.local".to_string(), "192.168.*".to_string()],
       blocklist_file: None,
+      dns_allowlist_mode: false,
       local_protocol: None,
       browser_pid: None,
+      browser_pid_start_time: None,
     };
 
     // Save
     save_proxy_config(&config).unwrap();
+
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::PermissionsExt;
+      let mode =
+        std::fs::metadata(crate::proxy_storage::get_storage_dir().join(format!("{id}.json")))
+          .unwrap()
+          .permissions()
+          .mode()
+          & 0o777;
+      assert_eq!(mode, 0o600, "proxy credentials must be owner-only");
+    }
 
     // Load and compare
     let loaded = get_proxy_config(&id).expect("Config should be loadable");
@@ -3142,6 +3498,7 @@ mod tests {
       port: 8080,
       username: None,
       password: None,
+      vless_uri: None,
     });
     assert_eq!(url, "http://1.2.3.4:8080");
 
@@ -3152,6 +3509,7 @@ mod tests {
       port: 1080,
       username: Some("user".to_string()),
       password: Some("p@ss".to_string()),
+      vless_uri: None,
     });
     assert_eq!(url, "socks5://user:p%40ss@proxy.example.com:1080");
 
@@ -3162,8 +3520,99 @@ mod tests {
       port: 3128,
       username: Some("justuser".to_string()),
       password: None,
+      vless_uri: None,
     });
     assert_eq!(url, "http://justuser@host.io:3128");
+  }
+
+  fn valid_vless_uri() -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    let public_key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+    format!(
+      "vless://6d6e21a1-4829-4d2b-bc7f-1b25707b61e4@127.0.0.1:443?\
+       encryption=none&flow=xtls-rprx-vision&security=reality&\
+       sni=www.example.com&fp=chrome&pbk={public_key}&\
+       sid=0123456789abcdef&spx=%2F&type=tcp&headerType=none#Local"
+    )
+  }
+
+  #[test]
+  fn vless_settings_are_validated_canonicalized_and_stripped_of_unused_credentials() {
+    let uri = valid_vless_uri();
+    let normalized = ProxyManager::normalize_proxy_settings(ProxySettings {
+      proxy_type: "VLESS".to_string(),
+      host: "ignored.invalid".to_string(),
+      port: 1,
+      username: Some("unused-user".to_string()),
+      password: Some("unused-password".to_string()),
+      vless_uri: Some(uri.clone()),
+    })
+    .unwrap();
+
+    assert_eq!(normalized.proxy_type, "vless");
+    assert_eq!(normalized.host, "127.0.0.1");
+    assert_eq!(normalized.port, 443);
+    assert!(normalized.username.is_none());
+    assert!(normalized.password.is_none());
+    assert_eq!(normalized.vless_uri.as_deref(), Some(uri.as_str()));
+
+    let invalid = uri.replace("security=reality", "security=tls");
+    let error = ProxyManager::normalize_proxy_settings(ProxySettings {
+      proxy_type: "vless".to_string(),
+      host: "127.0.0.1".to_string(),
+      port: 443,
+      username: None,
+      password: None,
+      vless_uri: Some(invalid.clone()),
+    })
+    .unwrap_err();
+    assert!(error.contains("VLESS_CONFIG_INVALID"));
+    assert!(!error.contains(&invalid));
+  }
+
+  #[test]
+  fn vless_stored_proxy_persistence_and_exports_preserve_the_canonical_uri() {
+    let temp = tempfile::tempdir().unwrap();
+    let _data_guard = crate::app_dirs::set_test_data_dir(temp.path().to_path_buf());
+    let manager = ProxyManager::new();
+    let settings = ProxyManager::normalize_proxy_settings(ProxySettings {
+      proxy_type: "vless".to_string(),
+      host: "ignored.invalid".to_string(),
+      port: 1,
+      username: Some("unused".to_string()),
+      password: Some("unused".to_string()),
+      vless_uri: Some(valid_vless_uri()),
+    })
+    .unwrap();
+    let stored = StoredProxy::new("Local Reality".to_string(), settings);
+    manager.save_proxy(&stored).unwrap();
+    manager.upsert_stored_proxy(stored.clone());
+
+    let json: ProxyExportData =
+      serde_json::from_str(&manager.export_proxies_json().unwrap()).unwrap();
+    assert_eq!(json.proxies.len(), 1);
+    assert_eq!(json.proxies[0].proxy_type, "vless");
+    assert_eq!(json.proxies[0].vless_uri, stored.proxy_settings.vless_uri);
+    assert_eq!(
+      manager.export_proxies_txt(),
+      stored.proxy_settings.vless_uri.clone().unwrap()
+    );
+
+    let reloaded = ProxyManager::new()
+      .get_stored_proxies()
+      .into_iter()
+      .find(|candidate| candidate.id == stored.id)
+      .expect("persisted VLESS proxy should reload");
+    assert_eq!(reloaded.proxy_settings, stored.proxy_settings);
+
+    let parsed = ProxyManager::parse_txt_proxies(&manager.export_proxies_txt());
+    assert!(matches!(
+      parsed.as_slice(),
+      [ProxyParseResult::Parsed(proxy)]
+        if proxy.proxy_type == "vless"
+          && proxy.vless_uri == stored.proxy_settings.vless_uri
+    ));
   }
 
   #[test]
@@ -3237,6 +3686,7 @@ mod tests {
         port: 80,
         username: None,
         password: None,
+        vless_uri: None,
       },
       sync_enabled: false,
       last_sync: None,
@@ -3298,8 +3748,10 @@ mod tests {
       profile_id: None,
       bypass_rules: Vec::new(),
       blocklist_file: None,
+      dns_allowlist_mode: false,
       local_protocol: None,
       browser_pid: None,
+      browser_pid_start_time: None,
     };
     save_proxy_config(&config).unwrap();
 
@@ -3430,6 +3882,57 @@ mod tests {
         assert_eq!(p.port, 1080);
       }
       _ => panic!("Expected Parsed"),
+    }
+
+    // Scheme in front of the colon-separated body
+    let results = ProxyManager::parse_txt_proxies("socks5://1.2.3.4:1080:admin:secret\n");
+    match &results[0] {
+      ProxyParseResult::Parsed(p) => {
+        assert_eq!(p.proxy_type, "socks5");
+        assert_eq!(p.host, "1.2.3.4");
+        assert_eq!(p.port, 1080);
+        assert_eq!(p.username.as_deref(), Some("admin"));
+        assert_eq!(p.password.as_deref(), Some("secret"));
+      }
+      _ => panic!("Expected Parsed"),
+    }
+
+    // Same, with the credentials in front
+    let results = ProxyManager::parse_txt_proxies("https://admin:secret:proxy.com:8443\n");
+    match &results[0] {
+      ProxyParseResult::Parsed(p) => {
+        assert_eq!(p.proxy_type, "https");
+        assert_eq!(p.host, "proxy.com");
+        assert_eq!(p.port, 8443);
+        assert_eq!(p.username.as_deref(), Some("admin"));
+        assert_eq!(p.password.as_deref(), Some("secret"));
+      }
+      _ => panic!("Expected Parsed"),
+    }
+
+    // An IPv6 literal splits into four parts as well, and must not be read as
+    // the colon-separated form
+    let results = ProxyManager::parse_txt_proxies("http://[::1]:8080\n");
+    match &results[0] {
+      ProxyParseResult::Parsed(p) => {
+        assert_eq!(p.host, "[::1]");
+        assert_eq!(p.port, 8080);
+        assert!(p.username.is_none());
+      }
+      _ => panic!("Expected Parsed"),
+    }
+
+    // A scheme-prefixed body that is ambiguous stays ambiguous
+    let results = ProxyManager::parse_txt_proxies("socks5://1234:5678:9012:3456\n");
+    match &results[0] {
+      ProxyParseResult::Ambiguous {
+        line,
+        possible_formats,
+      } => {
+        assert_eq!(line, "socks5://1234:5678:9012:3456");
+        assert_eq!(possible_formats.len(), 2);
+      }
+      _ => panic!("Expected Ambiguous"),
     }
 
     // Ambiguous: both positions could be ports

@@ -11,7 +11,13 @@ import {
   LuRefreshCw,
   LuUser,
 } from "react-icons/lu";
+import {
+  formatDate,
+  formatHours,
+  RemoteHoursMeter,
+} from "@/components/cookie-bot-shared";
 import { LoadingButton } from "@/components/loading-button";
+import { TeamUsagePanel } from "@/components/team-usage-panel";
 import {
   AnimatedTabs,
   AnimatedTabsContent,
@@ -24,8 +30,13 @@ import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useCloudAuth } from "@/hooks/use-cloud-auth";
+import { cookieBotScopeFor, useCookieBot } from "@/hooks/use-cookie-bot";
 import { translateBackendError } from "@/lib/backend-errors";
-import { getEntitlements } from "@/lib/entitlements";
+import {
+  canUseCookieBot,
+  getEntitlements,
+  isTeamOwner,
+} from "@/lib/entitlements";
 import { showErrorToast, showSuccessToast } from "@/lib/toast-utils";
 import { cn } from "@/lib/utils";
 import type { SyncSettings } from "@/types";
@@ -55,6 +66,25 @@ export function AccountPage({
   } = useCloudAuth();
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
+
+  // Remote hours are plan truth, so they belong here rather than only next to
+  // the controls that spend them. Until this landed, `remote-sessions/quota`
+  // had no caller anywhere and a customer's first sight of their allowance was
+  // a refused launch.
+  const remoteHoursVisible = isLoggedIn && canUseCookieBot(user);
+  const showTeamUsage = remoteHoursVisible && isTeamOwner(user);
+  const { quota, isLoading: isQuotaLoading } = useCookieBot(
+    remoteHoursVisible,
+    cookieBotScopeFor(user),
+  );
+  const [activeTab, setActiveTab] = useState("account");
+
+  // Signing out (or losing the team) removes the tab while it is the selected
+  // one, which would leave the page showing an empty panel with no trigger to
+  // click back to.
+  useEffect(() => {
+    if (!showTeamUsage && activeTab === "team-usage") setActiveTab("account");
+  }, [showTeamUsage, activeTab]);
 
   // Self-hosted server state. Loaded once when the dialog opens and persisted
   // via `save_sync_settings` so the rest of the app picks up the new URL/token
@@ -198,315 +228,385 @@ export function AccountPage({
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose} subPage={subPage}>
-      <DialogContent className="flex max-h-[calc(100vh-4rem)] max-w-2xl flex-col">
-        <div
-          className={cn(
-            "flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-4",
-            subPage && "mx-auto w-full max-w-2xl",
-          )}
-        >
-          <AnimatedTabs defaultValue="account">
-            <AnimatedTabsList>
-              <AnimatedTabsTrigger value="account">
-                {t("account.tabs.account")}
-              </AnimatedTabsTrigger>
-              <AnimatedTabsTrigger
-                value="self-hosted"
-                disabled={selfHostedDisabled}
-                title={
-                  selfHostedDisabled
-                    ? t("account.selfHosted.disabledWhileLoggedIn")
-                    : undefined
-                }
-              >
-                {t("account.tabs.selfHosted")}
-              </AnimatedTabsTrigger>
-            </AnimatedTabsList>
+      <DialogContent className="flex max-h-[calc(100vh-5rem)] max-w-3xl flex-col">
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          <div className={cn(subPage && "mx-auto w-full max-w-4xl")}>
+            <AnimatedTabs value={activeTab} onValueChange={setActiveTab}>
+              <AnimatedTabsList>
+                <AnimatedTabsTrigger value="account">
+                  {t("account.tabs.account")}
+                </AnimatedTabsTrigger>
+                {showTeamUsage && (
+                  <AnimatedTabsTrigger value="team-usage">
+                    {t("account.tabs.teamUsage")}
+                  </AnimatedTabsTrigger>
+                )}
+                <AnimatedTabsTrigger
+                  value="self-hosted"
+                  disabled={selfHostedDisabled}
+                  title={
+                    selfHostedDisabled
+                      ? t("account.selfHosted.disabledWhileLoggedIn")
+                      : undefined
+                  }
+                >
+                  {t("account.tabs.selfHosted")}
+                </AnimatedTabsTrigger>
+              </AnimatedTabsList>
 
-            <AnimatedTabsContent value="account" className="mt-4">
-              <div className="flex flex-col gap-4">
-                <div className="flex items-center gap-3">
-                  <div className="grid size-12 shrink-0 place-items-center rounded-full bg-accent text-foreground">
-                    <LuUser className="size-6" />
+              <AnimatedTabsContent value="account" className="mt-4">
+                <div className="flex flex-col gap-4">
+                  <div className="flex items-center gap-3">
+                    <div className="grid size-12 shrink-0 place-items-center rounded-full bg-accent text-accent-foreground">
+                      <LuUser className="size-6" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      {isLoggedIn && user ? (
+                        <>
+                          <h2 className="truncate text-base font-semibold">
+                            {user.email}
+                          </h2>
+                          <p className="mt-0.5 text-xs text-muted-foreground">
+                            {t("account.plan", {
+                              plan: user.plan,
+                              period: user.planPeriod ?? "—",
+                            })}
+                          </p>
+                        </>
+                      ) : (
+                        <>
+                          <h2 className="text-base font-semibold">
+                            {t("account.signedOut")}
+                          </h2>
+                          <p className="mt-0.5 text-xs text-muted-foreground">
+                            {t("account.signedOutDescription")}
+                          </p>
+                        </>
+                      )}
+                    </div>
                   </div>
-                  <div className="min-w-0 flex-1">
-                    {isLoggedIn && user ? (
-                      <>
-                        <h2 className="truncate text-base font-semibold">
-                          {user.email}
-                        </h2>
-                        <p className="mt-0.5 text-xs text-muted-foreground">
-                          {t("account.plan", {
-                            plan: user.plan,
-                            period: user.planPeriod ?? "—",
+
+                  {remoteHoursVisible && (
+                    // A headline block, not one field among six: the allowance
+                    // is the number a customer needs before a launch is
+                    // refused, which is the only way they ever saw it before.
+                    <div className="rounded-md border border-border bg-muted/40 px-3 py-2.5">
+                      <div className="flex items-baseline justify-between gap-3">
+                        <p className="text-[10px] tracking-wide text-muted-foreground uppercase">
+                          {t("cookieBot.hours.label")}
+                        </p>
+                        {formatDate(quota?.period_end) && (
+                          <p className="text-xs tabular-nums text-muted-foreground">
+                            {t("cookieBot.hours.resets", {
+                              date: formatDate(quota?.period_end),
+                            })}
+                          </p>
+                        )}
+                      </div>
+                      <p className="mt-1 text-lg leading-none font-semibold tabular-nums">
+                        {quota ? formatHours(quota.remaining_hours) : "—"}
+                        <span className="ml-1 text-sm font-normal text-muted-foreground">
+                          {t("cookieBot.hours.remainingOf", {
+                            total: quota
+                              ? formatHours(quota.granted_hours)
+                              : "—",
+                          })}
+                        </span>
+                      </p>
+                      <RemoteHoursMeter
+                        quota={quota}
+                        isLoading={isQuotaLoading}
+                        variant="inline"
+                        className="mt-2"
+                      />
+                      <div className="mt-2 flex items-baseline justify-between gap-3">
+                        <p className="text-xs tabular-nums text-muted-foreground">
+                          {t("cookieBot.hours.used", {
+                            used: quota ? formatHours(quota.used_hours) : "—",
+                            total: quota
+                              ? formatHours(quota.granted_hours)
+                              : "—",
                           })}
                         </p>
-                      </>
-                    ) : (
-                      <>
-                        <h2 className="text-base font-semibold">
-                          {t("account.signedOut")}
-                        </h2>
-                        <p className="mt-0.5 text-xs text-muted-foreground">
-                          {t("account.signedOutDescription")}
-                        </p>
-                      </>
-                    )}
-                  </div>
-                </div>
+                        {showTeamUsage && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setActiveTab("team-usage");
+                            }}
+                            className="text-xs text-muted-foreground underline underline-offset-2 transition-colors duration-100 hover:text-foreground"
+                          >
+                            {t("account.viewTeamUsage")}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )}
 
-                {isLoggedIn && user && (
-                  <div className="grid grid-cols-2 gap-2 text-xs">
-                    <div className="rounded-md border border-border bg-muted/40 px-3 py-2">
-                      <p className="text-[10px] tracking-wide text-muted-foreground uppercase">
-                        {t("account.fields.plan")}
-                      </p>
-                      <p className="mt-0.5 font-medium uppercase">
-                        {user.plan}
-                      </p>
-                    </div>
-                    <div className="rounded-md border border-border bg-muted/40 px-3 py-2">
-                      <p className="text-[10px] tracking-wide text-muted-foreground uppercase">
-                        {t("account.fields.status")}
-                      </p>
-                      <p className="mt-0.5">{user.subscriptionStatus ?? "—"}</p>
-                    </div>
-                    {user.teamRole && (
+                  {isLoggedIn && user && (
+                    <div className="grid grid-cols-2 gap-2 text-xs">
                       <div className="rounded-md border border-border bg-muted/40 px-3 py-2">
                         <p className="text-[10px] tracking-wide text-muted-foreground uppercase">
-                          {t("account.fields.teamRole")}
+                          {t("account.fields.plan")}
                         </p>
-                        <p className="mt-0.5">{user.teamRole}</p>
-                      </div>
-                    )}
-                    {user.planPeriod && (
-                      <div className="rounded-md border border-border bg-muted/40 px-3 py-2">
-                        <p className="text-[10px] tracking-wide text-muted-foreground uppercase">
-                          {t("account.fields.period")}
+                        <p className="mt-0.5 font-medium uppercase">
+                          {user.plan}
                         </p>
-                        <p className="mt-0.5">{user.planPeriod}</p>
                       </div>
-                    )}
-                    {typeof user.deviceOrdinal === "number" && (
                       <div className="rounded-md border border-border bg-muted/40 px-3 py-2">
                         <p className="text-[10px] tracking-wide text-muted-foreground uppercase">
-                          {t("account.fields.device")}
+                          {t("account.fields.status")}
                         </p>
                         <p className="mt-0.5">
-                          {t("account.deviceOrdinal", {
-                            ordinal: user.deviceOrdinal,
-                            count: user.deviceCount ?? user.deviceOrdinal,
-                          })}
+                          {user.subscriptionStatus ?? "—"}
                         </p>
                       </div>
+                      {user.teamRole && (
+                        <div className="rounded-md border border-border bg-muted/40 px-3 py-2">
+                          <p className="text-[10px] tracking-wide text-muted-foreground uppercase">
+                            {t("account.fields.teamRole")}
+                          </p>
+                          <p className="mt-0.5">{user.teamRole}</p>
+                        </div>
+                      )}
+                      {user.planPeriod && (
+                        <div className="rounded-md border border-border bg-muted/40 px-3 py-2">
+                          <p className="text-[10px] tracking-wide text-muted-foreground uppercase">
+                            {t("account.fields.period")}
+                          </p>
+                          <p className="mt-0.5">{user.planPeriod}</p>
+                        </div>
+                      )}
+                      {typeof user.deviceOrdinal === "number" && (
+                        <div className="rounded-md border border-border bg-muted/40 px-3 py-2">
+                          <p className="text-[10px] tracking-wide text-muted-foreground uppercase">
+                            {t("account.fields.device")}
+                          </p>
+                          <p className="mt-0.5">
+                            {t("account.deviceOrdinal", {
+                              ordinal: user.deviceOrdinal,
+                              count: user.deviceCount ?? user.deviceOrdinal,
+                            })}
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {isLoggedIn &&
+                    user &&
+                    getEntitlements(user).browserAutomation &&
+                    user.isPrimaryDevice === false && (
+                      <p className="text-xs text-warning-text">
+                        {t("account.automationPrimaryOnly")}
+                      </p>
                     )}
-                  </div>
-                )}
+                  {isLoggedIn &&
+                    user &&
+                    getEntitlements(user).browserAutomation &&
+                    user.isPrimaryDevice === true &&
+                    (user.deviceCount ?? 1) > 1 && (
+                      <p className="text-xs text-success-text">
+                        {t("account.automationActiveHere")}
+                      </p>
+                    )}
 
-                {isLoggedIn &&
-                  user &&
-                  getEntitlements(user).browserAutomation &&
-                  user.isPrimaryDevice === false && (
-                    <p className="text-xs text-warning">
-                      {t("account.automationPrimaryOnly")}
-                    </p>
-                  )}
-                {isLoggedIn &&
-                  user &&
-                  getEntitlements(user).browserAutomation &&
-                  user.isPrimaryDevice === true &&
-                  (user.deviceCount ?? 1) > 1 && (
-                    <p className="text-xs text-success">
-                      {t("account.automationActiveHere")}
-                    </p>
-                  )}
-
-                <div className="mt-2 flex flex-wrap gap-2">
-                  {isLoggedIn ? (
-                    <>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {isLoggedIn ? (
+                      <>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => {
+                            void handleRefresh();
+                          }}
+                          disabled={isRefreshing}
+                          className="h-8 gap-1.5 text-xs"
+                        >
+                          <LuRefreshCw className="size-3" />
+                          {t("account.refresh")}
+                        </Button>
+                        <LoadingButton
+                          size="sm"
+                          variant="destructive"
+                          isLoading={isLoggingOut}
+                          disabled={isRefreshing}
+                          onClick={() => {
+                            void handleLogout();
+                          }}
+                          className="h-8 gap-1.5 text-xs"
+                        >
+                          <LuLogOut className="size-3" />
+                          {t("account.logout")}
+                        </LoadingButton>
+                      </>
+                    ) : (
                       <Button
                         size="sm"
-                        variant="outline"
-                        onClick={() => {
-                          void handleRefresh();
-                        }}
-                        disabled={isRefreshing}
+                        onClick={onOpenSignIn}
                         className="h-8 gap-1.5 text-xs"
                       >
-                        <LuRefreshCw className="size-3" />
-                        {t("account.refresh")}
+                        <LuCloud className="size-3" />
+                        {t("account.signIn")}
                       </Button>
-                      <LoadingButton
-                        size="sm"
-                        variant="destructive"
-                        isLoading={isLoggingOut}
-                        disabled={isRefreshing}
-                        onClick={() => {
-                          void handleLogout();
-                        }}
-                        className="h-8 gap-1.5 text-xs"
-                      >
-                        <LuLogOut className="size-3" />
-                        {t("account.logout")}
-                      </LoadingButton>
-                    </>
-                  ) : (
-                    <Button
-                      size="sm"
-                      onClick={onOpenSignIn}
-                      className="h-8 gap-1.5 text-xs"
-                    >
-                      <LuCloud className="size-3" />
-                      {t("account.signIn")}
-                    </Button>
-                  )}
+                    )}
+                  </div>
                 </div>
-              </div>
-            </AnimatedTabsContent>
+              </AnimatedTabsContent>
 
-            <AnimatedTabsContent value="self-hosted" className="mt-4">
-              {selfHostedDisabled ? (
-                // Defensive: the tab trigger is disabled while the user is
-                // logged in, so this branch shouldn't be reachable via UI —
-                // but if state flips mid-render (e.g. a cloud login finishes
-                // while the tab is open), show the explanation instead of
-                // a silent empty card.
-                <p className="text-sm text-muted-foreground">
-                  {t("account.selfHosted.disabledWhileLoggedIn")}
-                </p>
-              ) : (
-                <div className="flex flex-col gap-4">
-                  <div>
-                    <p className="text-sm font-medium">
-                      {t("account.selfHosted.title")}
-                    </p>
-                    <p className="mt-0.5 text-xs text-muted-foreground">
-                      {t("account.selfHosted.description")}
-                    </p>
-                  </div>
+              {showTeamUsage && (
+                <AnimatedTabsContent value="team-usage" className="mt-4">
+                  <TeamUsagePanel quota={quota} />
+                </AnimatedTabsContent>
+              )}
 
-                  <div className="space-y-1.5">
-                    <Label htmlFor="self-hosted-server-url" className="text-xs">
-                      {t("sync.serverUrl")}
-                    </Label>
-                    <Input
-                      id="self-hosted-server-url"
-                      type="url"
-                      placeholder={t("sync.serverUrlPlaceholder")}
-                      value={serverUrl}
-                      onChange={(e) => {
-                        setServerUrl(e.target.value);
-                        setConnectionStatus("unknown");
-                      }}
-                      autoComplete="off"
-                      spellCheck={false}
-                    />
-                  </div>
+              <AnimatedTabsContent value="self-hosted" className="mt-4">
+                {selfHostedDisabled ? (
+                  // Defensive: the tab trigger is disabled while the user is
+                  // logged in, so this branch shouldn't be reachable via UI —
+                  // but if state flips mid-render (e.g. a cloud login finishes
+                  // while the tab is open), show the explanation instead of
+                  // a silent empty card.
+                  <p className="text-sm text-muted-foreground">
+                    {t("account.selfHosted.disabledWhileLoggedIn")}
+                  </p>
+                ) : (
+                  <div className="flex flex-col gap-4">
+                    <div>
+                      <p className="text-sm font-medium">
+                        {t("account.selfHosted.title")}
+                      </p>
+                      <p className="mt-0.5 text-xs text-muted-foreground">
+                        {t("account.selfHosted.description")}
+                      </p>
+                    </div>
 
-                  <div className="space-y-1.5">
-                    <Label htmlFor="self-hosted-token" className="text-xs">
-                      {t("sync.token")}
-                    </Label>
-                    <div className="relative">
+                    <div className="space-y-1.5">
+                      <Label
+                        htmlFor="self-hosted-server-url"
+                        className="text-xs"
+                      >
+                        {t("sync.serverUrl")}
+                      </Label>
                       <Input
-                        id="self-hosted-token"
-                        type={showToken ? "text" : "password"}
-                        placeholder={t("sync.tokenPlaceholder")}
-                        value={token}
+                        id="self-hosted-server-url"
+                        type="url"
+                        placeholder={t("sync.serverUrlPlaceholder")}
+                        value={serverUrl}
                         onChange={(e) => {
-                          setToken(e.target.value);
+                          setServerUrl(e.target.value);
                           setConnectionStatus("unknown");
                         }}
                         autoComplete="off"
                         spellCheck={false}
-                        className="pr-9"
                       />
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setShowToken((v) => !v);
-                        }}
-                        aria-label={
-                          showToken
-                            ? t("common.aria.hideToken")
-                            : t("common.aria.showToken")
-                        }
-                        className="absolute top-1/2 right-2 -translate-y-1/2 p-1 text-muted-foreground hover:text-foreground"
-                      >
-                        {showToken ? (
-                          <LuEyeOff className="size-3.5" />
-                        ) : (
-                          <LuEye className="size-3.5" />
-                        )}
-                      </button>
                     </div>
-                  </div>
 
-                  <div className="flex items-center gap-2 text-xs">
-                    <span className="text-muted-foreground">
-                      {t("account.selfHosted.connectionStatus")}
-                    </span>
-                    {connectionStatus === "connected" && (
-                      <Badge
-                        variant="default"
-                        className="bg-success text-success-foreground"
-                      >
-                        {t("sync.status.connected")}
-                      </Badge>
-                    )}
-                    {connectionStatus === "error" && (
-                      <Badge variant="destructive">
-                        {t("sync.status.error")}
-                      </Badge>
-                    )}
-                    {connectionStatus === "testing" && (
-                      <Badge variant="secondary">
-                        {t("sync.status.syncing")}
-                      </Badge>
-                    )}
-                    {connectionStatus === "unknown" && (
-                      <Badge variant="secondary">
-                        {t("account.selfHosted.statusUnknown")}
-                      </Badge>
-                    )}
-                  </div>
+                    <div className="space-y-1.5">
+                      <Label htmlFor="self-hosted-token" className="text-xs">
+                        {t("sync.token")}
+                      </Label>
+                      <div className="relative">
+                        <Input
+                          id="self-hosted-token"
+                          type={showToken ? "text" : "password"}
+                          placeholder={t("sync.tokenPlaceholder")}
+                          value={token}
+                          onChange={(e) => {
+                            setToken(e.target.value);
+                            setConnectionStatus("unknown");
+                          }}
+                          autoComplete="off"
+                          spellCheck={false}
+                          className="pr-9"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowToken((v) => !v);
+                          }}
+                          aria-label={
+                            showToken
+                              ? t("common.aria.hideToken")
+                              : t("common.aria.showToken")
+                          }
+                          className="absolute top-1/2 right-2 -translate-y-1/2 p-1 text-muted-foreground hover:text-foreground"
+                        >
+                          {showToken ? (
+                            <LuEyeOff className="size-3.5" />
+                          ) : (
+                            <LuEye className="size-3.5" />
+                          )}
+                        </button>
+                      </div>
+                    </div>
 
-                  <div className="flex flex-wrap gap-2">
-                    <LoadingButton
-                      size="sm"
-                      variant="outline"
-                      isLoading={isTestingConnection}
-                      disabled={!serverUrl || isSavingSelfHosted}
-                      onClick={() => void handleTestConnection()}
-                      className="h-8 text-xs"
-                    >
-                      {t("account.selfHosted.testConnection")}
-                    </LoadingButton>
-                    <LoadingButton
-                      size="sm"
-                      isLoading={isSavingSelfHosted}
-                      disabled={!serverUrl || !token || isTestingConnection}
-                      onClick={() => void handleSaveSelfHosted()}
-                      className="h-8 text-xs"
-                    >
-                      {t("common.buttons.save")}
-                    </LoadingButton>
-                    {hasConfig && (
-                      <Button
+                    <div className="flex items-center gap-2 text-xs">
+                      <span className="text-muted-foreground">
+                        {t("account.selfHosted.connectionStatus")}
+                      </span>
+                      {connectionStatus === "connected" && (
+                        <Badge
+                          variant="default"
+                          className="bg-success text-success-foreground"
+                        >
+                          {t("sync.status.connected")}
+                        </Badge>
+                      )}
+                      {connectionStatus === "error" && (
+                        <Badge variant="destructive">
+                          {t("sync.status.error")}
+                        </Badge>
+                      )}
+                      {connectionStatus === "testing" && (
+                        <Badge variant="secondary">
+                          {t("sync.status.syncing")}
+                        </Badge>
+                      )}
+                      {connectionStatus === "unknown" && (
+                        <Badge variant="secondary">
+                          {t("account.selfHosted.statusUnknown")}
+                        </Badge>
+                      )}
+                    </div>
+
+                    <div className="flex flex-wrap gap-2">
+                      <LoadingButton
                         size="sm"
-                        variant="destructive"
-                        disabled={isSavingSelfHosted || isTestingConnection}
-                        onClick={() => void handleDisconnectSelfHosted()}
+                        variant="outline"
+                        isLoading={isTestingConnection}
+                        disabled={!serverUrl || isSavingSelfHosted}
+                        onClick={() => void handleTestConnection()}
                         className="h-8 text-xs"
                       >
-                        {t("account.selfHosted.disconnect")}
-                      </Button>
-                    )}
+                        {t("account.selfHosted.testConnection")}
+                      </LoadingButton>
+                      <LoadingButton
+                        size="sm"
+                        isLoading={isSavingSelfHosted}
+                        disabled={!serverUrl || !token || isTestingConnection}
+                        onClick={() => void handleSaveSelfHosted()}
+                        className="h-8 text-xs"
+                      >
+                        {t("common.buttons.save")}
+                      </LoadingButton>
+                      {hasConfig && (
+                        <Button
+                          size="sm"
+                          variant="destructive"
+                          disabled={isSavingSelfHosted || isTestingConnection}
+                          onClick={() => void handleDisconnectSelfHosted()}
+                          className="h-8 text-xs"
+                        >
+                          {t("account.selfHosted.disconnect")}
+                        </Button>
+                      )}
+                    </div>
                   </div>
-                </div>
-              )}
-            </AnimatedTabsContent>
-          </AnimatedTabs>
+                )}
+              </AnimatedTabsContent>
+            </AnimatedTabs>
+          </div>
         </div>
       </DialogContent>
     </Dialog>
