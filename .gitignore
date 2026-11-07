@@ -71,3 +71,6 @@ HANDOFF.md
 .claude/stop-failure-events.jsonl
 .claude/quota-blocked.json
 session-recover.yaml
+
+# donut.bat runtime pid files
+.donut-*.pid

@@ -1,4 +1,4 @@
-[files]
+﻿[files]
 extend-exclude = [
     "src-tauri/src/territory_info.xml",
     "src/i18n/locales/*.json",
@@ -7,6 +7,8 @@ extend-exclude = [
     # Auto-generated from commit subjects by release.yml; typos here originate
     # in commit messages, which are immutable, so don't spell-check it.
     "CHANGELOG.md",
+    # Windows batch script encoded as GBK for the zh-CN console, not UTF-8.
+    "donut.bat",
 ]
 
 [default.extend-words]

@@ -170,8 +170,11 @@ export function WelcomeDialog({
 
   // Track the required browser's download + extraction the whole time the
   // dialog is open, so progress is live by the time the user reaches setup.
-  const setup = useBrowserSetup("wayfern", isOpen);
-  const browserName = getBrowserDisplayName("wayfern");
+  // This must mirror the browser `ensure_active_browsers_downloaded` installs
+  // (the default backend), otherwise onboarding waits on a download that
+  // nothing ever starts.
+  const setup = useBrowserSetup("fingerprint_chromium", isOpen);
+  const browserName = getBrowserDisplayName("fingerprint_chromium");
 
   const requestPermissions = useCallback(async () => {
     setRequesting(true);

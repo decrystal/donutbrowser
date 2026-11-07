@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import parseSpdxExpression from "spdx-expression-parse";
@@ -151,17 +151,49 @@ export function prepareLicenseInventory(entries) {
   });
 }
 
-function commandOutput(command, args) {
-  // pnpm ships only a `pnpm.cmd` batch shim on Windows, and Node refuses to
-  // spawn batch files without a shell (CVE-2024-27980), so `execFileSync`
-  // fails with EINVAL there. Every argument below is a literal from this file,
-  // so routing that one call through cmd.exe interpolates nothing.
-  const needsShell = process.platform === "win32" && command === "pnpm";
-  return execFileSync(needsShell ? "pnpm.cmd" : command, args, {
+const PNPM_ENTRY_PATTERN = /[\\/]pnpm\.(?:c|m)?js$/i;
+
+function pnpmCommandOutput(args) {
+  // When this script runs under pnpm (predev/prebuild/licenses:generate always
+  // invoke it that way), `npm_execpath` is the entry script of the very pnpm
+  // that launched us; rerunning it via the current node is PATH-independent and
+  // keeps the same pnpm version.
+  const pnpmEntry = process.env.npm_execpath;
+  if (
+    pnpmEntry &&
+    PNPM_ENTRY_PATTERN.test(pnpmEntry) &&
+    existsSync(pnpmEntry)
+  ) {
+    return execFileSync(process.execPath, [pnpmEntry, ...args], {
+      cwd: PROJECT_ROOT,
+      encoding: "utf8",
+      maxBuffer: MAX_COMMAND_OUTPUT,
+      windowsHide: true,
+    });
+  }
+  // On Windows, pnpm ships either as a `pnpm.cmd` batch shim (npm/corepack) or
+  // a native `pnpm.exe` (winget), so hardcoding one name breaks the other
+  // install path. Node refuses to spawn batch files without a shell
+  // (CVE-2024-27980), which is why this one call goes through cmd.exe, where
+  // PATHEXT resolves whichever pnpm exists. Every argument is a literal from
+  // this file, so nothing gets interpolated by the shell.
+  return execFileSync("pnpm", args, {
     cwd: PROJECT_ROOT,
     encoding: "utf8",
     maxBuffer: MAX_COMMAND_OUTPUT,
-    shell: needsShell,
+    shell: process.platform === "win32",
+    windowsHide: true,
+  });
+}
+
+function commandOutput(command, args) {
+  if (command === "pnpm") {
+    return pnpmCommandOutput(args);
+  }
+  return execFileSync(command, args, {
+    cwd: PROJECT_ROOT,
+    encoding: "utf8",
+    maxBuffer: MAX_COMMAND_OUTPUT,
     windowsHide: true,
   });
 }
