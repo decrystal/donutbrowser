@@ -29,8 +29,22 @@ struct EphemeralEntry {
   backing: EphemeralBacking,
 }
 
-lazy_static::lazy_static! {
-  static ref EPHEMERAL_DIRS: Mutex<HashMap<String, EphemeralEntry>> = Mutex::new(HashMap::new());
+static EPHEMERAL_DIRS: std::sync::LazyLock<Mutex<HashMap<String, EphemeralEntry>>> =
+  std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Recoveries still running. Recovery can mount a RAM disk and erase residue,
+/// so it runs off the startup thread; lookups wait for it, because a profile
+/// launched before its unsealed copy is mapped would start from the sealed one.
+static RECOVERIES_PENDING: (Mutex<usize>, std::sync::Condvar) =
+  (Mutex::new(0), std::sync::Condvar::new());
+
+const RECOVERY_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn wait_for_recovery() {
+  let (pending, done) = &RECOVERIES_PENDING;
+  if let Ok(guard) = pending.lock() {
+    let _ = done.wait_timeout_while(guard, RECOVERY_WAIT_LIMIT, |count| *count > 0);
+  }
 }
 
 /// Test-only redirect for the ephemeral base.
@@ -53,13 +67,40 @@ fn ephemeral_base_override() -> Option<PathBuf> {
   None
 }
 
+#[cfg(target_os = "linux")]
+const LINUX_EPHEMERAL_BASE: &str = "/dev/shm/donut-ephemeral";
+#[cfg(target_os = "macos")]
+const MACOS_RAM_DISK: &str = "/Volumes/DonutEphemeral";
+
+fn disk_fallback_base() -> PathBuf {
+  std::env::temp_dir().join("donut-ephemeral")
+}
+
+/// Whether an earlier run left a base that may hold directories to recover.
+/// Unlike `get_ephemeral_base_dir`, this never creates one.
+fn earlier_base_exists() -> bool {
+  if let Some(base) = ephemeral_base_override() {
+    return base.exists();
+  }
+  #[cfg(target_os = "linux")]
+  let ram = Path::new(LINUX_EPHEMERAL_BASE).exists();
+  #[cfg(target_os = "macos")]
+  let ram = Path::new(MACOS_RAM_DISK).is_dir();
+  #[cfg(target_os = "windows")]
+  let ram = existing_windows_ramdisk().is_some() || crate::ramfs::live_volume().is_some();
+  #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+  let ram = false;
+  ram || disk_fallback_base().exists()
+}
+
 /// Get or create the base directory for ephemeral profiles, and report whether
 /// it is actually RAM-backed.
 ///
-/// Linux: /dev/shm (always tmpfs). macOS: RAM disk via hdiutil. Windows: imdisk
-/// RAM disk, which is a third-party driver this app does not ship, so on most
-/// Windows machines the disk fallback is the normal path rather than an edge
-/// case. Callers must treat `Disk` as a downgrade and erase accordingly.
+/// Linux: /dev/shm (always tmpfs). macOS: RAM disk via hdiutil. Windows: a RAM
+/// disk the person made, else the WinFsp volume (`crate::ramfs`). WinFsp is a
+/// driver this app does not ship, so on many Windows machines the disk
+/// fallback is the normal path rather than an edge case. Callers must treat
+/// `Disk` as a downgrade and erase accordingly.
 fn get_ephemeral_base_dir() -> Result<(PathBuf, EphemeralBacking), String> {
   if let Some(base) = ephemeral_base_override() {
     std::fs::create_dir_all(&base)
@@ -69,7 +110,7 @@ fn get_ephemeral_base_dir() -> Result<(PathBuf, EphemeralBacking), String> {
 
   #[cfg(target_os = "linux")]
   {
-    let base = PathBuf::from("/dev/shm/donut-ephemeral");
+    let base = PathBuf::from(LINUX_EPHEMERAL_BASE);
     std::fs::create_dir_all(&base)
       .map_err(|e| format!("Failed to create ephemeral base in /dev/shm: {e}"))?;
     Ok((base, EphemeralBacking::Ram))
@@ -100,11 +141,11 @@ fn get_ephemeral_base_dir() -> Result<(PathBuf, EphemeralBacking), String> {
     // makes and the previous "may use disk" wording was logged unconditionally
     // right before disk was used, so it read as speculative when it was
     // certain. The cause used to be discarded entirely.
-    let base = std::env::temp_dir().join("donut-ephemeral");
+    let base = disk_fallback_base();
     std::fs::create_dir_all(&base)
       .map_err(|e| format!("Failed to create ephemeral base dir: {e}"))?;
     log::error!(
-      "No RAM disk available ({ramdisk_error}); ephemeral profiles are being written to disk at {} and will be securely erased on teardown instead",
+      "No RAM disk; ephemeral profiles go to disk and are erased on teardown path={} err=\"{ramdisk_error}\"",
       base.display()
     );
     Ok((base, EphemeralBacking::Disk))
@@ -113,7 +154,7 @@ fn get_ephemeral_base_dir() -> Result<(PathBuf, EphemeralBacking), String> {
 
 #[cfg(target_os = "macos")]
 fn get_or_create_macos_ramdisk() -> Result<PathBuf, String> {
-  let mount_point = PathBuf::from("/Volumes/DonutEphemeral");
+  let mount_point = PathBuf::from(MACOS_RAM_DISK);
 
   // Reuse existing RAM disk from a previous session
   if mount_point.exists() && mount_point.is_dir() {
@@ -151,56 +192,30 @@ fn get_or_create_macos_ramdisk() -> Result<PathBuf, String> {
     ));
   }
 
-  log::info!("Created macOS RAM disk at {}", mount_point.display());
+  log::info!("RAM disk mounted path={MACOS_RAM_DISK} device={dev} size_mb=256");
   Ok(mount_point)
 }
 
 #[cfg(target_os = "windows")]
+fn existing_windows_ramdisk() -> Option<PathBuf> {
+  ['R', 'Q', 'P', 'O']
+    .into_iter()
+    .map(|letter| PathBuf::from(format!("{}:\\DonutEphemeral", letter)))
+    .find(|base| base.is_dir())
+}
+
+/// A RAM disk the person made is used as it is. Creating one needs admin
+/// rights, so Donut does not try; it mounts its WinFsp volume instead.
+#[cfg(target_os = "windows")]
 fn get_or_create_windows_ramdisk() -> Result<PathBuf, String> {
-  // Check if a previous RAM disk with our directory already exists
-  for letter in ['R', 'Q', 'P', 'O'] {
-    let base = PathBuf::from(format!("{}:\\DonutEphemeral", letter));
-    if base.exists() && base.is_dir() {
-      return Ok(base);
-    }
+  if let Some(base) = existing_windows_ramdisk() {
+    return Ok(base);
   }
-
-  // Try to create a RAM disk using imdisk (open-source RAM disk driver)
-  for letter in ['R', 'Q', 'P', 'O'] {
-    let drive = format!("{}:", letter);
-    if PathBuf::from(format!("{}\\", drive)).exists() {
-      continue;
-    }
-
-    let output = std::process::Command::new("imdisk")
-      .args(["-a", "-s", "256M", "-m", &drive, "-p", "/fs:ntfs /q /y"])
-      .output();
-
-    match output {
-      Ok(out) if out.status.success() => {
-        let base = PathBuf::from(format!("{}\\DonutEphemeral", drive));
-        std::fs::create_dir_all(&base)
-          .map_err(|e| format!("Failed to create dir on RAM disk: {e}"))?;
-        log::info!("Created Windows RAM disk at {}", base.display());
-        return Ok(base);
-      }
-      Ok(out) => {
-        log::debug!(
-          "imdisk failed for drive {}: {}",
-          drive,
-          String::from_utf8_lossy(&out.stderr)
-        );
-      }
-      Err(e) => {
-        return Err(format!("imdisk not available: {e}"));
-      }
-    }
-  }
-
-  Err("Could not create Windows RAM disk".to_string())
+  crate::ramfs::ensure_volume()
 }
 
 pub fn create_ephemeral_dir(profile_id: &str) -> Result<PathBuf, String> {
+  wait_for_recovery();
   let (base, backing) = get_ephemeral_base_dir()?;
   let dir_path = base.join(profile_id);
 
@@ -221,19 +236,18 @@ pub fn create_ephemeral_dir(profile_id: &str) -> Result<PathBuf, String> {
   // anything, so a log could not be used to tell a RAM-backed session from a
   // disk-backed one after the fact.
   log::info!(
-    "Created {} ephemeral dir for profile {}: {}",
+    "Ephemeral dir created profile={profile_id} backing={}",
     match backing {
-      EphemeralBacking::Ram => "RAM-backed",
-      EphemeralBacking::Disk => "DISK-backed (not in memory)",
-    },
-    profile_id,
-    dir_path.display()
+      EphemeralBacking::Ram => "ram",
+      EphemeralBacking::Disk => "disk",
+    }
   );
 
   Ok(dir_path)
 }
 
 pub fn get_ephemeral_dir(profile_id: &str) -> Option<PathBuf> {
+  wait_for_recovery();
   Some(EPHEMERAL_DIRS.lock().ok()?.get(profile_id)?.path.clone())
 }
 
@@ -246,10 +260,11 @@ pub fn get_ephemeral_dir(profile_id: &str) -> Option<PathBuf> {
 /// browser, discarded the only handle to the directory and guaranteed nothing
 /// would ever retry it.
 pub fn remove_ephemeral_dir(profile_id: &str) -> bool {
+  wait_for_recovery();
   let entry = match EPHEMERAL_DIRS.lock() {
     Ok(map) => map.get(profile_id).map(|e| (e.path.clone(), e.backing)),
     Err(e) => {
-      log::error!("Failed to lock ephemeral dirs while removing {profile_id}: {e}");
+      log::error!("Ephemeral dir removal failed profile={profile_id} err=\"lock: {e}\"");
       return false;
     }
   };
@@ -273,16 +288,9 @@ pub fn remove_ephemeral_dir(profile_id: &str) -> bool {
         map.remove(profile_id);
       }
       log::info!(
-        "Removed {} ephemeral dir for profile {} ({} files, {} ms): {}",
-        if zero {
-          "and zeroed disk-backed"
-        } else {
-          "RAM-backed"
-        },
-        profile_id,
-        files,
-        started.elapsed().as_millis(),
-        dir_path.display()
+        "Ephemeral dir removed profile={profile_id} backing={} files={files} elapsed_ms={}",
+        if zero { "disk_zeroed" } else { "ram" },
+        started.elapsed().as_millis()
       );
       true
     }
@@ -291,7 +299,7 @@ pub fn remove_ephemeral_dir(profile_id: &str) -> bool {
       // knowingly still on the machine. The mapping is kept so a later sweep
       // can try again.
       log::error!(
-        "Failed to remove ephemeral dir {} for profile {profile_id}: {e}. Profile data is still on disk.",
+        "Ephemeral dir removal failed; data left behind profile={profile_id} path={} err=\"{e}\"",
         dir_path.display()
       );
       false
@@ -302,13 +310,57 @@ pub fn remove_ephemeral_dir(profile_id: &str) -> bool {
 /// Recover ephemeral dir mappings on startup by scanning the RAM-backed base dir.
 /// Dir names are profile UUIDs, so we re-populate the in-memory HashMap.
 /// Also cleans up old disk-based dirs from previous versions.
+///
+/// Returns at once: the work runs on its own thread, and every lookup in this
+/// module waits until it is done.
 pub fn recover_ephemeral_dirs() {
+  /// Ends the wait even when recovery panics.
+  struct Pending;
+  impl Drop for Pending {
+    fn drop(&mut self) {
+      let (pending, done) = &RECOVERIES_PENDING;
+      if let Ok(mut count) = pending.lock() {
+        *count = count.saturating_sub(1);
+      }
+      done.notify_all();
+    }
+  }
+
+  if let Ok(mut count) = RECOVERIES_PENDING.0.lock() {
+    *count += 1;
+  }
+  let guard = Pending;
+  let spawned = std::thread::Builder::new()
+    .name("ephemeral-recovery".into())
+    .spawn(move || {
+      let _guard = guard;
+      let started = std::time::Instant::now();
+      recover_ephemeral_dirs_now();
+      log::debug!(
+        "Ephemeral dir recovery done elapsed_ms={}",
+        started.elapsed().as_millis()
+      );
+    });
+  if let Err(e) = spawned {
+    log::warn!("Ephemeral dir recovery thread failed to start err=\"{e}\"");
+    recover_ephemeral_dirs_now();
+  }
+}
+
+fn recover_ephemeral_dirs_now() {
   cleanup_legacy_dirs();
+
+  // Resolving the base creates it, and on macOS that mounts a RAM disk that
+  // stays until the Mac restarts. Most installs never use an ephemeral or
+  // password-protected profile, so there is usually nothing to look for.
+  if !earlier_base_exists() {
+    return;
+  }
 
   let (base, backing) = match get_ephemeral_base_dir() {
     Ok(base) => base,
     Err(e) => {
-      log::warn!("Cannot recover ephemeral dirs: {e}");
+      log::warn!("Ephemeral dir recovery failed err=\"{e}\"");
       return;
     }
   };
@@ -333,16 +385,15 @@ pub fn recover_ephemeral_dirs() {
     if entry.path().is_dir() {
       if let Some(name) = entry.file_name().to_str() {
         if uuid::Uuid::parse_str(name).is_ok() {
-          dirs.insert(
-            name.to_string(),
-            EphemeralEntry {
-              path: entry.path(),
-              // Judge a recovered directory by the base it was found under, not
-              // by what some earlier run happened to resolve.
-              backing,
-            },
-          );
-          log::info!("Recovered ephemeral dir for profile {}", name);
+          // A disk-backed copy kept by the sweep above is the one with
+          // unsealed changes, so it is not displaced.
+          dirs.entry(name.to_string()).or_insert(EphemeralEntry {
+            path: entry.path(),
+            // Judge a recovered directory by the base it was found under, not
+            // by what some earlier run happened to resolve.
+            backing,
+          });
+          log::info!("Ephemeral dir recovered profile={name}");
         }
       }
     }
@@ -353,22 +404,147 @@ pub fn recover_ephemeral_dirs() {
 /// fallback, unless that fallback is the base being used right now (in which
 /// case `recover_ephemeral_dirs` is about to adopt them instead).
 fn sweep_disk_fallback_residue(current_base: &Path) {
-  let fallback = std::env::temp_dir().join("donut-ephemeral");
+  let fallback = disk_fallback_base();
   if !fallback.exists() || fallback == current_base {
+    return;
+  }
+
+  // A decrypted copy that still has its baseline holds changes its sealed
+  // profile does not have yet. It stays where it is and is mapped, so the next
+  // launch of that profile seals it, and nothing here is erased until then.
+  let mut unsealed = 0usize;
+  if let (Ok(entries), Ok(mut dirs)) = (std::fs::read_dir(&fallback), EPHEMERAL_DIRS.lock()) {
+    for entry in entries.flatten() {
+      let path = entry.path();
+      let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+        continue;
+      };
+      if uuid::Uuid::parse_str(&name).is_err()
+        || !path
+          .join(crate::profile::encryption::BASELINE_FILE_NAME)
+          .is_file()
+      {
+        continue;
+      }
+      dirs.entry(name).or_insert(EphemeralEntry {
+        path,
+        backing: EphemeralBacking::Disk,
+      });
+      unsealed += 1;
+    }
+  }
+  if unsealed > 0 {
+    log::warn!(
+      "Disk-backed decrypted copies kept until sealed count={unsealed} path={}",
+      fallback.display()
+    );
     return;
   }
 
   match crate::fs_secure::secure_remove_dir_all(&fallback, true) {
     Ok(files) if files > 0 => log::info!(
-      "Securely erased {files} file(s) of disk-backed ephemeral residue at {}",
+      "Erased disk-backed ephemeral residue files={files} path={}",
       fallback.display()
     ),
     Ok(_) => {}
     Err(e) => log::error!(
-      "Failed to erase disk-backed ephemeral residue at {}: {e}",
+      "Erasing disk-backed ephemeral residue failed path={} err=\"{e}\"",
       fallback.display()
     ),
   }
+}
+
+/// The ephemeral profiles that still have a directory here although their
+/// browser is gone. The status loop erases a directory when it sees the
+/// browser exit, but it never sees a browser that exits while Donut is closed
+/// or in the second before Donut quits. A protected profile's copy is not
+/// listed: it holds changes that wait for the next unlock to be sealed.
+pub fn stale_dirs(
+  profiles: &[BrowserProfile],
+  running: impl Fn(&BrowserProfile) -> bool,
+) -> Vec<String> {
+  wait_for_recovery();
+  let with_dir: Vec<(&BrowserProfile, String)> = {
+    let Ok(dirs) = EPHEMERAL_DIRS.lock() else {
+      return Vec::new();
+    };
+    profiles
+      .iter()
+      .filter(|profile| profile.ephemeral && !profile.password_protected)
+      .map(|profile| (profile, profile.id.to_string()))
+      .filter(|(_, id)| dirs.contains_key(id))
+      .collect()
+  };
+  with_dir
+    .into_iter()
+    .filter(|(profile, _)| !running(profile))
+    .map(|(_, id)| id)
+    .collect()
+}
+
+/// Whether the macOS RAM disk or the Windows RAM volume is mounted. `None`
+/// where neither can exist.
+pub fn ram_disk_mounted() -> Option<bool> {
+  #[cfg(target_os = "macos")]
+  return Some(Path::new(MACOS_RAM_DISK).is_dir());
+  #[cfg(target_os = "windows")]
+  return crate::ramfs::winfsp_available()
+    .ok()
+    .map(|()| crate::ramfs::live_volume().is_some());
+  #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+  None
+}
+
+/// Detach the macOS RAM disk, or stop the Windows RAM volume's host, when no
+/// profile directory is on it. Nothing else does, so the macOS disk would stay
+/// mounted until the Mac restarts, and the Windows host would keep running.
+///
+/// Runs at exit, where `hdiutil detach` takes seconds, so the detach is
+/// started and not waited for: it finishes after Donut is gone.
+pub fn detach_unused_ram_disk() {
+  #[cfg(target_os = "windows")]
+  {
+    if ephemeral_base_override().is_some() {
+      return;
+    }
+    if let Some(volume) = crate::ramfs::live_volume() {
+      if holds_no_profile_dirs(&volume.mount) {
+        crate::ramfs::stop_host(volume.pid, "unused_at_exit");
+      }
+    }
+  }
+  #[cfg(target_os = "macos")]
+  {
+    use std::process::Stdio;
+    // Every Donut build mounts the same volume, so what is on it decides, not
+    // only what this run created.
+    if ephemeral_base_override().is_some() || !holds_no_profile_dirs(Path::new(MACOS_RAM_DISK)) {
+      return;
+    }
+    match std::process::Command::new("hdiutil")
+      .args(["detach", "-force", MACOS_RAM_DISK])
+      .stdin(Stdio::null())
+      .stdout(Stdio::null())
+      .stderr(Stdio::null())
+      .spawn()
+    {
+      Ok(child) => log::info!(
+        "RAM disk detach started path={MACOS_RAM_DISK} pid={} reason=unused_at_exit",
+        child.id()
+      ),
+      Err(e) => log::warn!("RAM disk detach failed path={MACOS_RAM_DISK} err=\"{e}\""),
+    }
+  }
+}
+
+/// False when `path` cannot be read, so a missing volume is never detached.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+fn holds_no_profile_dirs(path: &Path) -> bool {
+  std::fs::read_dir(path).is_ok_and(|entries| {
+    entries
+      .flatten()
+      .all(|entry| uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()).is_err())
+  })
 }
 
 /// Remove old-format ephemeral dirs from /tmp (pre-tmpfs migration).
@@ -385,15 +561,50 @@ fn cleanup_legacy_dirs() {
       // always on real disk and always worth zeroing.
       if name.starts_with("donut-ephemeral-") && entry.path().is_dir() {
         if let Err(e) = crate::fs_secure::secure_remove_dir_all(&entry.path(), true) {
-          log::warn!("Failed to clean up legacy ephemeral dir: {e}");
+          log::warn!("Legacy ephemeral dir cleanup failed err=\"{e}\"");
         } else {
           log::info!(
-            "Cleaned up legacy ephemeral dir: {}",
+            "Legacy ephemeral dir removed path={}",
             entry.path().display()
           );
         }
       }
     }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EphemeralStorageStatus {
+  in_memory: bool,
+  /// `winfsp_missing` or `winfsp_error` when not in memory.
+  reason: Option<&'static str>,
+}
+
+/// Whether ephemeral profiles keep their data in memory on this computer.
+/// Mounts nothing.
+#[tauri::command]
+pub async fn get_ephemeral_storage_status() -> EphemeralStorageStatus {
+  storage_status()
+}
+
+fn storage_status() -> EphemeralStorageStatus {
+  #[cfg(target_os = "windows")]
+  {
+    if existing_windows_ramdisk().is_none() {
+      let reason = match crate::ramfs::status() {
+        crate::ramfs::Status::InMemory => None,
+        crate::ramfs::Status::WinfspMissing => Some("winfsp_missing"),
+        crate::ramfs::Status::WinfspError => Some("winfsp_error"),
+      };
+      return EphemeralStorageStatus {
+        in_memory: reason.is_none(),
+        reason,
+      };
+    }
+  }
+  EphemeralStorageStatus {
+    in_memory: true,
+    reason: None,
   }
 }
 
@@ -433,11 +644,15 @@ mod tests {
       last_sync: None,
       host_os: None,
       ephemeral,
+      temporary: false,
       extension_group_id: None,
       proxy_bypass_rules: Vec::new(),
       created_by_id: None,
       created_by_email: None,
       dns_blocklist: None,
+      dns_server: None,
+      status_id: None,
+      start_urls: Vec::new(),
       password_protected: false,
       clear_on_close: false,
       created_at: None,
@@ -524,6 +739,55 @@ mod tests {
 
   #[test]
   #[serial_test::serial]
+  fn recovery_creates_no_base_when_no_earlier_run_left_one() {
+    let base = BaseGuard::new();
+    let missing = base.path().join("never-created");
+    std::env::set_var("DONUTBROWSER_EPHEMERAL_ROOT", &missing);
+
+    recover_ephemeral_dirs();
+    wait_for_recovery();
+
+    assert!(!missing.exists());
+  }
+
+  #[test]
+  #[serial_test::serial]
+  fn only_dirs_of_ephemeral_profiles_whose_browser_is_gone_are_stale() {
+    let _base = BaseGuard::new();
+    EPHEMERAL_DIRS.lock().unwrap().clear();
+
+    let closed = make_test_profile(uuid::Uuid::new_v4(), true);
+    let open = make_test_profile(uuid::Uuid::new_v4(), true);
+    let without_dir = make_test_profile(uuid::Uuid::new_v4(), true);
+    let mut protected = make_test_profile(uuid::Uuid::new_v4(), true);
+    protected.password_protected = true;
+    for profile in [&closed, &open, &protected] {
+      create_ephemeral_dir(&profile.id.to_string()).unwrap();
+    }
+
+    let profiles = [closed.clone(), open.clone(), without_dir, protected.clone()];
+    let stale = stale_dirs(&profiles, |profile| profile.id == open.id);
+
+    assert_eq!(stale, vec![closed.id.to_string()]);
+    for profile in [&closed, &open, &protected] {
+      assert!(remove_ephemeral_dir(&profile.id.to_string()));
+    }
+  }
+
+  #[test]
+  fn only_a_volume_without_profile_dirs_counts_as_unused() {
+    let volume = tempfile::tempdir().unwrap();
+    assert!(!holds_no_profile_dirs(&volume.path().join("not-mounted")));
+
+    std::fs::create_dir(volume.path().join(".fseventsd")).unwrap();
+    assert!(holds_no_profile_dirs(volume.path()));
+
+    std::fs::create_dir(volume.path().join(uuid::Uuid::new_v4().to_string())).unwrap();
+    assert!(!holds_no_profile_dirs(volume.path()));
+  }
+
+  #[test]
+  #[serial_test::serial]
   fn disk_backed_dirs_are_zeroed_and_ram_backed_ones_are_not() {
     let base = BaseGuard::new();
     EPHEMERAL_DIRS.lock().unwrap().clear();
@@ -546,6 +810,19 @@ mod tests {
     assert!(remove_ephemeral_dir(&id));
     assert!(!dir.exists());
     assert!(get_ephemeral_dir(&id).is_none());
+  }
+
+  #[test]
+  fn storage_status_is_in_memory_or_names_its_reason() {
+    let status = serde_json::to_value(storage_status()).unwrap();
+    let in_memory = status["in_memory"].as_bool().unwrap();
+    let reason = status["reason"].as_str();
+    assert_eq!(in_memory, reason.is_none());
+    #[cfg(not(target_os = "windows"))]
+    assert!(in_memory);
+    if let Some(reason) = reason {
+      assert!(["winfsp_missing", "winfsp_error"].contains(&reason));
+    }
   }
 
   #[test]

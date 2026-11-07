@@ -10,7 +10,7 @@ fn base_dirs() -> &'static BaseDirs {
 }
 
 /// Returns the portable base directory if a `.portable` marker exists next to the executable.
-fn portable_dir() -> Option<&'static PathBuf> {
+pub fn portable_dir() -> Option<&'static PathBuf> {
   PORTABLE_DIR
     .get_or_init(|| {
       std::env::current_exe()
@@ -24,6 +24,50 @@ fn portable_dir() -> Option<&'static PathBuf> {
 /// Returns true if the app is running in portable mode.
 pub fn is_portable() -> bool {
   portable_dir().is_some()
+}
+
+/// A Linux app sandbox that Donut can be installed through. In either one the
+/// app cannot replace its own files, and it does not see the desktop's
+/// default-application settings the way a .deb or .rpm install does.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinuxSandbox {
+  Flatpak,
+  Snap,
+}
+
+/// The sandbox this process runs in, or `None` for a regular install.
+#[cfg(target_os = "linux")]
+pub fn linux_sandbox() -> Option<LinuxSandbox> {
+  static SANDBOX: OnceLock<Option<LinuxSandbox>> = OnceLock::new();
+  *SANDBOX.get_or_init(|| {
+    detect_linux_sandbox(
+      std::path::Path::new("/.flatpak-info").exists(),
+      std::env::var_os("SNAP").map(PathBuf::from).as_deref(),
+      std::env::current_exe().ok().as_deref(),
+    )
+  })
+}
+
+/// Flatpak writes `/.flatpak-info` into every sandbox. A snap is recognised by
+/// the executable living under `$SNAP`, not by the variable alone: a snapped
+/// terminal or IDE leaks `SNAP` into every program started from it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn detect_linux_sandbox(
+  flatpak_info_exists: bool,
+  snap_dir: Option<&std::path::Path>,
+  exe: Option<&std::path::Path>,
+) -> Option<LinuxSandbox> {
+  if flatpak_info_exists {
+    return Some(LinuxSandbox::Flatpak);
+  }
+  match (snap_dir, exe) {
+    // An empty `SNAP` is a prefix of every path.
+    (Some(snap), Some(exe)) if !snap.as_os_str().is_empty() && exe.starts_with(snap) => {
+      Some(LinuxSandbox::Snap)
+    }
+    _ => None,
+  }
 }
 
 /// Optional single-root override for all on-disk state. Set
@@ -80,8 +124,34 @@ fn state_is_relocated() -> bool {
 /// host machine. If a future plugin version sanitises the name to a bare file
 /// component this silently reverts to the default directory, which is why the
 /// first-run probe in `lib.rs` reads this same function rather than assuming.
+///
+/// A relocation that resolves to a relative path is rejected: see
+/// `window_state_override_for`.
 pub fn window_state_path_override() -> Option<PathBuf> {
-  state_is_relocated().then(|| data_dir().join(WINDOW_STATE_FILENAME))
+  window_state_override_for(state_is_relocated(), data_dir())
+}
+
+/// Split out from `window_state_path_override` so the absolute-path rule is
+/// testable without mutating process-wide environment variables.
+///
+/// A relative override is worse than no override: the plugin would resolve it
+/// against `app_config_dir` and write into an intermediate directory it never
+/// creates, so every save fails with ENOENT and is swallowed by the plugin's
+/// fire-and-forget exit handler. Falling back to the platform default at least
+/// persists geometry.
+fn window_state_override_for(relocated: bool, data_dir: PathBuf) -> Option<PathBuf> {
+  if !relocated {
+    return None;
+  }
+  let path = data_dir.join(WINDOW_STATE_FILENAME);
+  if !path.is_absolute() {
+    log::warn!(
+      "Relative window-state path ignored: geometry would not persist; set DONUTBROWSER_DATA_DIR or DONUTBROWSER_DATA_ROOT to an absolute path path=\"{}\"",
+      path.display()
+    );
+    return None;
+  }
+  Some(path)
 }
 
 /// Where the window-state file actually is, override or not. Used for the
@@ -167,6 +237,25 @@ pub fn data_subdir() -> PathBuf {
 
 pub fn settings_dir() -> PathBuf {
   data_dir().join("settings")
+}
+
+/// Whether a name read from sync or an automation client can become one path
+/// part under a data directory.
+///
+/// Ids and file names such as an extension's `file_name` or a proxy's `id`
+/// arrive in JSON from the sync server and from the REST API. `..`, a separator
+/// or an absolute path would read, write or delete outside the entity's own
+/// directory: a crafted extension `file_name` wrote anywhere the user can
+/// write, and an extension id of `..` led a remote tombstone to remove the
+/// whole data directory.
+pub fn is_plain_path_part(value: &str) -> bool {
+  !value.is_empty()
+    && value != "."
+    && value != ".."
+    && !value.contains(['/', '\\', '\0'])
+    // `C:name` carries a drive prefix on Windows; elsewhere `:` is an ordinary
+    // character, which a linked folder on macOS may well have.
+    && !(cfg!(windows) && value.contains(':'))
 }
 
 pub fn proxies_dir() -> PathBuf {
@@ -256,7 +345,10 @@ pub fn restrict_to_owner(path: &std::path::Path) {
   {
     use std::os::unix::fs::PermissionsExt;
     if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-      log::warn!("Failed to restrict permissions on {}: {e}", path.display());
+      log::warn!(
+        "Owner-only permission set failed path=\"{}\" err=\"{e}\"",
+        path.display()
+      );
     }
   }
   #[cfg(not(unix))]
@@ -292,6 +384,30 @@ pub fn write_owner_only(path: &std::path::Path, content: &[u8]) -> std::io::Resu
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn only_a_single_plain_name_is_a_plain_path_part() {
+    for plain in [
+      "6d6e21a1-4829-4d2b-bc7f-1b25707b61e4",
+      "ublock.zip",
+      "a b.crx",
+      "..x",
+    ] {
+      assert!(is_plain_path_part(plain), "{plain}");
+    }
+    for unsafe_part in [
+      "",
+      ".",
+      "..",
+      "../x",
+      "a/b",
+      "a\\b",
+      "/etc/passwd",
+      "nul\0byte",
+    ] {
+      assert!(!is_plain_path_part(unsafe_part), "{unsafe_part:?}");
+    }
+  }
 
   #[test]
   fn test_app_name() {
@@ -390,6 +506,27 @@ mod tests {
   }
 
   #[test]
+  fn window_state_override_rejects_a_relative_data_dir() {
+    // `DONUTBROWSER_DATA_ROOT=don-state` (or a relative DATA_DIR) would hand the
+    // plugin a relative filename it resolves against app_config_dir, into a
+    // directory nothing creates. Falling back to the default keeps geometry.
+    assert_eq!(
+      window_state_override_for(true, PathBuf::from("don-state/data")),
+      None
+    );
+    assert_eq!(window_state_override_for(true, PathBuf::from("")), None);
+
+    // temp_dir is absolute on every platform; a hard-coded "/tmp/..." is not
+    // absolute on Windows, where these tests also run.
+    let relocated = std::env::temp_dir().join("donut-relocated");
+    assert_eq!(
+      window_state_override_for(true, relocated.clone()),
+      Some(relocated.join(WINDOW_STATE_FILENAME))
+    );
+    assert_eq!(window_state_override_for(false, relocated), None);
+  }
+
+  #[test]
   fn window_state_follows_a_relocated_data_dir() {
     let tmp = PathBuf::from("/tmp/donut-relocated");
     let _guard = set_test_data_dir(tmp.clone());
@@ -411,6 +548,33 @@ mod tests {
     );
     assert!(portable.join("data").starts_with(&portable));
     assert!(portable.join("cache").starts_with(&portable));
+  }
+
+  #[test]
+  fn linux_sandbox_detection() {
+    let snap = PathBuf::from("/snap/donutbrowser/x1");
+    let snapped_exe = snap.join("usr/bin/donutbrowser");
+    let deb_exe = PathBuf::from("/usr/bin/donutbrowser");
+
+    assert_eq!(
+      detect_linux_sandbox(true, None, Some(&deb_exe)),
+      Some(LinuxSandbox::Flatpak)
+    );
+    assert_eq!(
+      detect_linux_sandbox(false, Some(&snap), Some(&snapped_exe)),
+      Some(LinuxSandbox::Snap)
+    );
+    // A .deb install started from a snapped terminal inherits its `SNAP`.
+    assert_eq!(
+      detect_linux_sandbox(false, Some(&snap), Some(&deb_exe)),
+      None
+    );
+    assert_eq!(
+      detect_linux_sandbox(false, Some(&PathBuf::new()), Some(&deb_exe)),
+      None
+    );
+    assert_eq!(detect_linux_sandbox(false, None, Some(&deb_exe)), None);
+    assert_eq!(detect_linux_sandbox(false, Some(&snap), None), None);
   }
 
   #[test]

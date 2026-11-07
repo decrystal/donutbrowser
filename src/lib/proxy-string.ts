@@ -15,20 +15,219 @@
 
 import type { ParsedProxyLine, ProxyParseResult } from "@/types";
 
-/** URL schemes the Rust parser accepts, mapped onto the stored proxy type. */
-const PROXY_SCHEMES: Record<string, string> = {
-  http: "http",
-  https: "https",
-  socks: "socks5",
-  socks4: "socks4",
-  socks5: "socks5",
-  ss: "ss",
-  shadowsocks: "ss",
-  vless: "vless",
-};
+/**
+ * URL schemes the Rust parser accepts, mapped onto the stored proxy type.
+ *
+ * A Map rather than an object literal, and for the same reason as
+ * PROTOCOL_TOKENS below: the key comes from text the user pasted, and an object
+ * lookup answers for the whole prototype chain. `__proto__://a:1:b:2` resolved
+ * to Object.prototype and `constructor://...` to a function, both truthy, so
+ * `splitProxyScheme` handed a non-string `proxy_type` to the import preview.
+ */
+const PROXY_SCHEMES = new Map<string, string>([
+  ["http", "http"],
+  ["https", "https"],
+  ["httpstls", "httpstls"],
+  ["socks", "socks5"],
+  ["socks4", "socks4"],
+  ["socks5", "socks5"],
+  ["ss", "ss"],
+  ["shadowsocks", "ss"],
+  ["vless", "vless"],
+  ["vmess", "vmess"],
+  ["trojan", "trojan"],
+  ["hysteria2", "hysteria2"],
+  ["hy2", "hysteria2"],
+]);
+
+/**
+ * Types an Xray-core sidecar carries. Their whole configuration is the share
+ * link stored in `vless_uri`, a name from before VMess, Trojan and Hysteria2
+ * joined VLESS.
+ */
+const XRAY_PROXY_TYPES = new Set([
+  "vless",
+  "vmess",
+  "trojan",
+  "hysteria2",
+  "hy2",
+]);
+
+/** Whether a stored `proxy_type` is configured by a share link. */
+export function isXrayProxyType(proxyType: string): boolean {
+  return XRAY_PROXY_TYPES.has(normalizeProxyType(proxyType));
+}
+
+/**
+ * Protocol identifiers, shortened where the raw stored type would not fit the
+ * management table's column. Not translated: these are wire protocol names,
+ * like the raw type that cell printed before. What the protocol MEANS for the
+ * user belongs in the tooltip, which is translated.
+ */
+const PROTOCOL_TOKENS = new Map<string, string>([["httpstls", "HTTP/TLS"]]);
+
+/**
+ * Trim and case-fold a stored `proxy_type` before anything compares it.
+ *
+ * The first two steps of `canonicalProxyType` (`proxy-type.ts`), and every
+ * reader of a stored type in this file goes through it. Skipping the trim here
+ * while the form trimmed for its labels is what let one REST-stored `"ss "` be
+ * Shadowsocks to the cipher field and an unencrypted hop to the warning printed
+ * beside it, a false alarm about a proxy carrying a real cipher, and the
+ * cheapest way to teach a user to ignore this warning. The two files cannot
+ * import each other (both are loaded straight by `node --test`), so
+ * `proxy-string.test.mjs` imports both and pins them in lockstep.
+ */
+function normalizeProxyType(proxyType: string): string {
+  return proxyType.trim().toLowerCase();
+}
+
+/**
+ * The protocol label for a stored proxy: the short token when there is one,
+ * otherwise the stored type verbatim. Empty only when the stored type is blank,
+ * which is the one case the caller has to fill with a translated placeholder.
+ *
+ * A Map, not an object literal. `proxy_type` is free text, POST /v1/proxies
+ * and `import_proxies_json` store whatever they are given, unvalidated, so an
+ * object lookup would answer from Object.prototype: `__proto__` yielded an
+ * object, which React refuses as a child, and rendering it threw and unmounted
+ * the ENTIRE proxy table, hiding every proxy and every first-hop warning;
+ * `constructor`, `toString` and `valueOf` yielded functions, which React drops,
+ * leaving the cell blank. A Map only ever answers for keys actually put in it.
+ */
+export function proxyProtocolToken(proxyType: string): string {
+  return PROTOCOL_TOKENS.get(normalizeProxyType(proxyType)) ?? proxyType.trim();
+}
 
 /** What a line carrying no scheme is assumed to be. */
 export const DEFAULT_PROXY_TYPE = "http";
+
+/**
+ * Proxy types whose hop from this machine to the proxy is encrypted.
+ *
+ * `https` is deliberately absent. It is a provider label on a plaintext CONNECT
+ * endpoint, and Donut dials it byte-for-byte like `http`
+ * (`proxy_server.rs::connect_to_target_via_upstream`). Listing it here would
+ * make the UI state something untrue about the wire.
+ */
+const ENCRYPTED_FIRST_HOP = new Set([
+  "httpstls",
+  "ss",
+  // The REST API stores proxy_type verbatim, so a proxy created with
+  // "shadowsocks" reaches the UI with that spelling and the backend tunnels it
+  // (proxy_server.rs matches "ss" | "shadowsocks"). Without it here the guard
+  // below returned false and the UI told the user an ENCRYPTED hop was in the
+  // clear, the same class of wrong claim this feature exists to remove, only
+  // inverted.
+  "shadowsocks",
+]);
+
+/**
+ * Whether the leg from this machine to the proxy is encrypted.
+ *
+ * Says nothing about what the proxy operator can see: they terminate the
+ * tunnel either way and still observe every hostname, port and timing, plus the
+ * full contents of anything not carried over end-to-end TLS.
+ */
+const NULL_CIPHERS = new Set(["none", "plain"]);
+
+/**
+ * Whether the hop from this machine to the proxy is encrypted.
+ *
+ * Shadowsocks takes the cipher as free text, and shadowsocks-crypto maps both
+ * "none" and "plain" to CipherKind::NONE, a no-op. Keying off the type alone
+ * therefore labelled such a proxy "First hop encrypted", coloured it safe, and
+ * suppressed the credentials-in-clear warning, for a connection carrying
+ * everything in the clear. A claim of safety that is wrong is worse than no
+ * claim, so the cipher decides for Shadowsocks.
+ */
+export function isFirstHopEncrypted(
+  proxyType: string,
+  cipher?: string | null,
+  shareLink?: string | null,
+): boolean {
+  const type = normalizeProxyType(proxyType);
+  if (XRAY_PROXY_TYPES.has(type)) return isShareLinkEncrypted(shareLink ?? "");
+  if (!ENCRYPTED_FIRST_HOP.has(type)) return false;
+  if (type === "ss" || type === "shadowsocks") {
+    // Fail closed. An absent cipher is not evidence of encryption, and the
+    // asymmetry matters: wrongly saying "in the clear" costs a needless
+    // warning, wrongly saying "encrypted" costs the user the one thing this
+    // label exists to tell them.
+    const normalized = (cipher ?? "").trim().toLowerCase();
+    return normalized.length > 0 && !NULL_CIPHERS.has(normalized);
+  }
+  return true;
+}
+
+const NULL_VMESS_CIPHERS = new Set(["none", "zero"]);
+
+/**
+ * Whether an Xray share link encrypts the hop to its server.
+ *
+ * The link decides, not the protocol: plain VLESS (`security=none`) carries
+ * its payload in the clear, and so does VMess with the `none` or `zero`
+ * cipher. Hysteria2 always runs over QUIC, which is TLS 1.3. A link this cannot
+ * read is reported as not encrypted, for the same fail-closed reason as the
+ * Shadowsocks cipher above.
+ */
+export function isShareLinkEncrypted(shareLink: string): boolean {
+  const link = shareLink.trim();
+  const separator = link.indexOf("://");
+  if (separator === -1) return false;
+  const scheme = link.slice(0, separator).toLowerCase();
+  const body = link.slice(separator + 3).split("#")[0] ?? "";
+  if (scheme === "hysteria2" || scheme === "hy2") return true;
+
+  if (scheme === "vmess" && !body.includes("@")) {
+    const json = decodeVmessJson(body);
+    if (!json) return false;
+    // Read as `uri.rs` reads it: values trimmed, and `encryption` taken as
+    // the cipher when `scy` is absent.
+    const field = (key: string) =>
+      String(json[key] ?? "")
+        .trim()
+        .toLowerCase();
+    const security = field("tls");
+    if (security === "tls" || security === "reality") return true;
+    const cipher = field("scy") || field("encryption") || "auto";
+    return !NULL_VMESS_CIPHERS.has(cipher);
+  }
+
+  // Everything after the FIRST `?` is the query. A WebSocket path such as
+  // `/ws?ed=2048` may carry a second one, and cutting there hid a later
+  // `security=none` and called a plaintext link encrypted.
+  const queryStart = body.indexOf("?");
+  const query = new URLSearchParams(
+    queryStart === -1 ? "" : body.slice(queryStart + 1),
+  );
+  const defaultSecurity = scheme === "trojan" ? "tls" : "none";
+  const security = (query.get("security") || defaultSecurity).toLowerCase();
+  if (security === "tls" || security === "reality") return true;
+  if (scheme === "vmess") {
+    const cipher = (query.get("encryption") || "auto").toLowerCase();
+    return !NULL_VMESS_CIPHERS.has(cipher);
+  }
+  return false;
+}
+
+/** v2rayN's `vmess://<base64 JSON>` body, or null when it is not one. */
+function decodeVmessJson(body: string): Record<string, unknown> | null {
+  try {
+    const base64 = decodeURIComponent(body)
+      .replace(/\s/g, "")
+      .replace(/-/g, "+")
+      .replace(/_/g, "/");
+    const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
+    const bytes = Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
+    const json: unknown = JSON.parse(new TextDecoder().decode(bytes));
+    return json !== null && typeof json === "object" && !Array.isArray(json)
+      ? (json as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
 
 export const HOST_FIRST_FORMAT = "host:port:username:password";
 export const CREDENTIALS_FIRST_FORMAT = "username:password:host:port";
@@ -47,10 +246,42 @@ export function splitProxyScheme(line: string): {
     return { proxyType: DEFAULT_PROXY_TYPE, rest: line };
   }
 
-  const proxyType = PROXY_SCHEMES[line.slice(0, separator).toLowerCase()];
+  const proxyType = PROXY_SCHEMES.get(line.slice(0, separator).toLowerCase());
   return proxyType
     ? { proxyType, rest: line.slice(separator + 3) }
     : { proxyType: DEFAULT_PROXY_TYPE, rest: line };
+}
+
+/**
+ * The colon-separated fields of a proxy line. An IPv6 address in brackets at
+ * the start of a field stays one field: `[2001:db8::1]:8080:user:pass`.
+ * Mirrors `split_proxy_fields` in `proxy_manager.rs`.
+ */
+export function splitProxyFields(line: string): string[] {
+  const fields: string[] = [];
+  let rest = line;
+  for (;;) {
+    const end = rest.startsWith("[") ? rest.indexOf("]") : -1;
+    if (end !== -1) {
+      const after = rest.slice(end + 1);
+      if (after === "") {
+        fields.push(rest);
+        return fields;
+      }
+      if (after.startsWith(":")) {
+        fields.push(rest.slice(0, end + 1));
+        rest = after.slice(1);
+        continue;
+      }
+    }
+    const colon = rest.indexOf(":");
+    if (colon === -1) {
+      fields.push(rest);
+      return fields;
+    }
+    fields.push(rest.slice(0, colon));
+    rest = rest.slice(colon + 1);
+  }
 }
 
 /**
@@ -64,7 +295,7 @@ export function resolveAmbiguousProxyLine(
 ): ParsedProxyLine | null {
   const trimmed = line.trim();
   const { proxyType, rest } = splitProxyScheme(trimmed);
-  const parts = rest.split(":");
+  const parts = splitProxyFields(rest);
   if (parts.length !== 4) {
     return null;
   }

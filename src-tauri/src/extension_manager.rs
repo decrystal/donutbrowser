@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use utoipa::ToSchema;
 
+use crate::app_dirs::is_plain_path_part;
 use crate::events;
 
 /// Where an extension's payload came from. `archive` is a user-supplied
@@ -24,6 +25,9 @@ fn default_source_kind() -> String {
 pub struct Extension {
   pub id: String,
   pub name: String,
+  /// The archive's identity, kept separately from the user's editable name.
+  #[serde(default)]
+  pub manifest_name: Option<String>,
   pub file_name: String,
   pub file_type: String,
   pub browser_compatibility: Vec<String>,
@@ -51,6 +55,9 @@ pub struct Extension {
   /// and never sync.
   #[serde(default)]
   pub linked_path: Option<String>,
+  /// The Chrome Web Store id, when it came from the store; it can update then.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub web_store_id: Option<String>,
 }
 
 impl Extension {
@@ -88,6 +95,60 @@ fn now_secs() -> u64 {
 
 fn extensions_base_dir() -> PathBuf {
   crate::app_dirs::extensions_dir()
+}
+
+/// Where an archive extension's unpacked files are kept between launches:
+/// `tree/` holds them, `source` the stamp of the archive they came from.
+fn unpacked_cache_dir(ext_id: &str) -> PathBuf {
+  extensions_base_dir().join("unpacked_cache").join(ext_id)
+}
+
+/// Bumped when `ensure_icons_extracted` starts reading something new from a
+/// manifest, so every extension is read once more.
+const BACKFILL_VERSION: u32 = 1;
+/// In an extension's folder: the stamp of the source the backfill last read.
+const BACKFILL_STAMP_FILE: &str = ".backfill-stamp";
+
+/// What tells one version of a file from the next: its name, size and
+/// modification time. Replacing an archive gives it a new stamp.
+fn file_stamp(path: &Path) -> Option<String> {
+  let metadata = fs::metadata(path).ok()?;
+  let modified = metadata
+    .modified()
+    .ok()?
+    .duration_since(UNIX_EPOCH)
+    .ok()?
+    .as_nanos();
+  Some(format!(
+    "{}:{}:{modified}",
+    path.file_name()?.to_string_lossy(),
+    metadata.len()
+  ))
+}
+
+fn is_message_placeholder(value: &str) -> bool {
+  crate::vpn_extension_detect::message_placeholder_key(value).is_some()
+}
+
+/// Copy the tree `from` into `to`, hard-linking files where the volume
+/// allows and copying where it does not. A `manifest.json` is always copied:
+/// the launch rewrites the staged one.
+fn stage_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+  fs::create_dir_all(to)?;
+  for entry in fs::read_dir(from)? {
+    let entry = entry?;
+    let source = entry.path();
+    let target = to.join(entry.file_name());
+    let file_type = entry.file_type()?;
+    if file_type.is_dir() {
+      stage_tree(&source, &target)?;
+    } else if file_type.is_file()
+      && (entry.file_name() == "manifest.json" || fs::hard_link(&source, &target).is_err())
+    {
+      fs::copy(&source, &target)?;
+    }
+  }
+  Ok(())
 }
 
 fn extension_groups_file() -> PathBuf {
@@ -180,6 +241,138 @@ pub(crate) fn resolve_archive_i18n(
 /// Read an unpacked extension's `manifest.json` off disk. The directory
 /// equivalent of `read_manifest_from_archive`, so both payload shapes feed the
 /// same metadata and icon extraction below.
+/// The manifest `key` of a staged copy. Chromium derives the id of an unpacked
+/// extension from its absolute path unless the manifest has a `key`, and the
+/// staging path differs on every machine and OS, so a path id leaves the
+/// extension's storage and settings on the machine that staged it. The key is
+/// derived from the profile and the extension, so the id is the same on every
+/// machine and still differs between profiles.
+fn portable_manifest_key(profile_id: &str, ext_id: &str) -> Vec<u8> {
+  use sha2::{Digest, Sha256};
+  let mut hasher = Sha256::new();
+  hasher.update(b"donut-staged-extension-key\0");
+  hasher.update(profile_id.as_bytes());
+  hasher.update([0u8]);
+  hasher.update(ext_id.as_bytes());
+  hasher.finalize().to_vec()
+}
+
+/// The extension id Chromium derives from a manifest `key`: the first 16 bytes
+/// of its SHA-256, each nibble written as a letter from `a` to `p`.
+fn extension_id_for_key(key: &[u8]) -> String {
+  use sha2::{Digest, Sha256};
+  Sha256::digest(key)[..16]
+    .iter()
+    .flat_map(|byte| [byte >> 4, byte & 0x0f])
+    .map(|nibble| char::from(b'a' + nibble))
+    .collect()
+}
+
+/// Whether two spellings name the same directory, as the browser records it.
+fn same_dir(recorded: &str, dir: &Path) -> bool {
+  let recorded = Path::new(recorded);
+  let canonical = dir.canonicalize().ok();
+  [Some(dir.to_path_buf()), canonical]
+    .into_iter()
+    .flatten()
+    .any(|candidate| {
+      let candidate = candidate.to_string_lossy().to_string();
+      let candidate = candidate.strip_prefix(r"\\?\").unwrap_or(&candidate);
+      if cfg!(windows) {
+        recorded.to_string_lossy().eq_ignore_ascii_case(candidate)
+      } else {
+        recorded == Path::new(candidate)
+      }
+    })
+}
+
+/// The id under which the profile already keeps state for the extension staged
+/// at `dir`, when that id is not `portable_id`. Such state was recorded before
+/// staged copies carried a key.
+fn recorded_path_id(profile_data_path: &Path, dir: &Path, portable_id: &str) -> Option<String> {
+  let mut recorded_path_ids = Vec::new();
+  for file in ["Preferences", "Secure Preferences"] {
+    let Ok(contents) = fs::read_to_string(profile_data_path.join("Default").join(file)) else {
+      continue;
+    };
+    let Ok(prefs) = serde_json::from_str::<serde_json::Value>(&contents) else {
+      continue;
+    };
+    let Some(settings) = prefs
+      .pointer("/extensions/settings")
+      .and_then(|v| v.as_object())
+    else {
+      continue;
+    };
+    if settings.contains_key(portable_id) {
+      return None;
+    }
+    recorded_path_ids.extend(
+      settings
+        .iter()
+        .filter(|(_, entry)| {
+          entry
+            .get("path")
+            .and_then(|p| p.as_str())
+            .is_some_and(|p| same_dir(p, dir))
+        })
+        .map(|(id, _)| id.clone()),
+    );
+  }
+  recorded_path_ids.into_iter().next()
+}
+
+/// Give the staged copy at `dir` a manifest `key`, so the browser gives it the
+/// same id on every machine. A manifest that already has a key keeps it. A
+/// profile that already keeps state under the copy's path id keeps that id, so
+/// an update never resets an extension on the machine it runs on.
+fn give_portable_id(dir: &Path, profile_id: &str, ext_id: &str, profile_data_path: &Path) {
+  use base64::Engine;
+
+  let manifest_path = dir.join("manifest.json");
+  let Ok(contents) = fs::read_to_string(&manifest_path) else {
+    return;
+  };
+  let Ok(mut manifest) =
+    serde_json::from_str::<serde_json::Value>(contents.trim_start_matches('\u{feff}'))
+  else {
+    log::warn!("Extension keeps a path id, its manifest is not plain JSON extension={ext_id}");
+    return;
+  };
+  let Some(object) = manifest.as_object_mut() else {
+    return;
+  };
+  if object.contains_key("key") {
+    return;
+  }
+  let key = portable_manifest_key(profile_id, ext_id);
+  let portable_id = extension_id_for_key(&key);
+  if let Some(recorded) = recorded_path_id(profile_data_path, dir, &portable_id) {
+    log::info!(
+      "Extension keeps the id its data is under extension={ext_id} id={recorded} profile={profile_id}"
+    );
+    return;
+  }
+  object.insert(
+    "key".to_string(),
+    serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(key)),
+  );
+  match serde_json::to_vec_pretty(&manifest) {
+    Ok(bytes) => {
+      if let Err(e) = fs::write(&manifest_path, bytes) {
+        log::warn!(
+          "Extension keeps a path id, manifest write failed extension={ext_id} err=\"{e}\""
+        );
+      }
+    }
+    Err(e) => {
+      log::warn!(
+        "Extension keeps a path id, manifest encode failed extension={ext_id} err=\"{e}\""
+      );
+    }
+  }
+}
+
 pub(crate) fn read_manifest_from_dir(dir: &Path) -> Option<serde_json::Value> {
   let contents = fs::read_to_string(dir.join("manifest.json")).ok()?;
   serde_json::from_str(&contents).ok()
@@ -258,7 +451,7 @@ fn extract_manifest_metadata(file_data: &[u8], file_type: &str) -> ManifestMetad
   }
 }
 
-fn manifest_metadata(
+pub(crate) fn manifest_metadata(
   manifest: &serde_json::Value,
   source: &ManifestSource<'_>,
 ) -> ManifestMetadata {
@@ -402,6 +595,19 @@ fn err_code(code: &str) -> Box<dyn std::error::Error> {
   serde_json::json!({ "code": code }).to_string().into()
 }
 
+/// A filesystem path named by an automation client (REST or MCP).
+///
+/// Automation loads an extension from whatever folder or archive the caller
+/// names, so the location is the caller's to choose. What a request may not
+/// do is climb: a `..` component is refused before the path is touched, and
+/// the path is then used exactly as given.
+pub fn client_named_path(raw: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+  if raw.contains("..") {
+    return Err(err_code("EXTENSION_PATH_INVALID"));
+  }
+  Ok(PathBuf::from(raw))
+}
+
 /// Validate that `dir` is a loadable unpacked extension and return its parsed
 /// manifest.
 fn validate_unpacked_dir(dir: &Path) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
@@ -476,7 +682,7 @@ fn zip_unpacked_dir(dir: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
   let mut buffer = std::io::Cursor::new(Vec::new());
   {
     let mut writer = zip::ZipWriter::new(&mut buffer);
-    let options: zip::write::FileOptions<'_, ()> =
+    let options: zip::write::SimpleFileOptions =
       zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     for (relative, absolute) in files {
       let data = fs::read(&absolute)?;
@@ -620,7 +826,7 @@ impl ExtensionManager {
     source_kind: String,
   ) -> Result<Extension, Box<dyn std::error::Error>> {
     let browser_compatibility = determine_browser_compatibility(&file_type);
-    if browser_compatibility.is_empty() {
+    if browser_compatibility.is_empty() || !is_plain_path_part(&file_name) {
       return Err(err_code("EXTENSION_UNSUPPORTED_FILE_TYPE"));
     }
     let now = now_secs();
@@ -630,7 +836,8 @@ impl ExtensionManager {
 
     let ext = Extension {
       id: uuid::Uuid::new_v4().to_string(),
-      name: Self::resolve_name(name, manifest_name)?,
+      name: Self::resolve_name(name, manifest_name.clone())?,
+      manifest_name,
       file_name: file_name.clone(),
       file_type,
       browser_compatibility,
@@ -644,6 +851,7 @@ impl ExtensionManager {
       homepage_url,
       source_kind,
       linked_path: None,
+      web_store_id: None,
     };
 
     let file_dir = self.get_file_dir(&ext.id);
@@ -666,7 +874,9 @@ impl ExtensionManager {
     dir: &Path,
     manifest: &serde_json::Value,
   ) -> Result<Extension, Box<dyn std::error::Error>> {
-    let absolute = dir.canonicalize()?;
+    // dunce, not std: on Windows std returns the `\\?\C:\...` form, which the
+    // Extensions page would show and `--load-extension` would be handed.
+    let absolute = dunce::canonicalize(dir)?;
     if !path_is_load_extension_safe(&absolute) {
       return Err(err_code("EXTENSION_PATH_HAS_COMMA"));
     }
@@ -677,7 +887,8 @@ impl ExtensionManager {
 
     let ext = Extension {
       id: uuid::Uuid::new_v4().to_string(),
-      name: Self::resolve_name(name, manifest_name)?,
+      name: Self::resolve_name(name, manifest_name.clone())?,
+      manifest_name,
       file_name: absolute
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -694,6 +905,7 @@ impl ExtensionManager {
       homepage_url,
       source_kind: SOURCE_KIND_UNPACKED.to_string(),
       linked_path: Some(absolute.to_string_lossy().to_string()),
+      web_store_id: None,
     };
 
     if let Some((icon_data, icon_ext)) = extract_icon_from_dir(&absolute, manifest) {
@@ -719,11 +931,12 @@ impl ExtensionManager {
     Ok(name)
   }
 
-  fn write_icon(&self, ext_id: &str, data: &[u8], icon_ext: &str) {
+  /// Returns whether the icon was written.
+  fn write_icon(&self, ext_id: &str, data: &[u8], icon_ext: &str) -> bool {
     let icon_path = self
       .get_extension_dir(ext_id)
       .join(format!("icon.{icon_ext}"));
-    let _ = fs::write(icon_path, data);
+    fs::write(icon_path, data).is_ok()
   }
 
   fn persist_new_extension(&self, ext: Extension) -> Result<Extension, Box<dyn std::error::Error>> {
@@ -735,10 +948,11 @@ impl ExtensionManager {
     fs::write(metadata_path, json)?;
 
     if let Err(e) = events::emit_empty("extensions-changed") {
-      log::error!("Failed to emit extensions-changed event: {e}");
+      log::warn!("Event emit failed event=extensions-changed err=\"{e}\"");
     }
 
     if ext.sync_enabled {
+      crate::team_activity::record("extension.add", &ext.id, Some(&ext.name), None);
       if let Some(scheduler) = crate::sync::get_global_scheduler() {
         let id = ext.id.clone();
         tauri::async_runtime::spawn(async move {
@@ -751,6 +965,9 @@ impl ExtensionManager {
   }
 
   pub fn get_extension(&self, id: &str) -> Result<Extension, Box<dyn std::error::Error>> {
+    if !is_plain_path_part(id) {
+      return Err(format!("Extension with id '{id}' not found").into());
+    }
     let metadata_path = self.get_metadata_path(id);
     if !metadata_path.exists() {
       return Err(format!("Extension with id '{id}' not found").into());
@@ -894,7 +1111,7 @@ impl ExtensionManager {
     explicit_name_provided: bool,
   ) -> Result<(), Box<dyn std::error::Error>> {
     let browser_compatibility = determine_browser_compatibility(&file_type);
-    if browser_compatibility.is_empty() {
+    if browser_compatibility.is_empty() || !is_plain_path_part(&file_name) {
       return Err(err_code("EXTENSION_UNSUPPORTED_FILE_TYPE"));
     }
 
@@ -938,7 +1155,7 @@ impl ExtensionManager {
     manifest: &serde_json::Value,
     explicit_name_provided: bool,
   ) -> Result<(), Box<dyn std::error::Error>> {
-    let absolute = dir.canonicalize()?;
+    let absolute = dunce::canonicalize(dir)?;
     if !path_is_load_extension_safe(&absolute) {
       return Err(err_code("EXTENSION_PATH_HAS_COMMA"));
     }
@@ -1001,6 +1218,7 @@ impl ExtensionManager {
     if let Some(h) = homepage_url {
       ext.homepage_url = Some(h);
     }
+    ext.manifest_name = manifest_name.clone();
     if let Some(mn) = manifest_name {
       if !explicit_name_provided && !mn.trim().is_empty() {
         ext.name = mn;
@@ -1016,10 +1234,11 @@ impl ExtensionManager {
     fs::write(metadata_path, json)?;
 
     if let Err(e) = events::emit_empty("extensions-changed") {
-      log::error!("Failed to emit extensions-changed event: {e}");
+      log::warn!("Event emit failed event=extensions-changed err=\"{e}\"");
     }
 
     if ext.sync_enabled {
+      crate::team_activity::record("extension.update", &ext.id, Some(&ext.name), None);
       if let Some(scheduler) = crate::sync::get_global_scheduler() {
         let eid = ext.id.clone();
         tauri::async_runtime::spawn(async move {
@@ -1029,6 +1248,19 @@ impl ExtensionManager {
     }
 
     Ok(ext)
+  }
+
+  /// Remember the Chrome Web Store id an extension was added from.
+  pub fn set_web_store_id(
+    &self,
+    id: &str,
+    store_id: &str,
+  ) -> Result<Extension, Box<dyn std::error::Error>> {
+    let store_id = crate::extension_fetch::parse_extension_id(store_id)
+      .ok_or_else(|| err_code("EXTENSION_NOT_FROM_STORE"))?;
+    let mut ext = self.get_extension(id)?;
+    ext.web_store_id = Some(store_id);
+    self.finish_update(ext)
   }
 
   pub fn delete_extension(
@@ -1051,21 +1283,24 @@ impl ExtensionManager {
     self.save_groups_data(&groups_data)?;
 
     if let Err(e) = events::emit_empty("extensions-changed") {
-      log::error!("Failed to emit extensions-changed event: {e}");
+      log::warn!("Event emit failed event=extensions-changed err=\"{e}\"");
     }
 
     if ext.sync_enabled {
+      crate::team_activity::record("extension.delete", &ext.id, Some(&ext.name), None);
       let ext_id = id.to_string();
       let app_handle_clone = app_handle.clone();
       tauri::async_runtime::spawn(async move {
         match crate::sync::SyncEngine::create_from_settings(&app_handle_clone).await {
           Ok(engine) => {
             if let Err(e) = engine.delete_extension(&ext_id).await {
-              log::warn!("Failed to delete extension {} from sync: {}", ext_id, e);
+              log::warn!("Remote extension delete failed extension={ext_id} err=\"{e}\"");
             }
           }
           Err(e) => {
-            log::debug!("Sync not configured, skipping remote deletion: {}", e);
+            log::debug!(
+              "Remote extension delete skipped: sync not configured extension={ext_id} err=\"{e}\""
+            );
           }
         }
       });
@@ -1126,10 +1361,11 @@ impl ExtensionManager {
     self.save_groups_data(&data)?;
 
     if let Err(e) = events::emit_empty("extensions-changed") {
-      log::error!("Failed to emit extensions-changed event: {e}");
+      log::warn!("Event emit failed event=extensions-changed err=\"{e}\"");
     }
 
     if group.sync_enabled {
+      crate::team_activity::record("extension.group_create", &group.id, Some(&group.name), None);
       if let Some(scheduler) = crate::sync::get_global_scheduler() {
         let id = group.id.clone();
         tauri::async_runtime::spawn(async move {
@@ -1199,10 +1435,16 @@ impl ExtensionManager {
     self.save_groups_data(&data)?;
 
     if let Err(e) = events::emit_empty("extensions-changed") {
-      log::error!("Failed to emit extensions-changed event: {e}");
+      log::warn!("Event emit failed event=extensions-changed err=\"{e}\"");
     }
 
     if updated.sync_enabled {
+      crate::team_activity::record(
+        "extension.group_update",
+        &updated.id,
+        Some(&updated.name),
+        None,
+      );
       if let Some(scheduler) = crate::sync::get_global_scheduler() {
         let gid = updated.id.clone();
         tauri::async_runtime::spawn(async move {
@@ -1247,6 +1489,7 @@ impl ExtensionManager {
     }
 
     if was_sync_enabled {
+      crate::team_activity::record("extension.group_delete", id, None, None);
       let group_id_owned = id.to_string();
       let app_handle_clone = app_handle.clone();
       tauri::async_runtime::spawn(async move {
@@ -1254,21 +1497,21 @@ impl ExtensionManager {
           Ok(engine) => {
             if let Err(e) = engine.delete_extension_group(&group_id_owned).await {
               log::warn!(
-                "Failed to delete extension group {} from sync: {}",
-                group_id_owned,
-                e
+                "Remote extension group delete failed extension_group={group_id_owned} err=\"{e}\""
               );
             }
           }
           Err(e) => {
-            log::debug!("Sync not configured, skipping remote deletion: {}", e);
+            log::debug!(
+              "Remote extension group delete skipped: sync not configured extension_group={group_id_owned} err=\"{e}\""
+            );
           }
         }
       });
     }
 
     if let Err(e) = events::emit_empty("extensions-changed") {
-      log::error!("Failed to emit extensions-changed event: {e}");
+      log::warn!("Event emit failed event=extensions-changed err=\"{e}\"");
     }
 
     Ok(())
@@ -1298,10 +1541,16 @@ impl ExtensionManager {
     self.save_groups_data(&data)?;
 
     if let Err(e) = events::emit_empty("extensions-changed") {
-      log::error!("Failed to emit extensions-changed event: {e}");
+      log::warn!("Event emit failed event=extensions-changed err=\"{e}\"");
     }
 
     if updated.sync_enabled {
+      crate::team_activity::record(
+        "extension.group_update",
+        &updated.id,
+        Some(&updated.name),
+        crate::team_activity::fields(&["extensions"]),
+      );
       if let Some(scheduler) = crate::sync::get_global_scheduler() {
         let gid = updated.id.clone();
         tauri::async_runtime::spawn(async move {
@@ -1332,10 +1581,16 @@ impl ExtensionManager {
     self.save_groups_data(&data)?;
 
     if let Err(e) = events::emit_empty("extensions-changed") {
-      log::error!("Failed to emit extensions-changed event: {e}");
+      log::warn!("Event emit failed event=extensions-changed err=\"{e}\"");
     }
 
     if updated.sync_enabled {
+      crate::team_activity::record(
+        "extension.group_update",
+        &updated.id,
+        Some(&updated.name),
+        crate::team_activity::fields(&["extensions"]),
+      );
       if let Some(scheduler) = crate::sync::get_global_scheduler() {
         let gid = updated.id.clone();
         tauri::async_runtime::spawn(async move {
@@ -1353,6 +1608,9 @@ impl ExtensionManager {
     &self,
     ext: &Extension,
   ) -> Result<(), Box<dyn std::error::Error>> {
+    if !is_plain_path_part(&ext.id) || !is_plain_path_part(&ext.file_name) {
+      return Err(format!("Extension '{}' has an unsafe id or file name", ext.id).into());
+    }
     let metadata_path = self.get_metadata_path(&ext.id);
     if let Some(parent) = metadata_path.parent() {
       fs::create_dir_all(parent)?;
@@ -1370,6 +1628,9 @@ impl ExtensionManager {
   }
 
   pub fn delete_extension_internal(&self, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if !is_plain_path_part(id) {
+      return Err(format!("Extension with id '{id}' not found").into());
+    }
     let ext_dir = self.get_extension_dir(id);
     if ext_dir.exists() {
       fs::remove_dir_all(&ext_dir)?;
@@ -1423,6 +1684,85 @@ impl ExtensionManager {
     data.groups.retain(|g| g.id != id);
     self.save_groups_data(&data)?;
     Ok(())
+  }
+
+  /// Move an extension out of the store for the trash: its folder (metadata,
+  /// payload, icon) goes to `into`, and it leaves every group. Returns it with
+  /// the groups it was in, so a restore can put it back in them.
+  pub fn take_for_trash(
+    &self,
+    id: &str,
+    into: &Path,
+  ) -> Result<(Extension, Vec<String>), Box<dyn std::error::Error>> {
+    let ext = self
+      .get_extension(id)
+      .map_err(|_| err_code("EXTENSION_NOT_FOUND"))?;
+    let mut data = self.load_groups_data()?;
+    let groups: Vec<String> = data
+      .groups
+      .iter()
+      .filter(|group| group.extension_ids.iter().any(|eid| eid == id))
+      .map(|group| group.id.clone())
+      .collect();
+    self.cleanup_staged_copies(id);
+    let ext_dir = self.get_extension_dir(id);
+    crate::profile::trash::move_dir(&ext_dir, into)?;
+    if !groups.is_empty() {
+      for group in &mut data.groups {
+        group.extension_ids.retain(|eid| eid != id);
+      }
+      if let Err(e) = self.save_groups_data(&data) {
+        if let Err(back) = crate::profile::trash::move_dir(into, &ext_dir) {
+          log::error!("Extension folder not put back extension={id} err=\"{back}\"");
+        }
+        return Err(e);
+      }
+    }
+    Ok((ext, groups))
+  }
+
+  /// Put back an extension the trash kept in `from`, saved as `ext`, and add
+  /// it again to those of `groups` that still exist. Returns the groups it
+  /// rejoined, their edit time set to `now`.
+  pub fn restore_from_trash(
+    &self,
+    ext: &Extension,
+    from: &Path,
+    groups: &[String],
+    now: u64,
+  ) -> Result<Vec<ExtensionGroup>, Box<dyn std::error::Error>> {
+    if !is_plain_path_part(&ext.id) {
+      return Err(err_code("EXTENSION_NOT_FOUND"));
+    }
+    let ext_dir = self.get_extension_dir(&ext.id);
+    if ext_dir.exists() {
+      // A registered extension would have been refused by the caller, so
+      // this folder holds no metadata and is leftover garbage.
+      log::warn!("Removing stale folder before restore extension={}", ext.id);
+      fs::remove_dir_all(&ext_dir)?;
+    }
+    if from.is_dir() {
+      crate::profile::trash::move_dir(from, &ext_dir)?;
+    }
+    self.update_extension_internal(ext)?;
+
+    let mut data = self.load_groups_data()?;
+    let mut rejoined = Vec::new();
+    for group in data
+      .groups
+      .iter_mut()
+      .filter(|group| groups.contains(&group.id))
+    {
+      if !group.extension_ids.contains(&ext.id) {
+        group.extension_ids.push(ext.id.clone());
+        group.updated_at = now;
+        rejoined.push(group.clone());
+      }
+    }
+    if !rejoined.is_empty() {
+      self.save_groups_data(&data)?;
+    }
+    Ok(rejoined)
   }
 
   // Compatibility validation
@@ -1505,16 +1845,15 @@ impl ExtensionManager {
           let linked_path = PathBuf::from(linked);
           if !linked_path.join("manifest.json").exists() {
             log::warn!(
-              "Skipping linked extension '{}': {} is no longer an extension folder",
-              ext.name,
-              linked
+              "Linked extension skipped: folder has no manifest.json extension={} path=\"{linked}\"",
+              ext.id
             );
             continue;
           }
           if !path_is_load_extension_safe(&linked_path) {
             log::warn!(
-              "Skipping linked extension '{}': path contains a comma, which --load-extension cannot express",
-              ext.name
+              "Linked extension skipped: path has a comma --load-extension cannot express extension={}",
+              ext.id
             );
             continue;
           }
@@ -1525,15 +1864,34 @@ impl ExtensionManager {
         let src_file = self.get_file_dir(ext_id).join(&ext.file_name);
         if src_file.exists() {
           let unpack_dir = unpacked_base.join(ext_id);
-          fs::create_dir_all(&unpack_dir)?;
-
-          // Extract .crx or .zip
-          match Self::unpack_extension(&src_file, &unpack_dir) {
+          // The archive is unpacked once per version; a launch links the
+          // files into its own staging folder. When the kept copy cannot be
+          // used (on Windows a running browser can hold its old files), the
+          // launch unpacks into its staging folder as before.
+          let staged = Self::unpacked_tree(ext_id, &src_file)
+            .and_then(|tree| stage_tree(&tree, &unpack_dir).map_err(Into::into))
+            .or_else(|e| {
+              log::debug!(
+                "Unpacked extension copy unusable, unpacking for this launch extension={} err=\"{e}\"",
+                ext.id
+              );
+              let _ = fs::remove_dir_all(&unpack_dir);
+              fs::create_dir_all(&unpack_dir)?;
+              Self::unpack_extension(&src_file, &unpack_dir)
+            });
+          match staged {
             Ok(()) => {
+              give_portable_id(
+                &unpack_dir,
+                &profile.id.to_string(),
+                ext_id,
+                _profile_data_path,
+              );
               extension_paths.push(unpack_dir.to_string_lossy().to_string());
             }
             Err(e) => {
-              log::warn!("Failed to unpack extension '{}': {}", ext.name, e);
+              let _ = fs::remove_dir_all(&unpack_dir);
+              log::warn!("Extension unpack failed extension={} err=\"{e}\"", ext.id);
             }
           }
         }
@@ -1554,7 +1912,7 @@ impl ExtensionManager {
     let dir = Self::unpacked_dir_for_profile(profile_id);
     if dir.exists() {
       if let Err(e) = fs::remove_dir_all(&dir) {
-        log::warn!("Failed to clean staged extensions for profile {profile_id}: {e}");
+        log::warn!("Staged extension cleanup failed profile={profile_id} err=\"{e}\"");
       }
     }
   }
@@ -1562,6 +1920,10 @@ impl ExtensionManager {
   /// Drop every profile's staged copy of one extension, so deleting it does not
   /// leave its code behind until some later launch happens to wipe the folder.
   fn cleanup_staged_copies(&self, ext_id: &str) {
+    let cache = unpacked_cache_dir(ext_id);
+    if is_plain_path_part(ext_id) && cache.exists() {
+      let _ = fs::remove_dir_all(&cache);
+    }
     let base = extensions_base_dir().join("unpacked");
     let Ok(entries) = fs::read_dir(&base) else {
       return;
@@ -1572,6 +1934,37 @@ impl ExtensionManager {
         let _ = fs::remove_dir_all(&staged);
       }
     }
+  }
+
+  /// The unpacked files of `src`, the stored archive of `ext_id`. They are
+  /// unpacked again only when the archive changed since the last unpack.
+  fn unpacked_tree(ext_id: &str, src: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let cache = unpacked_cache_dir(ext_id);
+    let tree = cache.join("tree");
+    let source_path = cache.join("source");
+    let stamp = file_stamp(src);
+    if let Some(stamp) = &stamp {
+      if tree.is_dir() && fs::read_to_string(&source_path).ok().as_ref() == Some(stamp) {
+        return Ok(tree);
+      }
+    }
+    // Staged copies of running browsers keep their own links to the old
+    // files, so the old tree can go.
+    if cache.exists() {
+      fs::remove_dir_all(&cache)?;
+    }
+    let partial = cache.join("tree.partial");
+    fs::create_dir_all(&partial)?;
+    if let Err(e) = Self::unpack_extension(src, &partial) {
+      let _ = fs::remove_dir_all(&cache);
+      return Err(e);
+    }
+    fs::rename(&partial, &tree)?;
+    // Written last, so a tree that was not finished never counts as current.
+    if let Some(stamp) = stamp {
+      fs::write(&source_path, stamp)?;
+    }
+    Ok(tree)
   }
 
   fn unpack_extension(
@@ -1593,7 +1986,7 @@ impl ExtensionManager {
     };
     for i in 0..archive.len() {
       let mut file = archive.by_index(i)?;
-      let out_path = dest.join(file.mangled_name());
+      let out_path = dest.join(file.mangled_name()?);
 
       if file.is_dir() {
         fs::create_dir_all(&out_path)?;
@@ -1618,6 +2011,10 @@ impl ExtensionManager {
   /// Backfill icons and manifest metadata for extensions stored before either
   /// existed, and repair records holding an unresolved `__MSG_key__`
   /// placeholder where a name or description should be.
+  ///
+  /// It runs at every start, so an extension whose archive (or linked
+  /// manifest) was already read in full is skipped: its stamp in
+  /// `.backfill-stamp` still matches and its record holds no placeholder.
   pub fn ensure_icons_extracted(&self) {
     let extensions = match self.list_extensions() {
       Ok(exts) => exts,
@@ -1625,68 +2022,92 @@ impl ExtensionManager {
     };
 
     for ext in extensions {
-      let has_icon = self
-        .get_extension_dir(&ext.id)
-        .read_dir()
-        .map(|entries| {
-          entries
-            .filter_map(|e| e.ok())
-            .any(|e| e.file_name().to_string_lossy().starts_with("icon."))
-        })
-        .unwrap_or(false);
-
-      // A linked extension has no stored payload; everything comes from the
-      // folder it is loaded from, which may since have moved.
-      if let Some(linked) = &ext.linked_path {
-        let linked_dir = PathBuf::from(linked);
-        let Some(manifest) = read_manifest_from_dir(&linked_dir) else {
-          continue;
-        };
-        if !has_icon {
-          if let Some((icon_data, icon_ext)) = extract_icon_from_dir(&linked_dir, &manifest) {
-            self.write_icon(&ext.id, &icon_data, &icon_ext);
-          }
-        }
-        let metadata = manifest_metadata(&manifest, &ManifestSource::Dir(&linked_dir));
-        self.backfill_metadata(&ext, metadata);
-        continue;
-      }
-
-      let file_path = self.get_file_dir(&ext.id).join(&ext.file_name);
-      let Ok(file_data) = fs::read(&file_path) else {
-        continue;
+      let source = match &ext.linked_path {
+        Some(linked) => PathBuf::from(linked).join("manifest.json"),
+        None => self.get_file_dir(&ext.id).join(&ext.file_name),
       };
-
-      if !has_icon {
-        if let Some((icon_data, icon_ext)) = extract_icon_from_archive(&file_data, &ext.file_type) {
-          self.write_icon(&ext.id, &icon_data, &icon_ext);
+      let stamp = file_stamp(&source).map(|stamp| format!("{BACKFILL_VERSION}:{stamp}"));
+      let stamp_path = self.get_extension_dir(&ext.id).join(BACKFILL_STAMP_FILE);
+      let holds_placeholder = is_message_placeholder(&ext.name)
+        || ext
+          .description
+          .as_deref()
+          .is_some_and(is_message_placeholder);
+      if stamp.is_some() && !holds_placeholder && fs::read_to_string(&stamp_path).ok() == stamp {
+        continue;
+      }
+      if self.backfill_extension(&ext) {
+        if let Some(stamp) = stamp {
+          let _ = fs::write(&stamp_path, stamp);
         }
       }
-
-      let metadata = extract_manifest_metadata(&file_data, &ext.file_type);
-      self.backfill_metadata(&ext, metadata);
     }
+  }
+
+  /// Read one extension's icon and metadata from its source. Returns whether
+  /// everything it found was saved.
+  fn backfill_extension(&self, ext: &Extension) -> bool {
+    let has_icon = self
+      .get_extension_dir(&ext.id)
+      .read_dir()
+      .map(|entries| {
+        entries
+          .filter_map(|e| e.ok())
+          .any(|e| e.file_name().to_string_lossy().starts_with("icon."))
+      })
+      .unwrap_or(false);
+
+    // A linked extension has no stored payload; everything comes from the
+    // folder it is loaded from, which may since have moved.
+    if let Some(linked) = &ext.linked_path {
+      let linked_dir = PathBuf::from(linked);
+      let Some(manifest) = read_manifest_from_dir(&linked_dir) else {
+        return false;
+      };
+      let mut saved = true;
+      if !has_icon {
+        if let Some((icon_data, icon_ext)) = extract_icon_from_dir(&linked_dir, &manifest) {
+          saved = self.write_icon(&ext.id, &icon_data, &icon_ext);
+        }
+      }
+      let metadata = manifest_metadata(&manifest, &ManifestSource::Dir(&linked_dir));
+      return self.backfill_metadata(ext, metadata) && saved;
+    }
+
+    let file_path = self.get_file_dir(&ext.id).join(&ext.file_name);
+    let Ok(file_data) = fs::read(&file_path) else {
+      return false;
+    };
+
+    let mut saved = true;
+    if !has_icon {
+      if let Some((icon_data, icon_ext)) = extract_icon_from_archive(&file_data, &ext.file_type) {
+        saved = self.write_icon(&ext.id, &icon_data, &icon_ext);
+      }
+    }
+
+    let metadata = extract_manifest_metadata(&file_data, &ext.file_type);
+    self.backfill_metadata(ext, metadata) && saved
   }
 
   /// Fill in metadata the stored record is missing, and replace any value that
   /// is still a raw localization placeholder. Values the user can see are
-  /// otherwise left alone, so a rename is never undone.
-  fn backfill_metadata(&self, ext: &Extension, metadata: ManifestMetadata) {
-    fn is_placeholder(value: &str) -> bool {
-      crate::vpn_extension_detect::message_placeholder_key(value).is_some()
-    }
+  /// otherwise left alone, so a rename is never undone. Returns whether the
+  /// record is saved: false only when a needed write failed.
+  fn backfill_metadata(&self, ext: &Extension, metadata: ManifestMetadata) -> bool {
     fn needs(current: &Option<String>) -> bool {
-      current.as_deref().is_none_or(is_placeholder)
+      current.as_deref().is_none_or(is_message_placeholder)
     }
 
     let (manifest_name, version, description, author, homepage_url) = metadata;
     let mut updated = ext.clone();
-    let mut changed = false;
+    let mut changed = updated.manifest_name != manifest_name;
+    updated.manifest_name = manifest_name.clone();
 
     // The name is user-editable, so it is only touched when what is stored is
     // an unresolved placeholder.
     if let Some(n) = manifest_name {
-      if is_placeholder(&ext.name) && !n.trim().is_empty() {
+      if is_message_placeholder(&ext.name) && !n.trim().is_empty() {
         updated.name = n;
         changed = true;
       }
@@ -1717,17 +2138,22 @@ impl ExtensionManager {
     }
 
     // A stored placeholder with no resolvable message is worse than nothing.
-    if updated.description.as_deref().is_some_and(is_placeholder) {
+    if updated
+      .description
+      .as_deref()
+      .is_some_and(is_message_placeholder)
+    {
       updated.description = None;
       changed = true;
     }
 
-    if changed {
-      let metadata_path = self.get_metadata_path(&ext.id);
-      if let Ok(json) = serde_json::to_string_pretty(&updated) {
-        let _ = fs::write(metadata_path, json);
-      }
+    if !changed {
+      return true;
     }
+    let metadata_path = self.get_metadata_path(&ext.id);
+    serde_json::to_string_pretty(&updated)
+      .ok()
+      .is_some_and(|json| fs::write(metadata_path, json).is_ok())
   }
 
   pub fn get_extension_icon(&self, ext_id: &str) -> Option<String> {
@@ -1757,9 +2183,8 @@ impl ExtensionManager {
 }
 
 // Global instance
-lazy_static::lazy_static! {
-  pub static ref EXTENSION_MANAGER: Mutex<ExtensionManager> = Mutex::new(ExtensionManager::new());
-}
+pub static EXTENSION_MANAGER: std::sync::LazyLock<Mutex<ExtensionManager>> =
+  std::sync::LazyLock::new(|| Mutex::new(ExtensionManager::new()));
 
 // Tauri commands
 
@@ -1782,11 +2207,18 @@ pub async fn add_extension(
   name: String,
   file_name: String,
   file_data: Vec<u8>,
+  web_store_id: Option<String>,
 ) -> Result<Extension, String> {
   let mgr = EXTENSION_MANAGER.lock().unwrap();
-  mgr
+  let added = mgr
     .add_extension(name, file_name, file_data)
-    .map_err(|e| crate::wrap_backend_error(e, "Failed to add extension"))
+    .map_err(|e| crate::wrap_backend_error(e, "Failed to add extension"))?;
+  match web_store_id {
+    Some(store_id) => mgr
+      .set_web_store_id(&added.id, &store_id)
+      .map_err(|e| crate::wrap_backend_error(e, "Failed to add extension")),
+    None => Ok(added),
+  }
 }
 
 /// Import a folder holding a top-level `manifest.json`. `link` loads it in
@@ -1958,6 +2390,83 @@ pub async fn get_extension_group_for_profile(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn extension_ids_follow_the_browser_derivation() {
+    assert_eq!(
+      extension_id_for_key(b"test"),
+      "jpignaibiiemhngfjkcpokkamffknabf"
+    );
+    assert_eq!(
+      extension_id_for_key(b"_"),
+      "ncocknphbhhlhkikpnnlmbcnbgdempcd"
+    );
+  }
+
+  fn staged_copy(root: &Path, name: &str, manifest: &str) -> PathBuf {
+    let dir = root.join(name);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("manifest.json"), manifest).unwrap();
+    dir
+  }
+
+  fn manifest_key(dir: &Path) -> Option<String> {
+    read_manifest_from_dir(dir)?
+      .get("key")?
+      .as_str()
+      .map(str::to_string)
+  }
+
+  #[test]
+  fn a_staged_copy_gets_one_key_per_profile_on_every_machine() {
+    let machine_a = tempfile::tempdir().unwrap();
+    let machine_b = tempfile::tempdir().unwrap();
+    let manifest = r#"{"name":"x","version":"1","manifest_version":3}"#;
+    let on_a = staged_copy(machine_a.path(), "staged", manifest);
+    let on_b = staged_copy(machine_b.path(), "elsewhere/staged", manifest);
+    let other_profile = staged_copy(machine_a.path(), "other", manifest);
+    let data = tempfile::tempdir().unwrap();
+
+    give_portable_id(&on_a, "profile-1", "ext-1", data.path());
+    give_portable_id(&on_b, "profile-1", "ext-1", data.path());
+    give_portable_id(&other_profile, "profile-2", "ext-1", data.path());
+
+    let key = manifest_key(&on_a).expect("a key is written");
+    assert_eq!(Some(key.clone()), manifest_key(&on_b));
+    assert_ne!(Some(key), manifest_key(&other_profile));
+  }
+
+  #[test]
+  fn a_manifest_key_and_recorded_extension_state_are_kept() {
+    let root = tempfile::tempdir().unwrap();
+    let keyed = staged_copy(
+      root.path(),
+      "keyed",
+      r#"{"name":"x","version":"1","manifest_version":3,"key":"AAAA"}"#,
+    );
+    let data = tempfile::tempdir().unwrap();
+    give_portable_id(&keyed, "profile-1", "ext-1", data.path());
+    assert_eq!(manifest_key(&keyed).as_deref(), Some("AAAA"));
+
+    let used = staged_copy(
+      root.path(),
+      "used",
+      r#"{"name":"x","version":"1","manifest_version":3}"#,
+    );
+    fs::create_dir_all(data.path().join("Default")).unwrap();
+    let prefs = serde_json::json!({
+      "extensions": {"settings": {"abcdefghijklmnopabcdefghijklmnop": {
+        "path": used.to_string_lossy(),
+      }}}
+    });
+    fs::write(
+      data.path().join("Default").join("Preferences"),
+      prefs.to_string(),
+    )
+    .unwrap();
+    give_portable_id(&used, "profile-1", "ext-2", data.path());
+    assert_eq!(manifest_key(&used), None, "the recorded path id stays");
+  }
 
   #[test]
   fn test_get_file_type() {
@@ -2178,13 +2687,68 @@ mod tests {
   }
 
   #[test]
+  fn a_launch_unpacks_an_archive_once_per_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = crate::app_dirs::set_test_data_dir(tmp.path().to_path_buf());
+
+    let mgr = ExtensionManager::new();
+    let source = write_unpacked_fixture(&tmp.path().join("source-extension"), "Cached");
+    let ext = mgr
+      .add_unpacked_extension("Ignored".to_string(), &source, false)
+      .unwrap();
+    let group = mgr.create_group("Cached Group".to_string()).unwrap();
+    mgr.add_extension_to_group(&group.id, &ext.id).unwrap();
+    let profile = profile_with_group("Cached", &group.id);
+
+    let staged = mgr
+      .install_extensions_for_profile(&profile, Path::new(""))
+      .unwrap();
+    let tree = unpacked_cache_dir(&ext.id).join("tree");
+    assert!(tree.join("background.js").is_file());
+
+    // The launch rewrites its own manifest, never the cached one.
+    assert!(manifest_key(Path::new(&staged[0])).is_some());
+    assert!(manifest_key(&tree).is_none());
+
+    // A second launch takes the cached files instead of unpacking again.
+    fs::write(tree.join("marker.txt"), "cached").unwrap();
+    let again = mgr
+      .install_extensions_for_profile(&profile, Path::new(""))
+      .unwrap();
+    assert_eq!(again, staged);
+    assert_eq!(
+      fs::read_to_string(Path::new(&again[0]).join("marker.txt")).unwrap(),
+      "cached"
+    );
+
+    // A new archive is unpacked again.
+    fs::write(source.join("content.js"), "globalThis.__v2 = true;\n").unwrap();
+    mgr
+      .update_extension_from_path(&ext.id, None, &source, false)
+      .unwrap();
+    let updated = mgr
+      .install_extensions_for_profile(&profile, Path::new(""))
+      .unwrap();
+    assert!(!Path::new(&updated[0]).join("marker.txt").exists());
+    assert!(Path::new(&updated[0]).join("content.js").is_file());
+
+    // Deleting the extension drops its cached files.
+    mgr.delete_extension_internal(&ext.id).unwrap();
+    assert!(!unpacked_cache_dir(&ext.id).exists());
+  }
+
+  #[test]
   fn test_linked_extension_is_loaded_in_place() {
     let tmp = tempfile::tempdir().unwrap();
     let _guard = crate::app_dirs::set_test_data_dir(tmp.path().to_path_buf());
 
     let mgr = ExtensionManager::new();
     let source = write_unpacked_fixture(&tmp.path().join("linked-extension"), "Linked Fixture");
-    let canonical = source.canonicalize().unwrap().to_string_lossy().to_string();
+    let canonical = dunce::canonicalize(&source)
+      .unwrap()
+      .to_string_lossy()
+      .to_string();
+    assert!(!canonical.starts_with(r"\\?\"), "{canonical}");
     let ext = mgr
       .add_unpacked_extension("Ignored".to_string(), &source, true)
       .unwrap();
@@ -2271,7 +2835,7 @@ mod tests {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
       let mut writer = zip::ZipWriter::new(&mut buffer);
-      let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+      let options: zip::write::SimpleFileOptions = zip::write::FileOptions::default();
       let manifest = serde_json::json!({
         "manifest_version": 3,
         "name": "__MSG_extName__",
@@ -2310,11 +2874,87 @@ mod tests {
       .unwrap();
 
     assert_eq!(ext.name, "uBlock Origin Lite");
+    assert_eq!(ext.manifest_name.as_deref(), Some("uBlock Origin Lite"));
     assert_eq!(
       ext.description.as_deref(),
       Some("An efficient content blocker.")
     );
     assert_eq!(ext.version.as_deref(), Some("1.2.3"));
+  }
+
+  #[test]
+  fn manifest_identity_backfill_preserves_an_explicit_name_and_edit_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = crate::app_dirs::set_test_data_dir(tmp.path().to_path_buf());
+    let mgr = ExtensionManager::new();
+    let mut ext = mgr
+      .add_extension(
+        "fallback".to_string(),
+        "ublock.zip".to_string(),
+        localized_extension_zip(),
+      )
+      .unwrap();
+    ext.name = "My blocker".to_string();
+    ext.manifest_name = None;
+    mgr.update_extension_internal(&ext).unwrap();
+    mgr.ensure_icons_extracted();
+    let restored = mgr.get_extension(&ext.id).unwrap();
+    assert_eq!(restored.name, "My blocker");
+    assert_eq!(
+      restored.manifest_name.as_deref(),
+      Some("uBlock Origin Lite")
+    );
+    assert_eq!(restored.updated_at, ext.updated_at);
+  }
+
+  #[test]
+  fn ids_and_file_names_from_sync_or_rest_cannot_leave_the_extension_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = crate::app_dirs::set_test_data_dir(tmp.path().to_path_buf());
+    let mgr = ExtensionManager::new();
+    let ext = mgr
+      .add_extension(
+        "fallback".to_string(),
+        "ublock.zip".to_string(),
+        localized_extension_zip(),
+      )
+      .unwrap();
+    let canary = tmp.path().join("canary.txt");
+    std::fs::write(&canary, "still here").unwrap();
+
+    // What a crafted sync object would upsert.
+    for (id, file_name) in [
+      ("..", "ublock.zip"),
+      ("../..", "ublock.zip"),
+      (ext.id.as_str(), "../../../escaped.zip"),
+      (ext.id.as_str(), "/tmp/escaped.zip"),
+      (ext.id.as_str(), ".."),
+    ] {
+      let mut crafted = ext.clone();
+      crafted.id = id.to_string();
+      crafted.file_name = file_name.to_string();
+      assert!(
+        mgr.update_extension_internal(&crafted).is_err(),
+        "{id} / {file_name}"
+      );
+    }
+
+    // A remote tombstone for `..` must not reach the parent directory.
+    assert!(mgr.get_extension("..").is_err());
+    assert!(mgr.delete_extension_internal("..").is_err());
+    assert!(canary.exists());
+
+    // The REST and UI add paths refuse a file name with path parts too.
+    for file_name in ["../escaped.zip", "nested/ublock.zip"] {
+      assert!(mgr
+        .add_extension(
+          "x".to_string(),
+          file_name.to_string(),
+          localized_extension_zip()
+        )
+        .is_err());
+    }
+    assert!(!tmp.path().join("escaped.zip").exists());
   }
 
   #[test]
@@ -2369,5 +3009,50 @@ mod tests {
     mgr.ensure_icons_extracted();
 
     assert_eq!(mgr.get_extension(&ext.id).unwrap().name, "My Blocker");
+  }
+
+  #[test]
+  fn the_start_up_backfill_reads_each_archive_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = crate::app_dirs::set_test_data_dir(tmp.path().to_path_buf());
+
+    let mgr = ExtensionManager::new();
+    let ext = mgr
+      .add_extension(
+        "fallback".to_string(),
+        "ublock.zip".to_string(),
+        localized_extension_zip(),
+      )
+      .unwrap();
+    mgr.ensure_icons_extracted();
+    let stamp = mgr.get_extension_dir(&ext.id).join(BACKFILL_STAMP_FILE);
+    assert!(stamp.is_file());
+
+    // The archive was read: a later start leaves the record alone.
+    let mut edited = mgr.get_extension(&ext.id).unwrap();
+    edited.version = None;
+    mgr.update_extension_internal(&edited).unwrap();
+    mgr.ensure_icons_extracted();
+    assert_eq!(mgr.get_extension(&ext.id).unwrap().version, None);
+
+    // A placeholder is still repaired.
+    edited.name = "__MSG_extName__".to_string();
+    mgr.update_extension_internal(&edited).unwrap();
+    mgr.ensure_icons_extracted();
+    assert_eq!(
+      mgr.get_extension(&ext.id).unwrap().name,
+      "uBlock Origin Lite"
+    );
+
+    // Without a stamp (a record from an older build) it reads it again.
+    let mut edited = mgr.get_extension(&ext.id).unwrap();
+    edited.version = None;
+    mgr.update_extension_internal(&edited).unwrap();
+    fs::remove_file(&stamp).unwrap();
+    mgr.ensure_icons_extracted();
+    assert_eq!(
+      mgr.get_extension(&ext.id).unwrap().version.as_deref(),
+      Some("1.2.3")
+    );
   }
 }

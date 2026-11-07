@@ -3,8 +3,8 @@
  * Sync E2E Test Harness
  *
  * This script:
- * 1. Downloads and starts MinIO (S3-compatible storage)
- * 2. Builds and starts donut-sync server
+ * 1. Downloads and starts rclone's S3 server (S3-compatible storage)
+ * 2. Builds and starts the donut-sync server
  * 3. Runs the Rust sync e2e tests
  * 4. Cleans up all processes
  *
@@ -12,21 +12,23 @@
  */
 
 import { spawn, execSync } from "child_process";
-import { createWriteStream, existsSync, mkdirSync, chmodSync } from "fs";
-import { mkdir, rm, writeFile } from "fs/promises";
+import { createWriteStream, existsSync } from "fs";
+import { mkdir } from "fs/promises";
 import http from "http";
 import https from "https";
 import os from "os";
 import path from "path";
 import { pipeline } from "stream/promises";
 import { fileURLToPath } from "url";
+import { ensureRclone, serveS3Args } from "./rclone.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, "..");
 const CACHE_DIR = path.join(ROOT_DIR, ".cache", "sync-test");
 
-const MINIO_PORT = 9876;
-const MINIO_CONSOLE_PORT = 9877;
+const S3_PORT = 9876;
+const S3_ACCESS_KEY = "donuttestaccesskey";
+const S3_SECRET_KEY = "donuttestsecretkey";
 const SYNC_PORT = 3456;
 // Must be >= 24 chars and not a known default — the server's validateEnv()
 // rejects short/placeholder tokens and exits at startup otherwise.
@@ -85,108 +87,85 @@ async function downloadFile(url, dest) {
   });
 }
 
-function getMinioUrl() {
-  const platform = os.platform();
-  const arch = os.arch();
-
-  if (platform === "darwin") {
-    if (arch === "arm64") {
-      return "https://dl.min.io/server/minio/release/darwin-arm64/minio";
-    }
-    return "https://dl.min.io/server/minio/release/darwin-amd64/minio";
-  } else if (platform === "linux") {
-    if (arch === "arm64") {
-      return "https://dl.min.io/server/minio/release/linux-arm64/minio";
-    }
-    return "https://dl.min.io/server/minio/release/linux-amd64/minio";
-  } else if (platform === "win32") {
-    return "https://dl.min.io/server/minio/release/windows-amd64/minio.exe";
-  }
-
-  throw new Error(`Unsupported platform: ${platform}-${arch}`);
+function ensureS3Binary() {
+  return ensureRclone(CACHE_DIR, downloadFile, log);
 }
 
-async function ensureMinioBinary() {
-  const isWindows = os.platform() === "win32";
-  const minioBin = path.join(CACHE_DIR, isWindows ? "minio.exe" : "minio");
-
-  if (existsSync(minioBin)) {
-    log("MinIO binary already cached");
-    return minioBin;
-  }
-
-  log("Downloading MinIO binary...");
-  mkdirSync(CACHE_DIR, { recursive: true });
-
-  const url = getMinioUrl();
-  await downloadFile(url, minioBin);
-  if (!isWindows) {
-    chmodSync(minioBin, 0o755);
-  }
-
-  log("MinIO binary downloaded");
-  return minioBin;
-}
-
-async function startMinio(minioBin) {
-  const dataDir = path.join(CACHE_DIR, "minio-data");
+async function startS3(bin) {
+  const dataDir = path.join(CACHE_DIR, "s3-data");
   await mkdir(dataDir, { recursive: true });
 
-  log(`Starting MinIO on port ${MINIO_PORT}...`);
+  log(`Starting rclone serve s3 on port ${S3_PORT}...`);
 
   const proc = spawn(
-    minioBin,
-    ["server", dataDir, "--address", `:${MINIO_PORT}`, "--console-address", `:${MINIO_CONSOLE_PORT}`],
+    bin,
+    serveS3Args({
+      dataDir,
+      address: `127.0.0.1:${S3_PORT}`,
+      accessKey: S3_ACCESS_KEY,
+      secretKey: S3_SECRET_KEY,
+    }),
     {
-      env: {
-        ...process.env,
-        MINIO_ROOT_USER: "minioadmin",
-        MINIO_ROOT_PASSWORD: "minioadmin",
-      },
+      env: { ...process.env },
       stdio: ["ignore", "pipe", "pipe"],
-    }
+    },
   );
 
   processes.push(proc);
 
   proc.stdout.on("data", (data) => {
     if (process.env.VERBOSE) {
-      console.log(`[minio] ${data.toString().trim()}`);
+      console.log(`[s3] ${data.toString().trim()}`);
     }
   });
 
+  let lastStderr = "";
   proc.stderr.on("data", (data) => {
+    lastStderr = data.toString();
     if (process.env.VERBOSE) {
-      console.error(`[minio] ${data.toString().trim()}`);
+      console.error(`[s3] ${lastStderr.trim()}`);
     }
   });
 
   proc.on("error", (err) => {
-    error(`MinIO error: ${err.message}`);
+    error(`rclone error: ${err.message}`);
   });
 
-  await waitForHealth(`http://localhost:${MINIO_PORT}/minio/health/live`, 30000);
-  log("MinIO is ready");
+  // Without this, a server that refuses to start (a busy port, most often)
+  // surfaces as a bare 30s timeout with the reason buried behind VERBOSE.
+  let exitReason = null;
+  proc.on("exit", (code) => {
+    exitReason = `rclone exited with code ${code}: ${lastStderr.trim() || "no output"}`;
+  });
+
+  // No health endpoint: an unauthenticated list is answered once the listener
+  // is up, and any HTTP status proves that much.
+  await waitForListening(
+    `http://127.0.0.1:${S3_PORT}/`,
+    30000,
+    () => exitReason,
+  );
+  log("S3 storage is ready");
 
   return proc;
 }
 
+const SYNC_BINARY = path.join(
+  ROOT_DIR,
+  "donut-sync",
+  "target",
+  "debug",
+  process.platform === "win32" ? "donut-sync.exe" : "donut-sync",
+);
+
 async function buildDonutSync() {
   log("Building donut-sync...");
-  // `nest build` runs incremental tsc, which silently skips emit when
-  // tsconfig.build.tsbuildinfo says nothing changed — even if dist/ was
-  // wiped. Drop the cache so we always produce a fresh dist.
-  const syncDir = path.join(ROOT_DIR, "donut-sync");
-  await rm(path.join(syncDir, "tsconfig.build.tsbuildinfo"), {
-    force: true,
-  });
-  await rm(path.join(syncDir, "dist"), { recursive: true, force: true });
-  execSync("pnpm build", {
-    cwd: syncDir,
+  execSync("cargo build --locked", {
+    cwd: path.join(ROOT_DIR, "donut-sync"),
     stdio: process.env.VERBOSE ? "inherit" : "ignore",
   });
-  if (!existsSync(path.join(syncDir, "dist", "main.js"))) {
-    throw new Error("donut-sync build did not produce dist/main.js");
+  if (!existsSync(SYNC_BINARY)) {
+    throw new Error(`donut-sync build did not produce ${SYNC_BINARY}`);
   }
   log("donut-sync built");
 }
@@ -194,15 +173,16 @@ async function buildDonutSync() {
 async function startDonutSync() {
   log(`Starting donut-sync on port ${SYNC_PORT}...`);
 
-  const proc = spawn("node", ["dist/main.js"], {
-    cwd: path.join(ROOT_DIR, "donut-sync"),
+  // Started outside the project, so no developer .env reaches it.
+  const proc = spawn(SYNC_BINARY, [], {
+    cwd: os.tmpdir(),
     env: {
       ...process.env,
       PORT: String(SYNC_PORT),
       SYNC_TOKEN,
-      S3_ENDPOINT: `http://localhost:${MINIO_PORT}`,
-      S3_ACCESS_KEY_ID: "minioadmin",
-      S3_SECRET_ACCESS_KEY: "minioadmin",
+      S3_ENDPOINT: `http://127.0.0.1:${S3_PORT}`,
+      S3_ACCESS_KEY_ID: S3_ACCESS_KEY,
+      S3_SECRET_ACCESS_KEY: S3_SECRET_KEY,
       S3_BUCKET: "donut-sync-test",
       S3_FORCE_PATH_STYLE: "true",
     },
@@ -248,6 +228,38 @@ async function waitForHealth(url, timeoutMs) {
             }
           })
           .on("error", reject);
+      });
+      return;
+    } catch {
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+
+  throw new Error(`Timeout waiting for ${url}`);
+}
+
+async function waitForListening(url, timeoutMs, failureReason = () => null) {
+  const start = Date.now();
+
+  while (Date.now() - start < timeoutMs) {
+    const reason = failureReason();
+    if (reason) {
+      throw new Error(reason);
+    }
+    try {
+      await new Promise((resolve, reject) => {
+        // A per-attempt timeout matters: something else holding the port can
+        // accept the connection and then never answer, and without this the
+        // loop would wait on that one request forever instead of noticing
+        // that our own server is gone.
+        const req = http.get(url, (res) => {
+          res.resume();
+          resolve();
+        });
+        req.setTimeout(2000, () => {
+          req.destroy(new Error("probe timed out"));
+        });
+        req.on("error", reject);
       });
       return;
     } catch {
@@ -311,8 +323,8 @@ async function main() {
   });
 
   try {
-    const minioBin = await ensureMinioBinary();
-    await startMinio(minioBin);
+    const s3Bin = await ensureS3Binary();
+    await startS3(s3Bin);
     await buildDonutSync();
     await startDonutSync();
 

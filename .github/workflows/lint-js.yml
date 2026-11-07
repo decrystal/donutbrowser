@@ -2,47 +2,44 @@
 
 name: Lint Node.js
 
+# Pull requests reach this through pr-checks.yml and tags through release.yml.
+# Both used to trigger it directly as well, so it ran twice for each of them.
 on:
   workflow_call: {}
   push:
     branches:
       - main
-    tags:
-      - "v*"
-  pull_request:
-    paths-ignore:
-      - "src-tauri/**"
-      - "README.md"
-      - ".github/workflows/lint-rs.yml"
-      - ".github/workflows/osv.yml"
 
 permissions:
   contents: read
 
+concurrency:
+  # A called workflow sees its caller's `github.workflow`, so the literal
+  # prefix keeps this group apart from the caller's own. Only the standalone
+  # push to main cancels a superseded run; Rolling Release runs one at a time.
+  group: lint-js-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
 jobs:
   build:
-    strategy:
-      fail-fast: true
-      matrix:
-        os: [macos-latest]
-
-    runs-on: ${{ matrix.os }}
+    # biome and tsrs do not depend on the host. Linux starts faster than macOS
+    # and leaves the five-runner macOS pool to the Rust and release builds.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
-      - name: Disable git core.autocrlf on Windows
-        if: matrix.os == 'windows-latest'
-        run: git config --global core.autocrlf false
-
       - name: Checkout repository code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up pnpm package manager
-        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 #v6.0.10
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 #v6.1.1
         with:
           run_install: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 #v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 #v7.1.0
         with:
           node-version-file: .node-version
           cache: "pnpm"

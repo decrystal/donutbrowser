@@ -31,17 +31,72 @@ env:
   IMAGE_NAME: donutbrowser/donut-sync
 
 jobs:
-  build-and-push:
+  # donut-sync's own end-to-end suite covers which host it signs into presigned
+  # URLs. That is the whole of the self-hosted sync failure in issue 534: sign
+  # against an address only the server can reach and every client transfer dies
+  # at connect while /health and /readyz stay green. Run it here, before the
+  # image ships, because an image with broken presigning is the thing that
+  # reaches users.
+  #
+  # Ubuntu only: it needs Docker for the S3 test server.
+  test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ./donut-sync
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 #master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 #v2.9.3
+        with:
+          workspaces: "donut-sync -> target"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings -D clippy::all
+
+      # Publishes the S3 test server on 8987, the port the tests use.
+      - name: Start test storage
+        run: docker compose -f docker-compose.yml up -d --wait
+
+      - name: Run donut-sync tests
+        run: cargo test --locked
+
+      - name: Stop test storage
+        if: always()
+        run: docker compose -f docker-compose.yml down -v
+
+  build-and-push:
+    needs: test
+    # Forks have no Docker Hub credentials; skip instead of failing there.
+    if: github.repository == 'donutbrowser/donutbrowser'
+    runs-on: ubuntu-latest
+    # Both images are cross-compiled on the runner's own architecture, so
+    # nothing is emulated. The bound keeps a stuck build from burning hours.
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c #v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 #v4.4.1
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f #v4.6.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 #v4.8.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -73,9 +128,9 @@ jobs:
           printf 'tags=%s\n' "$TAGS" >> "$GITHUB_OUTPUT"
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a #v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc #v7.4.0
         with:
-          context: .
+          context: ./donut-sync
           file: ./donut-sync/Dockerfile
           push: true
           tags: ${{ steps.tags.outputs.tags }}

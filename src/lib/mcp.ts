@@ -1,0 +1,82 @@
+/** Where an agent points to drive this browser through Donut cloud. */
+export const REMOTE_MCP_URL = "https://api.donutbrowser.com/api/mcp";
+
+/**
+ * fx refuses a literal Authorization header in its config and reads the
+ * bearer token from this variable instead, so its install cannot carry the
+ * credential and the user has to export it themselves.
+ */
+export const FX_TOKEN_ENV = "DONUT_MCP_TOKEN";
+export const FX_AGENT_ID = "fx";
+
+/** The line that hands fx the credential, or null while there is none. */
+export function fxExportLine(key: string | null | undefined): string | null {
+  return key ? `export ${FX_TOKEN_ENV}=${key}` : null;
+}
+
+export type AgentCategory = "desktop-app" | "cli" | "editor" | "editor-ext";
+
+/**
+ * The tool groups an agent can list besides the core tools, in display
+ * order. The backend checks every name; `["core"]` is the core tools only and
+ * an empty list is every tool.
+ */
+export const OPTIONAL_TOOLSETS = [
+  "organize",
+  "network",
+  "traffic",
+  "fingerprint",
+  "extensions",
+  "cookies",
+  "sync",
+  "remote",
+  "recipes",
+] as const;
+export const CORE_TOOLSET = "core";
+
+export interface McpAgentInfo {
+  id: string;
+  display_name: string;
+  category: AgentCategory;
+  connected: boolean;
+  /** The entry presents the stored key; a connected client that is not
+   * current holds an older one. */
+  current: boolean;
+  detected: boolean;
+}
+
+export interface McpRemoteStatus {
+  enabled: boolean;
+  connected: boolean;
+  instanceId: string;
+  lastError: string | null;
+}
+
+/**
+ * Only the prefix leaves the backend; the plaintext is installed into agent
+ * configs by the app itself. Both spellings are read because the spec writes
+ * the Rust field as `token_prefix` while the sibling status struct serialises
+ * camelCase, and a mismatch here would silently render a present credential
+ * as missing.
+ */
+export interface McpRemoteCredential {
+  present: boolean;
+  tokenPrefix?: string | null;
+  token_prefix?: string | null;
+}
+
+/**
+ * What a rotation answers. The key is stored and installed by the time this
+ * arrives; `failed_clients` are the ids of the clients whose config could not
+ * be rewritten, for the user to retry, never a reason to mint again.
+ */
+export interface McpRemoteCredentialRotation
+  extends Pick<McpRemoteCredential, "tokenPrefix" | "token_prefix"> {
+  failed_clients?: string[];
+}
+
+export function credentialPrefixOf(
+  credential: Pick<McpRemoteCredential, "tokenPrefix" | "token_prefix"> | null,
+): string | null {
+  return credential?.tokenPrefix ?? credential?.token_prefix ?? null;
+}

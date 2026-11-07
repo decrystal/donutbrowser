@@ -1,0 +1,382 @@
+//! Runs the real binary against the S3 test server of
+//! `donut-sync/docker-compose.yml` (rclone on port 8987).
+//!
+//! The at-rest suite can run against a real S3 store instead, to check what
+//! it relies on there (versions, conditional copies): set
+//! `DONUT_SYNC_TEST_S3_ENDPOINT`, `_REGION`, `_ACCESS_KEY_ID`,
+//! `_SECRET_ACCESS_KEY` and `_BUCKET` (a scratch bucket each test empties
+//! first, so run with `--test-threads=1`).
+
+#![allow(dead_code)]
+
+use std::io::{BufRead, BufReader};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use donut_sync::s3::{Location, S3Store};
+use donut_sync::sigv4::Credentials;
+use donut_sync::store::{Store, StoreError};
+
+pub const S3_ENDPOINT: &str = "http://127.0.0.1:8987";
+pub const SYNC_TOKEN: &str = "test-sync-token-0123456789abcdef";
+
+/// Where the at-rest suite's storage is: the compose server, or what the
+/// `DONUT_SYNC_TEST_S3_*` variables name.
+pub struct Storage {
+  pub endpoint: String,
+  pub region: String,
+  pub access_key_id: String,
+  pub secret_access_key: String,
+  /// One bucket for every test, emptied before each.
+  pub bucket: Option<String>,
+}
+
+pub fn storage() -> Storage {
+  let var = |name: &str, default: &str| {
+    std::env::var(format!("DONUT_SYNC_TEST_S3_{name}"))
+      .ok()
+      .filter(|v| !v.is_empty())
+      .unwrap_or_else(|| default.to_string())
+  };
+  Storage {
+    endpoint: var("ENDPOINT", S3_ENDPOINT),
+    region: var("REGION", "us-east-1"),
+    access_key_id: var("ACCESS_KEY_ID", "minioadmin"),
+    secret_access_key: var("SECRET_ACCESS_KEY", "minioadmin"),
+    bucket: std::env::var("DONUT_SYNC_TEST_S3_BUCKET")
+      .ok()
+      .filter(|v| !v.is_empty()),
+  }
+}
+
+/// The test storage, without the server: what is really stored.
+pub fn raw_store(bucket: &str) -> S3Store {
+  let storage = storage();
+  S3Store::new(
+    Location::parse(&storage.endpoint, bucket, true).unwrap(),
+    Credentials {
+      access_key_id: storage.access_key_id,
+      secret_access_key: storage.secret_access_key,
+    },
+    storage.region,
+  )
+}
+
+/// The storage settings the server takes, for a command run to its exit.
+pub fn storage_env(bucket: &str) -> Vec<(&'static str, String)> {
+  let storage = storage();
+  vec![
+    ("S3_ENDPOINT", storage.endpoint),
+    ("S3_REGION", storage.region),
+    ("S3_ACCESS_KEY_ID", storage.access_key_id),
+    ("S3_SECRET_ACCESS_KEY", storage.secret_access_key),
+    ("S3_BUCKET", bucket.to_string()),
+    ("S3_FORCE_PATH_STYLE", "true".to_string()),
+  ]
+}
+
+/// A bucket of the test's own, or the fixed one, emptied of every version
+/// and unfinished upload.
+pub async fn fresh_bucket(name: &str) -> String {
+  let Some(fixed) = storage().bucket else {
+    return bucket(name);
+  };
+  let raw = raw_store(&fixed);
+  loop {
+    let Some(page) = raw.list_versions("", None).await.unwrap() else {
+      break;
+    };
+    if page.versions.is_empty() {
+      break;
+    }
+    for version in page.versions {
+      raw
+        .delete_version(&version.key, &version.version_id)
+        .await
+        .unwrap();
+    }
+  }
+  for upload in raw.list_multipart("").await.unwrap_or_default() {
+    let _ = raw.abort_multipart(&upload.key, &upload.upload_id).await;
+  }
+  fixed
+}
+
+/// Tries per request to storage (presigned URLs, and the server's transfer
+/// URLs in front of it). Storage answers the odd 500 (rclone does, as S3
+/// does), and S3 clients try such a request again; so do the tests.
+const STORAGE_ATTEMPTS: u32 = 3;
+
+pub trait StorageRequest {
+  /// Sends the request, again on a 5xx or a dropped connection, at most
+  /// `STORAGE_ATTEMPTS` times. A streamed body cannot be sent twice and goes
+  /// once.
+  fn send_to_storage(self) -> impl std::future::Future<Output = reqwest::Response> + Send;
+}
+
+impl StorageRequest for reqwest::RequestBuilder {
+  async fn send_to_storage(self) -> reqwest::Response {
+    let mut attempt = 1;
+    loop {
+      let Some(request) = self.try_clone() else {
+        return self.send().await.unwrap();
+      };
+      match request.send().await {
+        Ok(response) if !response.status().is_server_error() => return response,
+        Ok(response) if attempt >= STORAGE_ATTEMPTS => return response,
+        Err(e) if attempt >= STORAGE_ATTEMPTS => panic!("storage unreachable: {e}"),
+        _ => {}
+      }
+      tokio::time::sleep(Duration::from_millis(200 * u64::from(attempt))).await;
+      attempt += 1;
+    }
+  }
+}
+
+pub fn http() -> reqwest::Client {
+  let _ = rustls::crypto::ring::default_provider().install_default();
+  reqwest::Client::builder().no_proxy().build().unwrap()
+}
+
+/// Waits for the S3 test server, or fails with how to start it.
+pub async fn wait_for_s3() {
+  let store = raw_store(
+    &storage()
+      .bucket
+      .unwrap_or_else(|| "probe-availability".to_string()),
+  );
+  let deadline = Instant::now() + Duration::from_secs(30);
+  loop {
+    match store.head_bucket().await {
+      Ok(()) | Err(StoreError::NotFound) => return,
+      Err(_) if Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(500)).await,
+      Err(e) => panic!(
+        "No S3 test server at {S3_ENDPOINT} ({e}). Start it: docker compose -f donut-sync/docker-compose.yml up -d --wait"
+      ),
+    }
+  }
+}
+
+fn free_port() -> u16 {
+  std::net::TcpListener::bind("127.0.0.1:0")
+    .unwrap()
+    .local_addr()
+    .unwrap()
+    .port()
+}
+
+pub struct Server {
+  pub url: String,
+  child: Child,
+  output: Arc<Mutex<String>>,
+}
+
+impl Server {
+  /// The binary with the test storage, a long shared token and a fresh
+  /// bucket, plus `overrides` (`None` removes a variable).
+  pub async fn start(bucket: &str, overrides: &[(&str, Option<&str>)]) -> Server {
+    wait_for_s3().await;
+    let port = free_port();
+    let mut env: Vec<(String, String)> = vec![
+      ("SYNC_TOKEN".into(), SYNC_TOKEN.into()),
+      ("S3_ENDPOINT".into(), storage().endpoint),
+      ("S3_REGION".into(), storage().region),
+      ("S3_ACCESS_KEY_ID".into(), storage().access_key_id),
+      ("S3_SECRET_ACCESS_KEY".into(), storage().secret_access_key),
+      ("S3_BUCKET".into(), bucket.into()),
+      ("S3_FORCE_PATH_STYLE".into(), "true".into()),
+      ("PORT".into(), port.to_string()),
+    ];
+    for (name, value) in overrides {
+      env.retain(|(n, _)| n != name);
+      if let Some(value) = value {
+        env.push((name.to_string(), value.to_string()));
+      }
+    }
+    let output = Arc::new(Mutex::new(String::new()));
+    let mut child = spawn(&[], &env);
+    collect(&mut child, &output);
+    let url = format!("http://127.0.0.1:{port}");
+    let client = http();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+      if let Ok(response) = client.get(format!("{url}/health")).send().await
+        && response.status().is_success()
+      {
+        break;
+      }
+      if let Ok(Some(status)) = child.try_wait() {
+        panic!("server exited with {status}: {}", output.lock().unwrap());
+      }
+      assert!(
+        Instant::now() < deadline,
+        "server did not start: {}",
+        output.lock().unwrap()
+      );
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Server { url, child, output }
+  }
+
+  pub fn logs(&self) -> String {
+    self.output.lock().unwrap().clone()
+  }
+}
+
+impl Drop for Server {
+  fn drop(&mut self) {
+    let _ = self.child.kill();
+    let _ = self.child.wait();
+  }
+}
+
+fn spawn(args: &[&str], env: &[(String, String)]) -> Child {
+  // A directory without a `.env`, so a developer's file cannot leak in.
+  let dir = std::env::temp_dir().join("donut-sync-test-cwd");
+  std::fs::create_dir_all(&dir).unwrap();
+  Command::new(env!("CARGO_BIN_EXE_donut-sync"))
+    .args(args)
+    .env_clear()
+    .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+    .current_dir(dir)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap()
+}
+
+fn collect(child: &mut Child, output: &Arc<Mutex<String>>) {
+  let stdout = child.stdout.take().unwrap();
+  let stderr = child.stderr.take().unwrap();
+  for stream in [
+    Box::new(stdout) as Box<dyn std::io::Read + Send>,
+    Box::new(stderr),
+  ] {
+    let output = output.clone();
+    std::thread::spawn(move || {
+      for line in BufReader::new(stream).lines().map_while(Result::ok) {
+        let mut out = output.lock().unwrap();
+        out.push_str(&line);
+        out.push('\n');
+      }
+    });
+  }
+}
+
+/// Runs the binary to its exit (a refused configuration) and returns the
+/// exit code and what it printed.
+pub fn run_to_exit(env: &[(&str, &str)]) -> (i32, String) {
+  run_command(&[], env)
+}
+
+/// Runs the binary with `args` to its exit.
+pub fn run_command(args: &[&str], env: &[(&str, &str)]) -> (i32, String) {
+  let env: Vec<(String, String)> = env
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+  let child = spawn(args, &env);
+  let out = child.wait_with_output().unwrap();
+  (
+    out.status.code().unwrap_or(-1),
+    format!(
+      "{}{}",
+      String::from_utf8_lossy(&out.stdout),
+      String::from_utf8_lossy(&out.stderr)
+    ),
+  )
+}
+
+/// A bucket name of its own for each test.
+pub fn bucket(name: &str) -> String {
+  format!(
+    "it-{name}-{}",
+    &uuid::Uuid::new_v4().simple().to_string()[..8]
+  )
+}
+
+pub async fn post(
+  client: &reqwest::Client,
+  url: &str,
+  token: Option<&str>,
+  body: serde_json::Value,
+) -> (u16, serde_json::Value) {
+  let mut request = client.post(url).json(&body);
+  if let Some(token) = token {
+    request = request.bearer_auth(token);
+  }
+  let response = request.send().await.unwrap();
+  let status = response.status().as_u16();
+  let text = response.text().await.unwrap();
+  (
+    status,
+    serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)),
+  )
+}
+
+/// A stand-in HTTP service (the Donut API, the backend): answers each POST
+/// with `answer(path, body)` and keeps what it was asked.
+pub struct Mock {
+  pub url: String,
+  pub calls: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+}
+
+impl Mock {
+  pub async fn start(
+    answer: impl Fn(&str, &serde_json::Value) -> (u16, String) + Send + Sync + 'static,
+  ) -> Mock {
+    use http_body_util::{BodyExt, Full};
+    use hyper::body::Bytes;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let calls: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::default();
+    let answer = Arc::new(answer);
+    let recorded = calls.clone();
+    tokio::spawn(async move {
+      loop {
+        let Ok((stream, _)) = listener.accept().await else {
+          return;
+        };
+        let answer = answer.clone();
+        let recorded = recorded.clone();
+        tokio::spawn(async move {
+          let service =
+            hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+              let answer = answer.clone();
+              let recorded = recorded.clone();
+              async move {
+                let path = request.uri().path().to_string();
+                let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                recorded.lock().unwrap().push((path.clone(), body.clone()));
+                let (status, text) = answer(&path, &body);
+                Ok::<_, std::convert::Infallible>(
+                  hyper::Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(text)))
+                    .unwrap(),
+                )
+              }
+            });
+          let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+            .await;
+        });
+      }
+    });
+    Mock { url, calls }
+  }
+
+  pub fn calls_to(&self, path: &str) -> Vec<serde_json::Value> {
+    self
+      .calls
+      .lock()
+      .unwrap()
+      .iter()
+      .filter(|(p, _)| p == path)
+      .map(|(_, b)| b.clone())
+      .collect()
+  }
+}

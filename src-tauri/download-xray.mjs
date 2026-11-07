@@ -14,6 +14,9 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+// Held at 26.3.27. From 26.10.21 Xray-core refuses VLESS without TLS or
+// encryption, and Trojan without TLS, to a public server address, so those
+// share links stop working. Moving up needs the app to reject them first.
 export const XRAY_VERSION = "v26.3.27";
 export const XRAY_SOURCE_URL = `https://github.com/XTLS/Xray-core/tree/${XRAY_VERSION}`;
 export const XRAY_LICENSE_FILE = "xray-LICENSE.txt";

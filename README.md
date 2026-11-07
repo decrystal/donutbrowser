@@ -8,20 +8,50 @@
 <br>
 
 <p align="center">
-  <a style="text-decoration: none;" href="https://github.com/zhom/donutbrowser/releases/latest" target="_blank"><img alt="GitHub release" src="https://img.shields.io/github/v/release/zhom/donutbrowser">
+  <a style="text-decoration: none;" href="https://github.com/donutbrowser/donutbrowser/releases/latest" target="_blank"><img alt="GitHub release" src="https://img.shields.io/github/v/release/donutbrowser/donutbrowser">
   </a>
-  <a style="text-decoration: none;" href="https://github.com/zhom/donutbrowser/issues" target="_blank">
+  <a style="text-decoration: none;" href="https://github.com/donutbrowser/donutbrowser/issues" target="_blank">
     <img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat" alt="PRs Welcome">
   </a>
-  <a style="text-decoration: none;" href="https://github.com/zhom/donutbrowser/blob/main/LICENSE" target="_blank">
+  <a style="text-decoration: none;" href="https://github.com/donutbrowser/donutbrowser/blob/main/LICENSE" target="_blank">
     <img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License">
   </a>
-  <a style="text-decoration: none;" href="https://github.com/zhom/donutbrowser/network/members" target="_blank">
-    <img src="https://img.shields.io/github/forks/zhom/donutbrowser?style=social" alt="GitHub forks">
+  <a style="text-decoration: none;" href="https://github.com/donutbrowser/donutbrowser/network/members" target="_blank">
+    <img src="https://img.shields.io/github/forks/donutbrowser/donutbrowser?style=social" alt="GitHub forks">
   </a>
 </p>
 
-<img alt="Donut Browser Preview" src="assets/donut-preview.png" />
+<p align="center">
+  <img alt="Donut Browser starts three profiles. Each one opens its own browser window with the profile name in the address bar, and shows websites a different device." src="assets/readme/hero.svg" width="100%">
+</p>
+
+<p align="center">
+  Unlimited browser profiles on one computer. Each one shows websites a different device,<br>
+  keeps its own cookies, extensions and proxy, and stays on your machine.
+</p>
+
+## Keep every account separate
+
+Websites link accounts that come from the same device, and then one ban can take all of them. In Donut, each account runs in its own profile with its own fingerprint, cookies and proxy or VPN, so every site sees a different device.
+
+<img alt="In an ordinary browser, four accounts show websites the same device, so they are linked and one ban takes down all four. In Donut Browser, each account shows a different device, so the accounts stay separate." src="assets/readme/linking.svg" width="100%">
+
+The fingerprints come from [Wayfern](https://wayfern.com), a privacy-focused Chromium fork that sets them inside the engine, not with scripts on the page.
+
+## Your data stays on your device
+
+<img alt="Profiles, with their cookies, logins, history and fingerprints, stay on your device. Optional sync sends only data that is encrypted with your password. The app sends no telemetry." src="assets/readme/local.svg" width="100%">
+
+- No account needed: profiles, cookies, logins and history live on your computer.
+- Zero telemetry: the app sends no tracking or analytics.
+- Lock a profile with a password, or make it ephemeral so that nothing is left when it closes.
+- Sync is optional and end-to-end encrypted with a password only you know. Use Donut Sync or [run your own server](https://donutbrowser.com/docs/self-hosting).
+
+## Automate with code or with AI agents
+
+<img alt="Start a profile from the local REST API and connect Playwright to it over CDP, or let your AI agent work with profiles over remote MCP." src="assets/readme/automation.svg" width="100%">
+
+Start any profile from the local REST API on `127.0.0.1:10108`, then connect Playwright, Puppeteer or Selenium to it over CDP. Or connect Claude, Cursor, Codex or another MCP client over remote MCP, and watch what each agent does. Browser automation and remote MCP come with the paid plans. See the [quickstart](https://donutbrowser.com/docs/quickstart), [Playwright with Wayfern](https://donutbrowser.com/docs/wayfern) and [MCP](https://donutbrowser.com/docs/mcp) guides.
 
 ## Features
 
@@ -30,7 +60,7 @@
 - DNS AdBlocker: block ads, trackers, and other unwanted content with per-profile DNS blocking
 - Proxy support: HTTP, HTTPS, SOCKS4, SOCKS5 per profile, with dynamic proxy URLs
 - VPN support: WireGuard configs per profile
-- Local API & MCP: REST API and [Model Context Protocol](https://modelcontextprotocol.io) server for integration with Claude, automation tools, and custom workflows
+- REST API & remote MCP: a local REST API and a remote [Model Context Protocol](https://modelcontextprotocol.io) server for Claude, Cursor, automation tools and custom workflows
 - Profile groups: organize profiles and apply bulk settings
 - Import profiles: migrate from Chrome, Edge, Brave, or other Chromium browsers
 - Cookie & extension management: import/export cookies, manage extensions per profile
@@ -44,9 +74,7 @@
 <!-- install-links-start -->
 ### macOS
 
-| | Apple Silicon | Intel |
-|---|---|---|
-| **DMG** | [Download](https://github.com/zhom/donutbrowser/releases/download/v0.29.5/Donut_0.29.5_aarch64.dmg) | [Download](https://github.com/zhom/donutbrowser/releases/download/v0.29.5/Donut_0.29.5_x64.dmg) |
+[Download DMG (Apple Silicon)](https://github.com/donutbrowser/donutbrowser/releases/download/v0.36.0/Donut_0.36.0_aarch64.dmg)
 
 Or install via Homebrew:
 
@@ -56,15 +84,15 @@ brew install --cask donut
 
 ### Windows
 
-[Download Windows Installer (x64)](https://github.com/zhom/donutbrowser/releases/download/v0.29.5/Donut_0.29.5_x64-setup.exe) · [Portable (x64)](https://github.com/zhom/donutbrowser/releases/download/v0.29.5/Donut_0.29.5_x64-portable.zip)
+[Download Windows Installer (x64)](https://github.com/donutbrowser/donutbrowser/releases/download/v0.36.0/Donut_0.36.0_x64-setup.exe) · [Portable (x64)](https://github.com/donutbrowser/donutbrowser/releases/download/v0.36.0/Donut_0.36.0_x64-portable.zip)
 
 ### Linux
 
 | Format | x86_64 | ARM64 |
 |---|---|---|
-| **deb** | [Download](https://github.com/zhom/donutbrowser/releases/download/v0.29.5/Donut_0.29.5_amd64.deb) | [Download](https://github.com/zhom/donutbrowser/releases/download/v0.29.5/Donut_0.29.5_arm64.deb) |
-| **rpm** | [Download](https://github.com/zhom/donutbrowser/releases/download/v0.29.5/Donut-0.29.5-1.x86_64.rpm) | [Download](https://github.com/zhom/donutbrowser/releases/download/v0.29.5/Donut-0.29.5-1.aarch64.rpm) |
-| **AppImage** | [Download](https://github.com/zhom/donutbrowser/releases/download/v0.29.5/Donut_0.29.5_amd64.AppImage) | [Download](https://github.com/zhom/donutbrowser/releases/download/v0.29.5/Donut_0.29.5_aarch64.AppImage) |
+| **deb** | [Download](https://github.com/donutbrowser/donutbrowser/releases/download/v0.36.0/Donut_0.36.0_amd64.deb) | [Download](https://github.com/donutbrowser/donutbrowser/releases/download/v0.36.0/Donut_0.36.0_arm64.deb) |
+| **rpm** | [Download](https://github.com/donutbrowser/donutbrowser/releases/download/v0.36.0/Donut-0.36.0-1.x86_64.rpm) | [Download](https://github.com/donutbrowser/donutbrowser/releases/download/v0.36.0/Donut-0.36.0-1.aarch64.rpm) |
+| **AppImage** | [Download](https://github.com/donutbrowser/donutbrowser/releases/download/v0.36.0/Donut_0.36.0_amd64.AppImage) | [Download](https://github.com/donutbrowser/donutbrowser/releases/download/v0.36.0/Donut_0.36.0_aarch64.AppImage) |
 <!-- install-links-end -->
 
 Or install via package manager:
@@ -86,10 +114,33 @@ If that gives an EGL display error, add `WEBKIT_DISABLE_DMABUF_RENDERER=1` or `G
 
 </details>
 
+### Flatpak and Snap
+
+Releases include an x86_64 Flatpak bundle and a Snap, built from the `.deb` and tested in their sandboxes by the [Linux Packages](https://github.com/donutbrowser/donutbrowser/actions/workflows/linux-packages.yml) workflow. Download `Donut_*_x86_64.flatpak` or `Donut_*_amd64.snap` from the [releases](https://github.com/donutbrowser/donutbrowser/releases) (the nightly has them already) and install it:
+
+```bash
+flatpak install --user Donut_*_x86_64.flatpak
+sudo snap install --dangerous Donut_*_amd64.snap
+```
+
+The Snap leaves the microphone, the camera and the keyring (used by profile import) disconnected until you run `sudo snap connect donutbrowser:audio-record`, `donutbrowser:camera` or `donutbrowser:password-manager-service`. The Flatpak cannot change the default browser, so choose Donut in your system settings instead.
+
+### Windows portable
+
+The portable version keeps its profiles, logins and settings in the `data` folder next to `Donut.exe`, and updates itself like the installed app. An update does not change `data`, `cache` or `logs`.
+
+Portable copies of v0.35.5 and older cannot update themselves. To update one, quit Donut and run this in PowerShell with the path of your portable folder:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/donutbrowser/donutbrowser/main/scripts/update-portable.ps1))) -Path "D:\Donut-Portable"
+```
+
+Or download [update-portable.ps1](scripts/update-portable.ps1), right-click it and select **Run with PowerShell**. It asks for the folder.
+
 ### Nix
 
 ```bash
-nix run github:zhom/donutbrowser#release-start
+nix run github:donutbrowser/donutbrowser#release-start
 ```
 
 ## Self-Hosting Sync
@@ -101,27 +152,27 @@ Run your own sync server to sync profiles, proxies, and groups across devices fo
 Donut Browser is built by the people who use it, and plenty of the most useful help involves no code at all.
 
 - Tell other people about Donut. Word of mouth is how most users find the project, so talking about it is a real contribution.
-- Report bugs and request features in [GitHub Issues](https://github.com/zhom/donutbrowser/issues).
-- Answer questions in [GitHub Discussions](https://github.com/zhom/donutbrowser/discussions).
+- Report bugs and request features in [GitHub Issues](https://github.com/donutbrowser/donutbrowser/issues).
+- Answer questions in [GitHub Discussions](https://github.com/donutbrowser/donutbrowser/discussions).
 - Fix and improve translations in `src/i18n/locales`.
 - Write code. Start with [CONTRIBUTING.md](CONTRIBUTING.md).
 - Star the repo so more people see it.
 
 ## Star History
 
-<a href="https://gitdebt.com/zhom/donutbrowser?ref=readme">
+<a href="https://gitdebt.com/donutbrowser/donutbrowser?ref=readme">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.gitdebt.com/api/repos/zhom/donutbrowser/chart.svg?theme=dark&animate=1" />
-    <img alt="Cumulative GitHub stars for zhom/donutbrowser over time" src="https://api.gitdebt.com/api/repos/zhom/donutbrowser/chart.svg?theme=light&animate=1" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.gitdebt.com/api/repos/donutbrowser/donutbrowser/chart.svg?theme=dark&animate=1" />
+    <img alt="Cumulative GitHub stars for donutbrowser/donutbrowser over time" src="https://api.gitdebt.com/api/repos/donutbrowser/donutbrowser/chart.svg?theme=light&animate=1" />
   </picture>
 </a>
 
 ## Contributors
 
-<a href="https://gitdebt.com/zhom/donutbrowser?ref=readme">
+<a href="https://gitdebt.com/donutbrowser/donutbrowser?ref=readme">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.gitdebt.com/api/repos/zhom/donutbrowser/stats/contributors.svg?theme=dark&animate=1" />
-    <img alt="Everyone who has landed commits in zhom/donutbrowser, ranked by commit count" src="https://api.gitdebt.com/api/repos/zhom/donutbrowser/stats/contributors.svg?theme=light&animate=1" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.gitdebt.com/api/repos/donutbrowser/donutbrowser/stats/contributors.svg?theme=dark&animate=1" />
+    <img alt="Everyone who has landed commits in donutbrowser/donutbrowser, ranked by commit count" src="https://api.gitdebt.com/api/repos/donutbrowser/donutbrowser/stats/contributors.svg?theme=light&animate=1" />
   </picture>
 </a>
 

@@ -15,12 +15,12 @@ fn set_high_priority() {
       // This may fail without elevated privileges, which is fine
       let result = libc::setpriority(libc::PRIO_PROCESS, 0, -10);
       if result == 0 {
-        log::info!("Set process priority to -10 (high priority)");
+        log::debug!("Process priority set nice=-10");
       } else {
         // Try a less aggressive priority if -10 fails
         let result = libc::setpriority(libc::PRIO_PROCESS, 0, -5);
         if result == 0 {
-          log::info!("Set process priority to -5 (above normal)");
+          log::debug!("Process priority set nice=-5");
         }
       }
     }
@@ -32,9 +32,9 @@ fn set_high_priority() {
     // Valid range is -1000 to 1000, lower = less likely to be killed
     // -500 is a reasonable value that makes us less likely to be killed
     if let Err(e) = std::fs::write("/proc/self/oom_score_adj", "-500") {
-      log::debug!("Could not set OOM score adjustment: {}", e);
+      log::debug!("OOM score adjustment failed err=\"{e}\"");
     } else {
-      log::info!("Set OOM score adjustment to -500");
+      log::debug!("OOM score adjustment set oom_score_adj=-500");
     }
   }
 
@@ -47,41 +47,60 @@ fn set_high_priority() {
     unsafe {
       let process = GetCurrentProcess();
       if SetPriorityClass(process, ABOVE_NORMAL_PRIORITY_CLASS).is_ok() {
-        log::info!("Set process priority to ABOVE_NORMAL_PRIORITY_CLASS");
+        log::debug!("Process priority set class=ABOVE_NORMAL");
       } else {
-        log::debug!("Could not set process priority class");
+        log::debug!("Process priority class set failed");
       }
     }
   }
 }
 
-#[tokio::main(flavor = "multi_thread")]
+// One worker runs per running profile; a thread per CPU core in each one
+// adds up to hundreds of idle threads.
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
   // Initialize logger to write to stderr (which will be redirected to file).
   //
   // Default filter is Info — Debug pulls in reqwest/hyper internals which
   // make the per-worker log unreadable on a busy browser session and obscure
   // the actual lines we care about (binds, accept errors, upstream failures).
-  // RUST_LOG=debug or RUST_LOG=donut_proxy=trace still works for deep dives.
-  env_logger::Builder::from_default_env()
+  // RUST_LOG is parsed after the default so it wins: `debug`, or
+  // `donutbrowser_lib::proxy_server=trace` for the tunnel code alone.
+  // Same line shape as the app log: `[ts][target][LEVEL] message`, with the
+  // crate prefix dropped from the target.
+  env_logger::Builder::new()
     .filter_level(log::LevelFilter::Info)
-    .format_timestamp_millis()
+    .parse_default_env()
+    .format(|buf, record| {
+      use std::io::Write;
+      let target = record.target();
+      let target = target.strip_prefix("donutbrowser_lib::").unwrap_or(target);
+      writeln!(
+        buf,
+        "[{}][{}][{}] {}",
+        buf.timestamp_millis(),
+        target,
+        record.level(),
+        record.args()
+      )
+    })
     .init();
 
-  // Set up panic handler to log panics before process exits
   std::panic::set_hook(Box::new(|panic_info| {
-    log::error!("PANIC in proxy worker: {:?}", panic_info);
-    if let Some(location) = panic_info.location() {
-      log::error!(
-        "Location: {}:{}:{}",
-        location.file(),
-        location.line(),
-        location.column()
-      );
-    }
-    if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
-      log::error!("Message: {}", s);
-    }
+    let location = panic_info
+      .location()
+      .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+      .unwrap_or_else(|| "-".to_string());
+    let message = panic_info
+      .payload()
+      .downcast_ref::<&str>()
+      .map(|s| s.to_string())
+      .or_else(|| panic_info.payload().downcast_ref::<String>().cloned())
+      .unwrap_or_default();
+    log::error!(
+      "Worker panicked pid={} at={location} msg={message:?}",
+      std::process::id()
+    );
   }));
 
   let matches = Command::new("donut-proxy")
@@ -102,7 +121,7 @@ async fn main() {
             .arg(
               Arg::new("type")
                 .long("type")
-                .help("Proxy type (http, https, socks4, socks5, ss)"),
+                .help("Proxy type (http, https, httpstls, socks4, socks5, ss)"),
             )
             .arg(
               Arg::new("port")
@@ -144,6 +163,17 @@ async fn main() {
                 .help("Treat --blocklist-file as an allowlist (block all domains not listed)"),
             )
             .arg(
+              Arg::new("dns-server")
+                .long("dns-server")
+                .help("Resolve destinations with this DNS server, through the upstream: https://host/path, tls://host[:port], tcp://host[:port] or host[:port]"),
+            )
+            .arg(
+              Arg::new("no-domain-history")
+                .long("no-domain-history")
+                .num_args(0)
+                .help("Count bytes only; do not record which sites the browser reaches"),
+            )
+            .arg(
               Arg::new("local-protocol")
                 .long("local-protocol")
                 .help("Protocol served to the browser: http (default) or socks5"),
@@ -160,6 +190,41 @@ async fn main() {
             ),
         )
         .subcommand(Command::new("list").about("List all proxy servers")),
+    )
+    .subcommand(
+      Command::new("xray")
+        .about("Manage Xray-core workers for share-link proxies (VLESS, VMess, Trojan, Hysteria2)")
+        .subcommand(
+          Command::new("start")
+            .about(
+              "Start a worker serving authenticated SOCKS5 on 127.0.0.1. The share link is \
+               read from the first line of stdin, never from the command line",
+            )
+            .arg(
+              Arg::new("owner-pid")
+                .long("owner-pid")
+                .value_parser(clap::value_parser!(u32))
+                .required(true)
+                .help("The worker exits when this process exits"),
+            ),
+        )
+        .subcommand(
+          Command::new("bind")
+            .about("Make a worker exit with this process instead of its current owner")
+            .arg(Arg::new("id").long("id").required(true).help("Worker ID"))
+            .arg(
+              Arg::new("pid")
+                .long("pid")
+                .value_parser(clap::value_parser!(u32))
+                .required(true)
+                .help("New owner process ID"),
+            ),
+        )
+        .subcommand(
+          Command::new("stop")
+            .about("Stop a worker")
+            .arg(Arg::new("id").long("id").required(true).help("Worker ID")),
+        ),
     )
     .subcommand(
       Command::new("proxy-worker")
@@ -207,12 +272,28 @@ async fn main() {
         ),
     )
     .subcommand(
-      Command::new("mcp-bridge")
-        .about("Bridge stdio MCP to a local HTTP MCP server")
+      Command::new("ramfs")
+        .about("Serve the in-memory volume of ephemeral profiles until killed (Windows with WinFsp; internal use)")
         .arg(
-          Arg::new("url")
+          Arg::new("mount")
+            .long("mount")
             .required(true)
-            .help("HTTP MCP server URL (e.g. http://127.0.0.1:51080/mcp/TOKEN)"),
+            .value_parser(clap::value_parser!(std::path::PathBuf))
+            .help("Directory to mount the volume on; it must not exist"),
+        )
+        .arg(
+          Arg::new("capacity")
+            .long("capacity")
+            .required(true)
+            .value_parser(clap::value_parser!(u64))
+            .help("Volume size in bytes"),
+        )
+        .arg(
+          Arg::new("state")
+            .long("state")
+            .required(true)
+            .value_parser(clap::value_parser!(std::path::PathBuf))
+            .help("File that records the mounted volume"),
         ),
     )
     .get_matches();
@@ -254,7 +335,9 @@ async fn main() {
         .unwrap_or_default();
       let blocklist_file = start_matches.get_one::<String>("blocklist-file").cloned();
       let dns_allowlist_mode = start_matches.get_flag("dns-allowlist-mode");
+      let dns_server = start_matches.get_one::<String>("dns-server").cloned();
       let local_protocol = start_matches.get_one::<String>("local-protocol").cloned();
+      let record_domains = !start_matches.get_flag("no-domain-history");
 
       match start_proxy_process_with_profile(
         upstream_url,
@@ -263,7 +346,9 @@ async fn main() {
         bypass_rules,
         blocklist_file,
         dns_allowlist_mode,
+        dns_server,
         local_protocol,
+        record_domains,
       )
       .await
       {
@@ -339,7 +424,93 @@ async fn main() {
       println!("{}", serde_json::to_string(&configs).unwrap());
       process::exit(0);
     } else {
-      log::error!("Invalid action. Use 'start', 'stop', or 'list'");
+      eprintln!("Invalid action. Use 'start', 'stop', or 'list'");
+      process::exit(1);
+    }
+  } else if let Some(xray_matches) = matches.subcommand_matches("xray") {
+    if let Some(start_matches) = xray_matches.subcommand_matches("start") {
+      let owner_pid = *start_matches
+        .get_one::<u32>("owner-pid")
+        .expect("owner-pid is required");
+      let mut share_link = String::new();
+      if std::io::stdin().read_line(&mut share_link).is_err() || share_link.trim().is_empty() {
+        eprintln!("No share link on stdin");
+        process::exit(2);
+      }
+
+      // The detached worker would otherwise inherit the caller's pipes, and a
+      // caller that reads to EOF would wait for the worker to exit. Same fix
+      // as `proxy start` (proxy_runner.rs).
+      #[cfg(windows)]
+      {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::{SetHandleInformation, HANDLE, HANDLE_FLAGS};
+        const HANDLE_FLAG_INHERIT: u32 = 0x00000001;
+        for handle in [
+          std::io::stdin().as_raw_handle(),
+          std::io::stdout().as_raw_handle(),
+          std::io::stderr().as_raw_handle(),
+        ] {
+          if !handle.is_null() {
+            unsafe {
+              let _ = SetHandleInformation(HANDLE(handle), HANDLE_FLAG_INHERIT, HANDLE_FLAGS(0));
+            }
+          }
+        }
+      }
+
+      match donutbrowser_lib::xray_worker_runner::start_xray_worker_for_owner(
+        None,
+        share_link.trim(),
+        owner_pid,
+      )
+      .await
+      {
+        Ok(worker) => {
+          // Use println! here because this needs to go to stdout for parsing
+          println!(
+            "{}",
+            serde_json::json!({
+              "id": worker.id,
+              "localPort": worker.local_port,
+              "localUrl": format!("socks5://127.0.0.1:{}", worker.local_port),
+              "username": worker.username,
+              "password": worker.password,
+            })
+          );
+          process::exit(0);
+        }
+        Err(e) => {
+          eprintln!("Failed to start Xray-core worker: {e}");
+          process::exit(1);
+        }
+      }
+    } else if let Some(bind_matches) = xray_matches.subcommand_matches("bind") {
+      let id = bind_matches
+        .get_one::<String>("id")
+        .expect("id is required");
+      let pid = *bind_matches.get_one::<u32>("pid").expect("pid is required");
+      let success = donutbrowser_lib::xray_worker_runner::set_browser_pid(id, pid);
+      // Use println! here because this needs to go to stdout for parsing
+      println!("{}", serde_json::json!({ "success": success }));
+      process::exit(0);
+    } else if let Some(stop_matches) = xray_matches.subcommand_matches("stop") {
+      let id = stop_matches
+        .get_one::<String>("id")
+        .expect("id is required");
+      match donutbrowser_lib::xray_worker_runner::stop_xray_worker_now(id) {
+        Ok(success) => {
+          // Use println! here because this needs to go to stdout for parsing
+          println!("{}", serde_json::json!({ "success": success }));
+          process::exit(0);
+        }
+        Err(e) => {
+          eprintln!("Failed to stop Xray-core worker: {e}");
+          process::exit(1);
+        }
+      }
+    } else {
+      eprintln!("Invalid action. Use 'start', 'bind', or 'stop'");
       process::exit(1);
     }
   } else if let Some(worker_matches) = matches.subcommand_matches("proxy-worker") {
@@ -354,51 +525,42 @@ async fn main() {
       // Set high priority so this process is killed last under resource pressure
       set_high_priority();
 
-      log::info!(
-        "Proxy worker starting (pid {}, config id {})",
-        std::process::id(),
-        id
-      );
-
       // Retry config loading to handle file system race condition on Windows
       // where the config file may not be immediately visible after being written
       let config = {
         let mut attempts = 0;
         loop {
           if let Some(config) = get_proxy_config(id) {
-            log::info!(
-              "Found config: id={}, port={:?}, upstream={}",
-              config.id,
-              config.local_port,
-              redacted_upstream(&config.upstream_url)
-            );
             break config;
           }
           attempts += 1;
           if attempts >= 10 {
             log::error!(
-              "Proxy configuration {} not found after {} attempts",
-              id,
-              attempts
+              "Worker exiting kind=proxy id={id} pid={} reason=config_not_found attempts={attempts}",
+              process::id()
             );
             process::exit(1);
           }
-          log::debug!("Config {} not found yet, retrying ({}/10)...", id, attempts);
           std::thread::sleep(std::time::Duration::from_millis(50));
         }
       };
 
       // Run the proxy server - this should never return (infinite loop)
-      log::info!("Starting proxy server for config id: {}", id);
       if let Err(e) = run_proxy_server(config).await {
-        log::error!("Proxy server failed: {} ({:?})", e, e);
+        log::error!(
+          "Worker exiting kind=proxy id={id} pid={} reason=error err=\"{e}\"",
+          process::id()
+        );
         process::exit(1);
       }
       // This should never be reached - run_proxy_server has an infinite loop
-      log::error!("Proxy server returned unexpectedly (this should never happen)");
+      log::error!(
+        "Worker exiting kind=proxy id={id} pid={} reason=accept_loop_returned",
+        process::id()
+      );
       process::exit(1);
     } else {
-      log::error!("Invalid action for proxy-worker. Use 'start'");
+      eprintln!("Invalid action for proxy-worker. Use 'start'");
       process::exit(1);
     }
   } else if let Some(vpn_matches) = matches.subcommand_matches("vpn-worker") {
@@ -413,67 +575,41 @@ async fn main() {
 
     if action == "start" {
       set_high_priority();
-
-      log::info!("VPN worker starting, config id: {}", id);
-      log::info!("Process PID: {}", std::process::id());
+      let pid = process::id();
+      let exit_with = |reason: &str, detail: String| -> ! {
+        log::error!("Worker exiting kind=vpn id={id} pid={pid} reason={reason} {detail}");
+        process::exit(1);
+      };
 
       let config = if let Some(path) = config_path {
         // Load config directly from the provided path
-        log::info!("Loading VPN worker config from: {}", path);
         match std::fs::read_to_string(path) {
           Ok(content) => match serde_json::from_str::<
             donutbrowser_lib::vpn_worker_storage::VpnWorkerConfig,
           >(&content)
           {
-            Ok(config) => {
-              log::info!(
-                "Found VPN worker config: id={}, vpn_type={}, vpn_id={}",
-                config.id,
-                config.vpn_type,
-                config.vpn_id
-              );
-              config
-            }
-            Err(e) => {
-              log::error!("Failed to parse VPN worker config from {}: {}", path, e);
-              process::exit(1);
-            }
+            Ok(config) => config,
+            Err(e) => exit_with("config_unparsable", format!("path=\"{path}\" err=\"{e}\"")),
           },
-          Err(e) => {
-            log::error!("Failed to read VPN worker config from {}: {}", path, e);
-            process::exit(1);
-          }
+          Err(e) => exit_with("config_unreadable", format!("path=\"{path}\" err=\"{e}\"")),
         }
       } else {
         // Fallback: discover config by ID with retries
-        let storage_dir = donutbrowser_lib::proxy_storage::get_storage_dir();
-        log::info!("Looking for VPN worker config in: {:?}", storage_dir);
         let mut attempts = 0;
         loop {
           if let Some(config) = donutbrowser_lib::vpn_worker_storage::get_vpn_worker_config(id) {
-            log::info!(
-              "Found VPN worker config: id={}, vpn_type={}, vpn_id={}",
-              config.id,
-              config.vpn_type,
-              config.vpn_id
-            );
             break config;
           }
           attempts += 1;
           if attempts >= 50 {
-            log::error!(
-              "VPN worker configuration {} not found after {} attempts in {:?}",
-              id,
-              attempts,
-              storage_dir
+            exit_with(
+              "config_not_found",
+              format!(
+                "attempts={attempts} dir=\"{}\"",
+                donutbrowser_lib::proxy_storage::get_storage_dir().display()
+              ),
             );
-            process::exit(1);
           }
-          log::info!(
-            "VPN worker config {} not found yet, retrying ({}/50)...",
-            id,
-            attempts
-          );
           std::thread::sleep(std::time::Duration::from_millis(100));
         }
       };
@@ -481,24 +617,20 @@ async fn main() {
       // Read the decrypted VPN config from the temp file
       let vpn_config_data = match std::fs::read_to_string(&config.config_file_path) {
         Ok(data) => data,
-        Err(e) => {
-          log::error!(
-            "Failed to read VPN config file {}: {}",
-            config.config_file_path,
-            e
-          );
-          process::exit(1);
-        }
+        Err(e) => exit_with(
+          "vpn_config_unreadable",
+          format!("vpn={} err=\"{e}\"", config.vpn_id),
+        ),
       };
 
       match config.vpn_type.as_str() {
         "wireguard" => {
           let wg_config = match donutbrowser_lib::vpn::parse_wireguard_config(&vpn_config_data) {
             Ok(c) => c,
-            Err(e) => {
-              log::error!("Failed to parse WireGuard config: {}", e);
-              process::exit(1);
-            }
+            Err(e) => exit_with(
+              "wireguard_config_invalid",
+              format!("vpn={} err=\"{e}\"", config.vpn_id),
+            ),
           };
 
           let server =
@@ -507,17 +639,13 @@ async fn main() {
             .run(id.clone(), config_path.map(std::path::PathBuf::from))
             .await
           {
-            log::error!("VPN worker failed: {}", e);
-            process::exit(1);
+            exit_with("error", format!("vpn={} err=\"{e}\"", config.vpn_id));
           }
         }
-        other => {
-          log::error!("Unknown VPN type: {}", other);
-          process::exit(1);
-        }
+        other => exit_with("unknown_vpn_type", format!("vpn_type={other}")),
       }
     } else {
-      log::error!("Invalid action for vpn-worker. Use 'start'");
+      eprintln!("Invalid action for vpn-worker. Use 'start'");
       process::exit(1);
     }
   } else if let Some(xray_matches) = matches.subcommand_matches("xray-worker") {
@@ -528,7 +656,7 @@ async fn main() {
       .get_one::<String>("config-path")
       .expect("config-path is required");
     if action != "start" {
-      log::error!("Invalid action for xray-worker. Use 'start'");
+      eprintln!("Invalid action for xray-worker. Use 'start'");
       process::exit(1);
     }
 
@@ -536,86 +664,25 @@ async fn main() {
     if let Err(error) =
       donutbrowser_lib::xray_worker_runner::run_xray_worker(std::path::Path::new(config_path)).await
     {
-      log::error!("Xray worker failed: {error}");
+      log::error!(
+        "Worker exiting kind=xray pid={} reason=error err=\"{error}\"",
+        process::id()
+      );
       process::exit(1);
     }
-  } else if let Some(bridge_matches) = matches.subcommand_matches("mcp-bridge") {
-    let url = bridge_matches
-      .get_one::<String>("url")
-      .expect("url is required")
-      .clone();
-
-    // Suppress debug logging for bridge mode — stderr noise confuses MCP clients
-    log::set_max_level(log::LevelFilter::Warn);
-
-    // stdio↔HTTP MCP bridge: translates stdio JSON-RPC to Streamable HTTP transport
-    let client = reqwest::Client::new();
-    let stdin = tokio::io::stdin();
-    let reader = tokio::io::BufReader::new(stdin);
-    let mut session_id: Option<String> = None;
-
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-    let mut lines = reader.lines();
-    let mut stdout = tokio::io::stdout();
-
-    while let Ok(Some(line)) = lines.next_line().await {
-      if line.trim().is_empty() {
-        continue;
-      }
-
-      // Check if this is a notification (no "id" field) to handle 202 responses
-      let is_notification = serde_json::from_str::<serde_json::Value>(&line)
-        .ok()
-        .map(|v| v.get("id").is_none() || v["id"].is_null())
-        .unwrap_or(false);
-
-      let mut req = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json");
-
-      if let Some(sid) = &session_id {
-        req = req.header("mcp-session-id", sid);
-      }
-
-      match req.body(line).send().await {
-        Ok(resp) => {
-          // Capture session ID from initialize response
-          if let Some(sid) = resp.headers().get("mcp-session-id") {
-            if let Ok(s) = sid.to_str() {
-              session_id = Some(s.to_string());
-            }
-          }
-
-          // Notifications return 202 with no body — don't write anything
-          if is_notification {
-            continue;
-          }
-
-          if let Ok(body) = resp.text().await {
-            if !body.is_empty() {
-              let _ = stdout.write_all(body.as_bytes()).await;
-              let _ = stdout.write_all(b"\n").await;
-              let _ = stdout.flush().await;
-            }
-          }
-        }
-        Err(e) => {
-          if !is_notification {
-            let err = serde_json::json!({
-              "jsonrpc": "2.0",
-              "id": null,
-              "error": {"code": -32000, "message": format!("HTTP error: {e}")},
-            });
-            let _ = stdout.write_all(err.to_string().as_bytes()).await;
-            let _ = stdout.write_all(b"\n").await;
-            let _ = stdout.flush().await;
-          }
-        }
-      }
-    }
+  } else if let Some(ramfs_matches) = matches.subcommand_matches("ramfs") {
+    let mount = ramfs_matches
+      .get_one::<std::path::PathBuf>("mount")
+      .expect("mount is required");
+    let capacity = *ramfs_matches
+      .get_one::<u64>("capacity")
+      .expect("capacity is required");
+    let state = ramfs_matches
+      .get_one::<std::path::PathBuf>("state")
+      .expect("state is required");
+    process::exit(donutbrowser_lib::ramfs::host_main(mount, capacity, state));
   } else {
-    log::error!("No command specified");
+    eprintln!("No command specified");
     process::exit(1);
   }
 }

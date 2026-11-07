@@ -31,11 +31,9 @@ pub struct LaunchGatePrefs {
   pub vpn_extension_acks: HashMap<String, Vec<String>>,
 }
 
-lazy_static::lazy_static! {
-  /// Serializes read-modify-write so two concurrent acknowledgements in a bulk
-  /// run cannot clobber each other.
-  static ref PREFS_LOCK: Mutex<()> = Mutex::new(());
-}
+/// Serializes read-modify-write so two concurrent acknowledgements in a bulk
+/// run cannot clobber each other.
+static PREFS_LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
 
 fn prefs_file() -> PathBuf {
   crate::app_dirs::data_subdir().join("launch_gate_prefs.json")
@@ -46,7 +44,7 @@ pub fn load() -> LaunchGatePrefs {
     return LaunchGatePrefs::default();
   };
   serde_json::from_str(&content).unwrap_or_else(|e| {
-    log::warn!("Failed to parse launch gate prefs, ignoring them: {e}");
+    log::warn!("Launch gate prefs parse failed, ignoring them err=\"{e}\"");
     LaunchGatePrefs::default()
   })
 }
@@ -55,17 +53,17 @@ fn save(prefs: &LaunchGatePrefs) {
   let path = prefs_file();
   if let Some(parent) = path.parent() {
     if let Err(e) = std::fs::create_dir_all(parent) {
-      log::warn!("Failed to create launch gate prefs dir: {e}");
+      log::warn!("Launch gate prefs dir create failed err=\"{e}\"");
       return;
     }
   }
   match serde_json::to_string_pretty(prefs) {
     Ok(json) => {
       if let Err(e) = std::fs::write(&path, json) {
-        log::warn!("Failed to write launch gate prefs: {e}");
+        log::warn!("Launch gate prefs write failed err=\"{e}\"");
       }
     }
-    Err(e) => log::warn!("Failed to serialize launch gate prefs: {e}"),
+    Err(e) => log::warn!("Launch gate prefs serialize failed err=\"{e}\""),
   }
 }
 
@@ -76,17 +74,31 @@ fn update(mutate: impl FnOnce(&mut LaunchGatePrefs)) {
   save(&prefs);
 }
 
-/// Stable digest of a profile's stored fingerprint, so an acknowledgement stops
-/// applying the moment the fingerprint is regenerated or matched to a new exit.
+/// Stable digest of the device a profile publishes, so an acknowledgement
+/// stops applying the moment that device is regenerated or matched to a new
+/// exit.
+///
+/// An identity-backed profile stores no device at all: the identity, the user's
+/// overrides and the exit's location are the whole of it, and the published
+/// device moves exactly when one of the three does. The legacy payload is
+/// hashed alongside them for a profile that has not been migrated yet.
 pub fn fingerprint_hash(profile: &BrowserProfile) -> String {
   use sha2::{Digest, Sha256};
-  let fingerprint = profile
-    .wayfern_config
-    .as_ref()
-    .and_then(|c| c.fingerprint.as_deref())
-    .unwrap_or("");
   let mut hasher = Sha256::new();
-  hasher.update(fingerprint.as_bytes());
+  if let Some(config) = profile.wayfern_config.as_ref() {
+    for field in [
+      config.identity_id.as_deref(),
+      config.identity_overrides.as_deref(),
+      config.location.as_deref(),
+      config.fingerprint.as_deref(),
+    ] {
+      // Length-prefixed, so moving a boundary between two fields cannot
+      // produce the digest of a different pair.
+      let value = field.unwrap_or("");
+      hasher.update(value.len().to_le_bytes());
+      hasher.update(value.as_bytes());
+    }
+  }
   hasher
     .finalize()
     .iter()

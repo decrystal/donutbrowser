@@ -9,11 +9,24 @@ extend-exclude = [
     "CHANGELOG.md",
     # Windows batch script encoded as GBK for the zh-CN console, not UTF-8.
     "donut.bat",
+    # Upstream patches for the Flatpak's tray libraries, applied verbatim.
+    "packaging/flatpak/patches/",
+    # Keys and ciphertext of the chat sync test vector, in base64url.
+    "src-tauri/src/agent_tasks/chat_sync/test-vector.json",
 ]
 
 [default.extend-words]
+# The IDN test fixtures in src-tauri/src/xray encode "cafe" as punycode
+# ("xn--caf-dma") and as percent-escapes ("caf%C3%A9"). Both leave a bare "caf"
+# token that is an encoding artefact, never a misspelling of "calf".
+caf = "caf"
 DBE = "DBE"
 nd = "nd"
+# Playwright's code for a BigUint64Array in an encoded IndexedDB value.
+bui = "bui"
+# German and French words in the tray menu labels (tray.rs).
+Alle = "Alle"
+cours = "cours"
 
 [default.extend-identifiers]
 # Chrome Web Store extension name in the known-VPN list.

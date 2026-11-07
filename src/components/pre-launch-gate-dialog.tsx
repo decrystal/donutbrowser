@@ -19,6 +19,7 @@ import type {
   ConsistencyResult,
   DetectedVpnExtension,
   ExtensionScanState,
+  RouteUnreachable,
 } from "@/types";
 import { RippleButton } from "./ui/ripple";
 
@@ -33,6 +34,15 @@ export interface GateFindings {
   measurementUnreliable: boolean;
   /// The exit has not been measured yet; the launch itself will still check.
   probePending: boolean;
+  /// Dimensions nothing will compare, because the fingerprint declares no value
+  /// of its own. Reported so a launch that verified nothing does not read as a
+  /// launch that verified everything. Never a block.
+  unverified: string[];
+  /// The proxy or VPN did not answer a check just now. A warning: the user
+  /// may launch anyway.
+  routeUnreachable?: RouteUnreachable | null;
+  /// The profile has no proxy or VPN and the person asked to be asked first.
+  routeMissing?: boolean;
 }
 
 export interface GateDecision {
@@ -176,6 +186,7 @@ export function PreLaunchGateDialog({
 
   const fingerprint = findings?.fingerprint ?? null;
   const extensions = findings?.vpnExtensions ?? [];
+  const route = findings?.routeUnreachable ?? null;
   // Two different claims, kept visually apart. The first names extensions as
   // VPN/proxy tools; the second says only that an extension holds Chromium's
   // proxy permission, which a download manager needs to route its own
@@ -187,6 +198,11 @@ export function PreLaunchGateDialog({
   const mismatches = fingerprint?.mismatches ?? [];
   const exitIp = fingerprint?.exit_ip ?? null;
   const isBlocked = fingerprint !== null;
+  // What nothing compared. A measured result is authoritative about that, so it
+  // wins over the local prediction whenever the gate got as far as measuring.
+  const unverified = fingerprint
+    ? fingerprint.unverified
+    : (findings?.unverified ?? []);
 
   // Two guards, because answering a gate promotes the next one into the same
   // DOM node rather than closing the dialog. The ref settles one gate exactly
@@ -315,6 +331,36 @@ export function PreLaunchGateDialog({
             </div>
           )}
 
+          {findings?.routeMissing && (
+            <div data-slot="gate-route-missing" className="space-y-1">
+              <p className="font-medium">
+                {t("prelaunchGate.routeMissingHeading")}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {t("prelaunchGate.routeMissingBody")}
+              </p>
+            </div>
+          )}
+
+          {route && (
+            <div
+              data-slot="gate-route-unreachable"
+              className="space-y-2 rounded-md border border-warning/50 bg-warning/10 p-3"
+            >
+              <p className="font-medium">
+                {route.kind === "vpn"
+                  ? t("prelaunchGate.routeVpnHeading")
+                  : t("prelaunchGate.routeProxyHeading")}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {translateBackendError(t, JSON.stringify({ code: route.code }))}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {t("prelaunchGate.routeExplainer")}
+              </p>
+            </div>
+          )}
+
           {vpnExtensions.length > 0 && (
             <div className="space-y-2 rounded-md border border-warning/50 bg-warning/10 p-3">
               <p className="font-medium">
@@ -335,7 +381,7 @@ export function PreLaunchGateDialog({
           )}
 
           {proxyCapableExtensions.length > 0 && (
-            <div className="space-y-2 rounded-md border border-border bg-muted/40 p-3">
+            <div className="space-y-2 rounded-md border border-border bg-foreground/5 p-3">
               <p className="font-medium">
                 {t("prelaunchGate.proxyCapableHeading")}
               </p>
@@ -359,6 +405,21 @@ export function PreLaunchGateDialog({
           {findings?.probePending && !isBlocked && (
             <p className="text-xs text-muted-foreground">
               {t("prelaunchGate.probePending")}
+            </p>
+          )}
+
+          {/* Not a block and not a mismatch: the exit check has nothing to
+              compare on these dimensions, so it can neither clear them nor
+              flag them. Said plainly, so a launch that verified nothing is
+              never mistaken for one that verified everything. */}
+          {unverified.includes("timezone") && (
+            <p className="text-xs text-muted-foreground">
+              {t("prelaunchGate.exitUnverifiedTimezone")}
+            </p>
+          )}
+          {unverified.includes("language") && (
+            <p className="text-xs text-muted-foreground">
+              {t("prelaunchGate.exitUnverifiedLanguage")}
             </p>
           )}
 

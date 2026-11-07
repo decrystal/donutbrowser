@@ -10,10 +10,16 @@ fn main() {
   // Generate tray icon PNG files from SVG (macOS template icon format)
   generate_tray_icons();
 
-  #[cfg(target_os = "macos")]
-  {
+  if build_target.ends_with("-apple-darwin") {
     println!("cargo:rustc-link-lib=framework=CoreFoundation");
     println!("cargo:rustc-link-lib=framework=CoreServices");
+  }
+
+  // WinFsp's DLL loads at the first call into it, so Donut starts on machines
+  // that do not have WinFsp (src/ramfs).
+  #[cfg(windows)]
+  if build_target.contains("windows") {
+    winfsp::build::winfsp_link_delayload();
   }
 
   // Inject build version based on environment variables set by CI
@@ -37,13 +43,20 @@ fn main() {
     println!("cargo:rustc-env=BUILD_VERSION=dev-{version}");
   }
 
-  // Inject vault password at build time
-  if let Ok(vault_password) = std::env::var("DONUT_BROWSER_VAULT_PASSWORD") {
-    println!("cargo:rustc-env=DONUT_BROWSER_VAULT_PASSWORD={vault_password}");
-  } else {
-    // Use default password if environment variable is not set
-    println!("cargo:rustc-env=DONUT_BROWSER_VAULT_PASSWORD=donutbrowser-api-vault-password");
-  }
+  // The sealing password of every build before the per-install vault key.
+  // Still compiled in so an update can open the files those builds sealed
+  // and re-seal them under the installation's own key (see `src/vault.rs`).
+  // It reaches the crate through a file in OUT_DIR rather than a rustc-env
+  // line, so the build log never carries it.
+  let legacy_vault_password = std::env::var("DONUT_BROWSER_VAULT_PASSWORD")
+    .unwrap_or_else(|_| "donutbrowser-api-vault-password".to_string());
+  let out_dir = std::env::var("OUT_DIR").expect("cargo sets OUT_DIR for build scripts");
+  std::fs::write(
+    std::path::Path::new(&out_dir).join("legacy_vault_password.txt"),
+    legacy_vault_password,
+  )
+  .expect("write the legacy vault password for include_str!");
+  println!("cargo:rerun-if-env-changed=DONUT_BROWSER_VAULT_PASSWORD");
 
   // Tell Cargo to rebuild if the proxy binary source changes
   println!("cargo:rerun-if-changed=src/bin/proxy_server.rs");
@@ -65,16 +78,16 @@ fn main() {
     // or they crash with STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139). We embed the
     // manifest for all targets, then suppress the duplicate for bins with /MANIFEST:NO
     // (tauri_build's resource-embedded manifest still takes effect for bins).
-    #[cfg(target_os = "windows")]
-    {
+    if build_target.contains("windows") {
       embed_windows_manifest();
       println!("cargo:rustc-link-arg-bins=/MANIFEST:NO");
     }
   } else {
     println!("cargo:warning=Skipping tauri_build: external binaries not found. This is expected when building sidecar binaries.");
 
-    #[cfg(target_os = "windows")]
-    embed_windows_manifest();
+    if build_target.contains("windows") {
+      embed_windows_manifest();
+    }
   }
 }
 
@@ -94,19 +107,15 @@ fn external_binaries_exist() -> bool {
 
   let binaries_dir = PathBuf::from(&manifest_dir).join("binaries");
 
-  // Check for all required external binaries (must match tauri.conf.json externalBin)
-  let donut_proxy_name = if target.contains("windows") {
-    format!("donut-proxy-{}.exe", target)
-  } else {
-    format!("donut-proxy-{}", target)
-  };
+  // Must match tauri.conf.json externalBin. donut-proxy is a cargo bin of this
+  // crate, which the bundler packages on its own.
   let xray_name = if target.contains("windows") {
     format!("xray-{}.exe", target)
   } else {
     format!("xray-{}", target)
   };
 
-  binaries_dir.join(&donut_proxy_name).exists() && binaries_dir.join(&xray_name).exists()
+  binaries_dir.join(&xray_name).exists()
 }
 
 fn ensure_dist_folder_exists() {
@@ -132,7 +141,6 @@ fn ensure_dist_folder_exists() {
   println!("cargo:rerun-if-changed=../dist");
 }
 
-#[cfg(target_os = "windows")]
 fn embed_windows_manifest() {
   use std::path::PathBuf;
 
@@ -188,7 +196,7 @@ fn generate_tray_icons() {
     // macOS will automatically handle light/dark mode by inverting the icon
     // For template icons: RGB should be 0,0,0 (black) and alpha controls visibility
     let data = pixmap.data_mut();
-    for pixel in data.chunks_exact_mut(4) {
+    for pixel in data.as_chunks_mut::<4>().0 {
       // Keep the original alpha (shows where icon content is)
       // but make the color black for template icon format
       pixel[0] = 0; // R

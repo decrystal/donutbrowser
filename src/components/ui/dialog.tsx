@@ -2,20 +2,43 @@
 
 import { type HTMLMotionProps, motion } from "motion/react";
 import { Dialog as DialogPrimitive } from "radix-ui";
-import type * as React from "react";
+import * as React from "react";
 import { useTranslation } from "react-i18next";
-import { RxCross2 } from "react-icons/rx";
+import { LuX } from "react-icons/lu";
 
+import { FOCUS_RING } from "@/components/ui/focus-ring";
 import { useControlledState } from "@/hooks/use-controlled-state";
+import { useMotionAllowed } from "@/hooks/use-motion-allowed";
 import { getStrictContext } from "@/lib/get-strict-context";
+import {
+  MOTION_DURATION,
+  MOTION_EASE_IN,
+  MOTION_EASE_OUT,
+  originToward,
+} from "@/lib/motion";
 import { cn } from "@/lib/utils";
 import { WindowDragArea } from "../window-drag-area";
 
+/**
+ * A closed modal stays mounted this long for its exit, then unmounts on a
+ * timer. No animation callback decides it, so a paused webview cannot keep a
+ * closed dialog on screen.
+ */
+const DIALOG_EXIT_FALLBACK_MS = 150;
+const DIALOG_EXIT_TRANSITION = {
+  duration: MOTION_DURATION.fast,
+  ease: MOTION_EASE_IN,
+};
+
 type DialogContextType = {
   isOpen: boolean;
+  /** Closed, still mounted while the exit plays. */
+  exiting: boolean;
   setIsOpen: DialogProps["onOpenChange"];
   subPage: boolean;
   container: HTMLElement | null | undefined;
+  motionEnabled: boolean;
+  motionAllowed: boolean;
 };
 
 const [DialogProvider, useDialog] =
@@ -26,22 +49,57 @@ type DialogProps = React.ComponentProps<typeof DialogPrimitive.Root> & {
   subPage?: boolean;
   /** Portal container target. Required when subPage=true; ignored otherwise. */
   container?: HTMLElement | null;
+  motionEnabled?: boolean;
 };
 
-function Dialog({ subPage, container, children, ...props }: DialogProps) {
+function Dialog({
+  subPage,
+  container,
+  motionEnabled = true,
+  children,
+  ...props
+}: DialogProps) {
   const [isOpen, setIsOpen] = useControlledState({
     value: props?.open,
     defaultValue: props?.defaultOpen,
     onChange: props?.onOpenChange,
   });
+  const motionAllowed = useMotionAllowed();
+  const animateExit = motionEnabled && motionAllowed && !subPage;
+  const [exiting, setExiting] = React.useState(false);
+  const [wasOpen, setWasOpen] = React.useState(isOpen);
+  if (wasOpen !== isOpen) {
+    setWasOpen(isOpen);
+    setExiting(!isOpen && animateExit);
+  }
+  React.useEffect(() => {
+    if (!exiting) return;
+    const timer = window.setTimeout(
+      () => setExiting(false),
+      DIALOG_EXIT_FALLBACK_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [exiting]);
+  // While the exit plays the dialog is already closed: a second close request
+  // (an outside click, Escape) must not reach the owner again.
+  const requestOpenChange = React.useCallback(
+    (open: boolean) => {
+      if (!open && !isOpen) return;
+      setIsOpen(open);
+    },
+    [isOpen, setIsOpen],
+  );
 
   return (
     <DialogProvider
       value={{
         isOpen,
+        exiting,
         setIsOpen,
         subPage: !!subPage,
         container: container ?? undefined,
+        motionEnabled,
+        motionAllowed,
       }}
     >
       {/* In sub-page mode the Dialog isn't a modal — it's an in-flow page.
@@ -53,7 +111,7 @@ function Dialog({ subPage, container, children, ...props }: DialogProps) {
         data-slot="dialog"
         {...props}
         modal={subPage ? false : props.modal}
-        onOpenChange={setIsOpen}
+        onOpenChange={requestOpenChange}
       >
         {children}
       </DialogPrimitive.Root>
@@ -77,9 +135,9 @@ function DialogPortal({
   container: portalContainer,
   ...props
 }: DialogPortalProps) {
-  const { isOpen, container } = useDialog();
+  const { isOpen, exiting, container } = useDialog();
 
-  if (!isOpen) return null;
+  if (!isOpen && !exiting) return null;
 
   return (
     <DialogPrimitive.Portal
@@ -99,19 +157,28 @@ type DialogOverlayProps = Omit<
 > &
   HTMLMotionProps<"div">;
 
-function DialogOverlay({
-  className,
-  transition = { duration: 0.2, ease: "easeInOut" },
-  ...props
-}: DialogOverlayProps) {
+function DialogOverlay({ className, ...props }: DialogOverlayProps) {
+  const { exiting, motionEnabled, motionAllowed } = useDialog();
+  const fade = motionEnabled && motionAllowed;
   return (
     <DialogPrimitive.Overlay data-slot="dialog-overlay" asChild forceMount>
       <motion.div
         key="dialog-overlay"
-        initial={{ opacity: 0, filter: "blur(4px)" }}
-        animate={{ opacity: 1, filter: "blur(0px)" }}
-        transition={transition}
-        className={cn("fixed inset-0 z-9999 bg-background/50", className)}
+        // Decorative: the dimmed backdrop may fade in from nothing.
+        initial={fade ? { opacity: 0 } : false}
+        animate={{ opacity: exiting ? 0 : 1 }}
+        transition={
+          fade
+            ? exiting
+              ? DIALOG_EXIT_TRANSITION
+              : { duration: MOTION_DURATION.fast, ease: MOTION_EASE_OUT }
+            : { duration: 0 }
+        }
+        className={cn(
+          "fixed inset-0 z-9999 bg-background/50",
+          exiting && "pointer-events-none",
+          className,
+        )}
         {...props}
       >
         {/* Keep the OS title-bar zone draggable while a modal is open — the
@@ -162,15 +229,9 @@ function SubPageContent({
   // shared dialog wrappers turned out to be unreliable when both classnames
   // and !important variants competed — inline styles guarantee the layout.
   return (
-    <motion.div
+    <div
       data-slot="sub-page"
       data-sub-page="true"
-      // Sub-pages enter with a short rise+fade so rail navigation reads as a
-      // transition instead of a hard cut. Same axis for every page (spatial
-      // consistency); the outgoing page unmounts under the incoming fade.
-      initial={{ opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.25, ease: [0.23, 1, 0.32, 1] }}
       style={{
         position: "relative",
         display: "flex",
@@ -194,8 +255,29 @@ function SubPageContent({
       }}
     >
       {children}
-    </motion.div>
+    </div>
   );
+}
+
+/** The transform origin that points a dialog box at the focused control. */
+function originFromFocus(content: HTMLElement): string {
+  const opener = document.activeElement;
+  const rect =
+    opener instanceof HTMLElement &&
+    opener !== document.body &&
+    !content.contains(opener)
+      ? opener.getBoundingClientRect()
+      : null;
+  // The layout box, without the entry scale: same center, unscaled size.
+  const box = content.getBoundingClientRect();
+  const width = content.offsetWidth;
+  const height = content.offsetHeight;
+  return originToward(rect, {
+    x: box.left + box.width / 2 - width / 2,
+    y: box.top + box.height / 2 - height / 2,
+    width,
+    height,
+  });
 }
 
 function DialogContent({
@@ -209,10 +291,27 @@ function DialogContent({
   transition,
   hideClose,
   dismissible = true,
+  ref,
   ...props
 }: DialogContentProps) {
   const { t } = useTranslation();
-  const { subPage } = useDialog();
+  const { exiting, subPage, motionEnabled, motionAllowed } = useDialog();
+  const animateEntry = motionEnabled && motionAllowed;
+  // The dialog grows out of the control that opened it. The node attaches
+  // before Radix moves focus into the dialog (a later effect), so the focused
+  // element here is still that control.
+  const setContentRef = React.useCallback(
+    (node: HTMLDivElement | null) => {
+      if (node) node.style.transformOrigin = originFromFocus(node);
+      if (typeof ref === "function") ref(node);
+      else if (ref) ref.current = node;
+    },
+    [ref],
+  );
+  // The exit shows what the dialog showed while open, even when the owner
+  // clears the data behind it as it closes.
+  const shownChildren = React.useRef(children);
+  if (!exiting) shownChildren.current = children;
 
   if (subPage) {
     return <SubPageContent>{children}</SubPageContent>;
@@ -246,32 +345,44 @@ function DialogContent({
       >
         <motion.div
           key="dialog-content"
+          ref={setContentRef}
           data-slot="dialog-content"
-          // Open motion modeled on transitions.dev's modal: a subtle scale
-          // from 0.96 → 1 with opacity, eased with cubic-bezier(0.22, 1, 0.36,
-          // 1). The portal unmounts immediately on close so a closed Radix
-          // surface cannot linger over the app. The centering translate stays
-          // in `style` so `scale` animates around the center without fighting
-          // the transform-based positioning.
-          style={{ transformOrigin: "center" }}
-          initial={{ opacity: 0, scale: 0.96 }}
-          animate={{ opacity: 1, scale: 1 }}
+          // Content is readable on the first frame, even in an occluded webview:
+          // the entry only scales. Keyboard navigation skips the settle, and a
+          // closed dialog unmounts on a timer whatever the exit does.
+          initial={animateEntry ? { scale: 0.985 } : false}
+          animate={
+            exiting ? { scale: 0.985, opacity: 0 } : { scale: 1, opacity: 1 }
+          }
           transition={
-            transition ?? { duration: 0.25, ease: [0.22, 1, 0.36, 1] }
+            exiting
+              ? DIALOG_EXIT_TRANSITION
+              : animateEntry
+                ? (transition ?? {
+                    duration: MOTION_DURATION.base,
+                    ease: MOTION_EASE_OUT,
+                  })
+                : { duration: 0 }
           }
           className={cn(
             // w-[calc(100%-2rem)] (not w-full + max-w) keeps the 1rem window
             // gutter even when callers override max-w-*: tailwind-merge drops
             // a base max-w in favor of the caller's, but leaves width alone.
-            "surface-material fixed top-[50%] left-[50%] z-10000 grid max-h-[calc(100dvh-3rem)] w-[calc(100%-2rem)] max-w-lg -translate-[50%] gap-4 overflow-y-auto rounded-lg border p-6 shadow-lg",
+            "fixed top-[50%] left-[50%] z-10000 grid max-h-[calc(100vh-3rem)] w-[calc(100%-2rem)] max-w-lg -translate-[50%] gap-4 overflow-y-auto rounded-lg border bg-background p-6",
+            exiting && "pointer-events-none",
             className,
           )}
           {...props}
         >
-          {children}
+          {exiting ? shownChildren.current : children}
           {!hideClose && dismissible && (
-            <DialogPrimitive.Close className="absolute top-4 right-4 cursor-pointer rounded-xs opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:ring-2 focus:ring-ring focus:ring-offset-2 focus:outline-hidden disabled:pointer-events-none data-[state=open]:bg-accent data-[state=open]:text-accent-foreground [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4">
-              <RxCross2 />
+            <DialogPrimitive.Close
+              className={cn(
+                "absolute top-4 right-4 cursor-pointer rounded-xs opacity-70 transition-opacity hover:opacity-100 focus-visible:opacity-100 disabled:pointer-events-none data-[state=open]:bg-accent data-[state=open]:text-accent-foreground [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+                FOCUS_RING,
+              )}
+            >
+              <LuX />
               <span className="sr-only">{t("common.buttons.close")}</span>
             </DialogPrimitive.Close>
           )}

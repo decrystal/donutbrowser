@@ -6,6 +6,12 @@ import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { LuEye, LuEyeOff } from "react-icons/lu";
 import { LoadingButton } from "@/components/loading-button";
+import {
+  AnimatedTabs,
+  AnimatedTabsContent,
+  AnimatedTabsList,
+  AnimatedTabsTrigger,
+} from "@/components/ui/animated-tabs";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -15,18 +21,21 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { FOCUS_RING } from "@/components/ui/focus-ring";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ProBadge } from "@/components/ui/pro-badge";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useCloudAuth } from "@/hooks/use-cloud-auth";
+import { translateBackendError } from "@/lib/backend-errors";
+import { effectivePlanOf } from "@/lib/entitlements";
 import { showErrorToast, showSuccessToast } from "@/lib/toast-utils";
-import type { SyncSettings } from "@/types";
+import { cn } from "@/lib/utils";
+import type { SyncServerCheck, SyncSettings, SyncSourceState } from "@/types";
 
 const DEVICE_LINK_URL = "https://donutbrowser.com/auth/link";
 
@@ -75,52 +84,55 @@ export function SyncConfigDialog({
   } = useCloudAuth();
 
   const [activeTab, setActiveTab] = useState<string>("cloud");
+  const [syncSource, setSyncSource] = useState<SyncSourceState | null>(null);
   const [, setLiveProxyUsage] = useState<ProxyUsage | null>(null);
 
   const [connectionStatus, setConnectionStatus] = useState<
-    "unknown" | "testing" | "connected" | "error"
+    "unknown" | "testing" | "connected" | "error" | "storage-unreachable"
   >("unknown");
   const [storageEndpoint, setStorageEndpoint] = useState<string | null>(null);
   const hasConfig = Boolean(serverUrl && token);
 
-  // `/health` is a bare liveness probe: it answers ok on a server whose storage
-  // is unreachable or misconfigured, which is how a green "connected" could sit
-  // next to a sync where every single file failed. `/readyz` checks storage and
-  // reports the endpoint clients are handed in presigned URLs, so surface that
-  // too — when transfers fail, it is the value worth checking first.
-  const probeServer = useCallback(async (url: string) => {
-    const base = url.replace(/\/$/, "");
-    const response = await fetch(`${base}/readyz`);
+  // Probing the sync server alone is what let a broken setup look correct.
+  // Files never travel through that server: the client is handed a presigned
+  // URL and uploads straight to storage, so a server whose storage address is
+  // reachable only from its own network answers every probe while every single
+  // transfer fails at connect. The check runs in the backend because that is
+  // the client that performs the transfers — same DNS, proxy and TLS trust, so
+  // a setup that passes here can actually move bytes.
+  const probeServer = useCallback(
+    (url: string) =>
+      invoke<SyncServerCheck>("check_sync_server_connection", {
+        serverUrl: url,
+      }),
+    [],
+  );
 
-    // A server old enough to predate /readyz is still a working server, so
-    // fall back rather than reporting a healthy setup as broken.
-    if (response.status === 404) {
-      const health = await fetch(`${base}/health`);
-      return { ok: health.ok, storageEndpoint: undefined };
+  const applyProbeResult = useCallback((result: SyncServerCheck) => {
+    setStorageEndpoint(result.storage_endpoint ?? null);
+    if (!result.server_reachable || result.storage_ready === false) {
+      setConnectionStatus("error");
+      return "error" as const;
     }
-
-    if (!response.ok) {
-      return { ok: false as const, storageEndpoint: undefined };
+    if (result.storage_reachable === false) {
+      setConnectionStatus("storage-unreachable");
+      return "storage-unreachable" as const;
     }
-    const body = (await response.json()) as {
-      storageEndpoint?: string;
-    } | null;
-    return { ok: true as const, storageEndpoint: body?.storageEndpoint };
+    setConnectionStatus("connected");
+    return "connected" as const;
   }, []);
 
   const testConnection = useCallback(
     async (url: string) => {
       setConnectionStatus("testing");
       try {
-        const result = await probeServer(url);
-        setStorageEndpoint(result.storageEndpoint ?? null);
-        setConnectionStatus(result.ok ? "connected" : "error");
+        applyProbeResult(await probeServer(url));
       } catch {
         setStorageEndpoint(null);
         setConnectionStatus("error");
       }
     },
-    [probeServer],
+    [probeServer, applyProbeResult],
   );
 
   const loadSettings = useCallback(async () => {
@@ -143,6 +155,11 @@ export function SyncConfigDialog({
     if (isOpen) {
       setConnectionStatus("unknown");
       void loadSettings();
+      void invoke<SyncSourceState>("get_sync_source")
+        .then(setSyncSource)
+        .catch(() => {
+          setSyncSource(null);
+        });
       void invoke<ProxyUsage | null>("cloud_get_proxy_usage")
         .then(setLiveProxyUsage)
         .catch(() => {
@@ -173,12 +190,18 @@ export function SyncConfigDialog({
     setConnectionStatus("testing");
     try {
       const result = await probeServer(serverUrl);
-      setStorageEndpoint(result.storageEndpoint ?? null);
-      if (result.ok) {
-        setConnectionStatus("connected");
+      const outcome = applyProbeResult(result);
+      if (outcome === "connected") {
         showSuccessToast(t("sync.config.connectionSuccess"));
+      } else if (outcome === "storage-unreachable") {
+        // Deliberately an error, not a warning. Nothing will sync in this
+        // state, and reporting it as success is the bug being fixed.
+        showErrorToast(
+          t("sync.config.storageUnreachable", {
+            endpoint: result.storage_endpoint ?? "",
+          }),
+        );
       } else {
-        setConnectionStatus("error");
         showErrorToast(t("sync.config.serverError"));
       }
     } catch {
@@ -188,7 +211,7 @@ export function SyncConfigDialog({
     } finally {
       setIsTesting(false);
     }
-  }, [serverUrl, t, probeServer]);
+  }, [serverUrl, t, probeServer, applyProbeResult]);
 
   const handleSave = useCallback(async () => {
     setIsSaving(true);
@@ -206,7 +229,9 @@ export function SyncConfigDialog({
       onClose();
     } catch (error) {
       console.error("Failed to save sync settings:", error);
-      showErrorToast(t("sync.config.saveFailed"));
+      showErrorToast(t("sync.config.saveFailed"), {
+        description: translateBackendError(t, error),
+      });
     } finally {
       setIsSaving(false);
     }
@@ -230,7 +255,9 @@ export function SyncConfigDialog({
       showSuccessToast(t("sync.config.disconnected"));
     } catch (error) {
       console.error("Failed to disconnect:", error);
-      showErrorToast(t("sync.config.disconnectFailed"));
+      showErrorToast(t("sync.config.disconnectFailed"), {
+        description: translateBackendError(t, error),
+      });
     } finally {
       setIsSaving(false);
     }
@@ -245,9 +272,9 @@ export function SyncConfigDialog({
       onLoginStarted?.();
     } catch (error) {
       console.error("Failed to open login link:", error);
-      showErrorToast(String(error));
+      showErrorToast(translateBackendError(t, error));
     }
-  }, [onLoginStarted]);
+  }, [onLoginStarted, t]);
 
   const handleCloudLogout = useCallback(async () => {
     try {
@@ -262,12 +289,19 @@ export function SyncConfigDialog({
       }
     } catch (error) {
       console.error("Failed to logout:", error);
-      showErrorToast(String(error));
+      showErrorToast(translateBackendError(t, error));
     }
   }, [logout, t]);
 
   const cloudBlocked = !isLoggedIn && hasConfig;
   const selfHostedBlocked = isLoggedIn;
+  const activeSource = syncSource?.active ?? "cloud";
+  const syncServer =
+    activeSource === "account"
+      ? syncSource?.account_server
+      : activeSource === "self_hosted"
+        ? syncSource?.self_hosted_server
+        : null;
 
   return (
     <Dialog open={isOpen} onOpenChange={onClose}>
@@ -296,21 +330,31 @@ export function SyncConfigDialog({
                   {t("sync.cloud.plan")}
                 </span>
                 <span className="capitalize">
-                  {user.plan}
+                  {effectivePlanOf(user)}
                   {user.planPeriod ? ` (${user.planPeriod})` : ""}
                 </span>
               </div>
-              <div className="flex justify-between">
+              <div className="flex justify-between gap-4">
                 <span className="text-muted-foreground">
-                  {t("sync.cloud.profiles")}
+                  {t("sync.cloud.server")}
                 </span>
-                <span>
-                  {t("sync.cloud.profileUsage", {
-                    used: user.cloudProfilesUsed,
-                    limit: user.profileLimit,
-                  })}
+                <span className="truncate">
+                  {syncServer ?? t("account.ownServer.donutCloud")}
                 </span>
               </div>
+              {activeSource === "cloud" && (
+                <div className="flex justify-between">
+                  <span className="text-muted-foreground">
+                    {t("sync.cloud.profiles")}
+                  </span>
+                  <span>
+                    {t("sync.cloud.profileUsage", {
+                      used: user.cloudProfilesUsed,
+                      limit: user.profileLimit,
+                    })}
+                  </span>
+                </div>
+              )}
               {user.teamName && (
                 <>
                   <div className="flex justify-between">
@@ -328,7 +372,9 @@ export function SyncConfigDialog({
                         ? t("sync.team.roleOwner")
                         : user.teamRole === "admin"
                           ? t("sync.team.roleAdmin")
-                          : t("sync.team.roleMember")}
+                          : user.teamRole === "launcher"
+                            ? t("sync.team.roleLauncher")
+                            : t("sync.team.roleMember")}
                     </span>
                   </div>
                   <p className="pt-1 text-xs text-muted-foreground">
@@ -358,9 +404,9 @@ export function SyncConfigDialog({
             </div>
           </div>
         ) : (
-          <Tabs value={activeTab} onValueChange={setActiveTab}>
-            <TabsList className="w-full">
-              <TabsTrigger
+          <AnimatedTabs value={activeTab} onValueChange={setActiveTab}>
+            <AnimatedTabsList className="flex w-full">
+              <AnimatedTabsTrigger
                 value="cloud"
                 className="flex-1"
                 disabled={cloudBlocked}
@@ -369,8 +415,8 @@ export function SyncConfigDialog({
                   {t("sync.cloud.tabLabel")}
                   {cloudBlocked && <ProBadge />}
                 </span>
-              </TabsTrigger>
-              <TabsTrigger
+              </AnimatedTabsTrigger>
+              <AnimatedTabsTrigger
                 value="self-hosted"
                 className="flex-1"
                 disabled={selfHostedBlocked}
@@ -379,13 +425,13 @@ export function SyncConfigDialog({
                   {t("sync.cloud.selfHostedTabLabel")}
                   {selfHostedBlocked && <ProBadge />}
                 </span>
-              </TabsTrigger>
-            </TabsList>
+              </AnimatedTabsTrigger>
+            </AnimatedTabsList>
 
-            <TabsContent value="cloud">
+            <AnimatedTabsContent value="cloud">
               {isCloudLoading ? (
                 <div className="flex justify-center py-8">
-                  <div className="size-6 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                  <div className="size-6 animate-spin rounded-full border-2 border-current border-t-transparent motion-reduce:animate-none" />
                 </div>
               ) : (
                 <div className="grid gap-4 py-4">
@@ -400,12 +446,12 @@ export function SyncConfigDialog({
                   </Button>
                 </div>
               )}
-            </TabsContent>
+            </AnimatedTabsContent>
 
-            <TabsContent value="self-hosted">
+            <AnimatedTabsContent value="self-hosted">
               {isLoading ? (
                 <div className="flex justify-center py-8">
-                  <div className="size-6 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                  <div className="size-6 animate-spin rounded-full border-2 border-current border-t-transparent motion-reduce:animate-none" />
                 </div>
               ) : (
                 <div className="grid gap-4 py-4">
@@ -443,7 +489,10 @@ export function SyncConfigDialog({
                             onClick={() => {
                               setShowToken(!showToken);
                             }}
-                            className="absolute top-1/2 right-3 -translate-y-1/2 transform rounded-sm p-1 transition-colors hover:bg-accent hover:text-accent-foreground"
+                            className={cn(
+                              "absolute top-1/2 right-3 -translate-y-1/2 transform rounded-sm p-1 transition-colors hover:bg-foreground/5 hover:text-foreground",
+                              FOCUS_RING,
+                            )}
                             aria-label={
                               showToken
                                 ? t("common.aria.hideToken")
@@ -458,7 +507,9 @@ export function SyncConfigDialog({
                           </button>
                         </TooltipTrigger>
                         <TooltipContent>
-                          {showToken ? "Hide token" : "Show token"}
+                          {showToken
+                            ? t("common.aria.hideToken")
+                            : t("common.aria.showToken")}
                         </TooltipContent>
                       </Tooltip>
                     </div>
@@ -466,7 +517,7 @@ export function SyncConfigDialog({
 
                   {connectionStatus === "testing" && (
                     <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                      <div className="size-4 animate-spin rounded-full border-2 border-current border-t-transparent" />
+                      <div className="size-4 animate-spin rounded-full border-2 border-current border-t-transparent motion-reduce:animate-none" />
                       {t("sync.status.syncing")}
                     </div>
                   )}
@@ -485,6 +536,19 @@ export function SyncConfigDialog({
                       )}
                     </div>
                   )}
+                  {connectionStatus === "storage-unreachable" && (
+                    <div className="flex flex-col gap-1">
+                      <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <div className="size-2 rounded-full bg-destructive" />
+                        {t("sync.config.storageUnreachableStatus")}
+                      </div>
+                      <span className="text-xs text-muted-foreground break-all">
+                        {t("sync.config.storageUnreachable", {
+                          endpoint: storageEndpoint ?? "",
+                        })}
+                      </span>
+                    </div>
+                  )}
                   {connectionStatus === "error" && (
                     <div className="flex items-center gap-2 text-sm text-muted-foreground">
                       <div className="size-2 rounded-full bg-destructive" />
@@ -501,26 +565,27 @@ export function SyncConfigDialog({
                     onClick={() => void handleDisconnect()}
                     disabled={isSaving}
                   >
-                    Disconnect
+                    {t("account.selfHosted.disconnect")}
                   </Button>
                 )}
-                <Button
+                <LoadingButton
                   variant="outline"
                   onClick={() => void handleTestConnection()}
-                  disabled={isTesting || !serverUrl}
+                  isLoading={isTesting}
+                  disabled={!serverUrl}
                 >
-                  {isTesting ? "Testing..." : "Test Connection"}
-                </Button>
+                  {t("account.selfHosted.testConnection")}
+                </LoadingButton>
                 <LoadingButton
                   onClick={() => void handleSave()}
                   isLoading={isSaving}
                   disabled={!serverUrl || !token}
                 >
-                  Save
+                  {t("common.buttons.save")}
                 </LoadingButton>
               </DialogFooter>
-            </TabsContent>
-          </Tabs>
+            </AnimatedTabsContent>
+          </AnimatedTabs>
         )}
       </DialogContent>
     </Dialog>

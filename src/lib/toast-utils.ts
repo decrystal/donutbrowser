@@ -3,6 +3,7 @@ import React from "react";
 import { type ExternalToast, toast as sonnerToast } from "sonner";
 import { UnifiedToast } from "@/components/custom-toast";
 import i18n from "@/i18n";
+import { playUiSound, type UiSound } from "@/lib/ui-sounds";
 
 interface BaseToastProps {
   id?: string;
@@ -26,6 +27,10 @@ interface SuccessToastProps extends BaseToastProps {
 
 interface ErrorToastProps extends BaseToastProps {
   type: "error";
+}
+
+interface InfoToastProps extends BaseToastProps {
+  type: "info";
 }
 
 interface DownloadToastProps extends BaseToastProps {
@@ -65,6 +70,7 @@ interface SyncProgressToastProps extends BaseToastProps {
 type ToastProps =
   | SuccessToastProps
   | ErrorToastProps
+  | InfoToastProps
   | DownloadToastProps
   | LoadingToastProps
   | VersionUpdateToastProps
@@ -175,6 +181,8 @@ export function showDownloadToast(
     return;
   }
 
+  if (stage === "completed") playUiSound("download");
+
   // Only show cancel button during active downloading, not for completed/extracting/verifying
   const showCancel = stage === "downloading";
 
@@ -188,14 +196,21 @@ export function showDownloadToast(
   });
 }
 
+interface ResultToastOptions {
+  id?: string;
+  description?: string;
+  duration?: number;
+  /** The sound to play instead of the toast's own; null plays none. */
+  sound?: UiSound | null;
+  /** One button that acts on the result, such as "Show". */
+  action?: ExternalToast["action"];
+}
+
 export function showSuccessToast(
   title: string,
-  options?: {
-    id?: string;
-    description?: string;
-    duration?: number;
-  },
+  { sound = "success", ...options }: ResultToastOptions = {},
 ) {
+  if (sound) playUiSound(sound);
   return showToast({
     type: "success",
     title,
@@ -205,16 +220,52 @@ export function showSuccessToast(
 
 export function showErrorToast(
   title: string,
-  options?: {
-    id?: string;
-    description?: string;
-    duration?: number;
-  },
+  { sound = "error", ...options }: ResultToastOptions = {},
 ) {
+  if (sound) playUiSound(sound);
   return showToast({
     type: "error",
     title,
     ...options,
+  });
+}
+
+interface UndoToastOptions {
+  id?: string;
+  description?: string;
+  /** How long Undo stays offered, in milliseconds. */
+  duration?: number;
+  /** The sound to play; null plays none. */
+  sound?: UiSound | null;
+}
+
+/**
+ * A finished, reversible action ("Moved to Trash") with an Undo button.
+ * `onUndo` runs at most once, and the toast closes when it is pressed.
+ */
+export function showUndoToast(
+  title: string,
+  onUndo: () => void | Promise<void>,
+  { sound = "trash", duration = 8000, ...options }: UndoToastOptions = {},
+) {
+  if (sound) playUiSound(sound);
+  const id = options.id ?? `toast-undo-${Date.now()}`;
+  let used = false;
+  return showToast({
+    type: "success",
+    title,
+    ...options,
+    id,
+    duration,
+    action: {
+      label: i18n.t("common.buttons.undo"),
+      onClick: () => {
+        if (used) return;
+        used = true;
+        dismissToast(id);
+        void onUndo();
+      },
+    },
   });
 }
 

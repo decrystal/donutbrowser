@@ -1,4 +1,4 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+﻿# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
 
 # dependencies
 /node_modules
@@ -12,6 +12,7 @@
 # testing
 /coverage
 /e2e/app/target/
+/e2e/app/Cargo.lock
 /e2e/.driver/
 
 # next.js
@@ -35,7 +36,7 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# nodecar
+# nested build output
 **/dist
 **/node_modules
 
@@ -49,9 +50,6 @@ yarn-error.log*
 *.tsbuildinfo
 
 !**/.gitkeep
-
-# nodecar
-nodecar/nodecar-bin
 
 # sync test harness cache
 .cache/
@@ -71,6 +69,7 @@ HANDOFF.md
 .claude/stop-failure-events.jsonl
 .claude/quota-blocked.json
 session-recover.yaml
+# Claude Code session-recovery state
 
 # donut.bat runtime pid files
 .donut-*.pid

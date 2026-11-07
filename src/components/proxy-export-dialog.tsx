@@ -16,6 +16,7 @@ import {
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { playUiSound } from "@/lib/ui-sounds";
 import { RippleButton } from "./ui/ripple";
 
 interface ProxyExportDialogProps {
@@ -53,6 +54,7 @@ export function ProxyExportDialog({ isOpen, onClose }: ProxyExportDialogProps) {
   const handleCopyToClipboard = useCallback(async () => {
     try {
       await navigator.clipboard.writeText(exportContent);
+      playUiSound("copy");
       setCopied(true);
       toast.success(t("toasts.success.copied"));
       setTimeout(() => {
@@ -65,7 +67,7 @@ export function ProxyExportDialog({ isOpen, onClose }: ProxyExportDialogProps) {
   }, [exportContent, t]);
 
   const handleDownload = useCallback(() => {
-    const filename = format === "json" ? "proxies.json" : "proxies.txt";
+    const filename = `proxies.${format}`;
     const mimeType = format === "json" ? "application/json" : "text/plain";
 
     const blob = new Blob([exportContent], { type: mimeType });

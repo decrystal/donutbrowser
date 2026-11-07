@@ -6,8 +6,9 @@ on:
 
 jobs:
   stale:
-    if: github.repository == 'zhom/donutbrowser'
+    if: github.repository == 'donutbrowser/donutbrowser'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       issues: write
       pull-requests: write

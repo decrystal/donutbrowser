@@ -1,4 +1,4 @@
-# Project Guidelines
+﻿# Project Guidelines
 
 > NOTE: CLAUDE.md is a symlink to AGENTS.md. Editing either file updates both.
 > After significant changes (new modules, renamed files, new directories), re-evaluate the Repository Structure below and update it if needed.
@@ -7,57 +7,102 @@
 
 ```
 donutbrowser/
-├── src/                              # Next.js frontend
-│   ├── app/                          # App router (page.tsx, layout.tsx)
-│   ├── components/                   # 50+ React components (dialogs, tables, UI)
-│   ├── hooks/                        # Event-driven React hooks
-│   ├── i18n/locales/                 # Translations (en, es, fr, ja, ko, pt, ru, tr, vi, zh)
-│   ├── generated/                    # Build-generated third-party license inventory
-│   ├── lib/                          # Utilities (themes, toast, browser-utils)
-│   └── types.ts                      # Shared TypeScript interfaces
-├── src-tauri/                        # Rust backend (Tauri)
-│   ├── src/
-│   │   ├── lib.rs                    # Tauri command registration (100+ commands)
-│   │   ├── browser_runner.rs         # Profile launch/kill orchestration
-│   │   ├── browser.rs               # Browser trait & launch logic
-│   │   ├── profile/                  # Profile CRUD (manager.rs, types.rs)
-│   │   ├── proxy_manager.rs         # Proxy lifecycle & connection testing
-│   │   ├── proxy_server.rs          # Local proxy binary (donut-proxy)
-│   │   ├── proxy_storage.rs         # Proxy config persistence (JSON files)
-│   │   ├── api_server.rs            # REST API (utoipa + axum)
-│   │   ├── mcp_server.rs            # MCP protocol server
-│   │   ├── automation_rate_limiter.rs # Shared REST/MCP automation quota
-│   │   ├── sync/                    # Cloud sync (engine, encryption, manifest, scheduler)
-│   │   ├── vpn/                     # WireGuard tunnels
-│   │   ├── xray/                    # VLESS + XTLS Vision + REALITY config/URI support
-│   │   ├── xray_worker_runner.rs    # Xray-core sidecar lifecycle
-│   │   ├── xray_worker_storage.rs   # Private Xray worker state and runtime files
-│   │   ├── wayfern_manager.rs       # Wayfern (Chromium) browser management
+鈹溾攢鈹€ src/                              # Next.js frontend
+鈹?  鈹溾攢鈹€ app/                          # App router (page.tsx, layout.tsx)
+鈹?  鈹溾攢鈹€ components/                   # 50+ React components (dialogs, tables, UI)
+鈹?  鈹?  鈹溾攢鈹€ table-controls.tsx         # Shared filters, sort rules, column controls, and row selection
+鈹?  鈹?  鈹溾攢鈹€ managed-data-table.tsx     # Shared management table and keyboard navigation
+鈹?  鈹?  鈹溾攢鈹€ entity-page.tsx            # Proxy/VPN/group/extension page parts: page and row actions, kind badges, sync and check cells
+鈹?  鈹?  鈹溾攢鈹€ entity-empty-state.tsx     # Empty states of those pages, with their scenes
+鈹?  鈹?  鈹溾攢鈹€ profile-search-input.tsx   # Profile search with ghost-text completion and suggestions
+鈹?  鈹?  鈹溾攢鈹€ profile-table/            # Profile table parts: launch control, traffic cell and snapshots, row menu, column fit
+鈹?  鈹?  鈹溾攢鈹€ settings/                 # Settings page parts: rows, choice cards, theme previews, sounds, save bar
+鈹?  鈹?  鈹溾攢鈹€ feature-clip.tsx          # Recordings of the app (public/clips) for tips and onboarding
+鈹?  鈹?  鈹溾攢鈹€ agent-chat/               # Agent page: chats, composer, sidebar, templates gallery (catalog in lib/agent-templates.ts)
+鈹?  鈹?  鈹斺攢鈹€ tips/                     # Feature tips: icons and the day's coach mark
+鈹?  鈹溾攢鈹€ hooks/                        # Event-driven React hooks, table preferences, filtering, and keyboard controls
+鈹?  鈹溾攢鈹€ i18n/locales/                 # Translations (de, en, es, fr, ja, ko, pt, ru, tr, vi, zh)
+鈹?  鈹溾攢鈹€ generated/                    # Build-generated third-party license inventory
+鈹?  鈹溾攢鈹€ lib/                          # Utilities (themes, toast, browser-utils, ui-sounds, schedules, team-activity, coach-mark placement, profile-list-store, agent-templates)
+鈹?  鈹斺攢鈹€ types.ts                      # Shared TypeScript interfaces
+鈹溾攢鈹€ src-tauri/                        # Rust backend (Tauri)
+鈹?  鈹溾攢鈹€ src/
+鈹?  鈹?  鈹溾攢鈹€ lib.rs                    # Tauri command registration (100+ commands)
+鈹?  鈹?  鈹溾攢鈹€ browser_runner.rs         # Profile launch/kill orchestration
+鈹?  鈹?  鈹溾攢鈹€ browser.rs               # Browser trait & launch logic
+鈹?  鈹?  鈹溾攢鈹€ profile/                  # Profile CRUD (manager.rs, types.rs), bulk-edit patch (patch.rs), trash
+鈹?  鈹?  鈹溾攢鈹€ proxy_manager.rs         # Proxy lifecycle, connection testing, per-proxy check history
+鈹?  鈹?  鈹溾攢鈹€ proxy_udp.rs             # SOCKS5 UDP ASSOCIATE probe (yes/no/unknown UDP verdict)
+鈹?  鈹?  鈹溾攢鈹€ proxy_server.rs          # Local proxy binary (donut-proxy)
+鈹?  鈹?  鈹溾攢鈹€ profile_dns.rs           # Per-profile DNS server: DoH/DoT/TCP resolver the worker runs through the profile's own route
+鈹?  鈹?  鈹溾攢鈹€ proxy_storage.rs         # Proxy config persistence (JSON files)
+鈹?  鈹?  鈹溾攢鈹€ api_server.rs            # REST API (utoipa + axum)
+鈹?  鈹?  鈹溾攢鈹€ mcp_server.rs            # MCP tool engine, served over the remote bridge
+鈹?  鈹?  鈹溾攢鈹€ mcp_toolsets.rs          # Optional MCP toolsets: which tools a client lists (core + opt-in sets)
+鈹?  鈹?  鈹溾攢鈹€ mcp_views.rs             # Compact MCP views: profile summaries, filters, paging, size caps
+鈹?  鈹?  鈹溾攢鈹€ navigation_watch.rs      # Whether a CDP action navigated, so a click waits only for a load that comes
+鈹?  鈹?  鈹溾攢鈹€ network_capture.rs       # MCP network capture: one browser-level socket per profile, in memory, credentials redacted
+鈹?  鈹?  鈹溾攢鈹€ agent_uploads.rs         # Files an agent sends to file_upload, kept until the browser stops
+鈹?  鈹?  鈹溾攢鈹€ mcp_remote.rs            # Remote MCP bridge: outbound websocket to Donut cloud (Enterprise remote control)
+鈹?  鈹?  鈹溾攢鈹€ mcp_integrations.rs      # 20-client MCP installer: remote endpoint with bearer, format-preserving JSONC/TOML edits
+鈹?  鈹?  鈹溾攢鈹€ automation_rate_limiter.rs # Shared REST/MCP automation quota
+鈹?  鈹?  鈹溾攢鈹€ agent_console.rs         # The person's side of connected MCP agents: activity, questions, notes, take-over, pause
+鈹?  鈹?  鈹溾攢鈹€ agent_tasks/             # Agent tasks and routines (hidden unless the `agent` entitlement): Wayfern engine over CDP, multi-profile batches, agent token, cloud runs
+鈹?  鈹?  鈹溾攢鈹€ recipes.rs               # Thin client for cloud recipes; storage and replay stay in the cloud
+鈹?  鈹?  鈹溾攢鈹€ agent_schedules.rs       # Thin client for scheduled recipes (paid plans; the cloud checks the plan)
+鈹?  鈹?  鈹溾攢鈹€ cloud_api.rs             # Signed-in JSON calls to Donut cloud, with token refresh and error codes
+鈹?  鈹?  鈹溾攢鈹€ feedback.rs              # Feedback to the Donut team from the dialog and the send_feedback MCP tool, optional redacted logs
+鈹?  鈹?  鈹溾攢鈹€ sync/                    # Cloud sync (engine, encryption, manifest, scheduler, lease: one device at a time per profile)
+鈹?  鈹?  鈹溾攢鈹€ vpn/                     # WireGuard tunnels
+鈹?  鈹?  鈹溾攢鈹€ ramfs/                   # Windows RAM volume for ephemeral profiles: in-memory file system on WinFsp, hosted by donut-proxy
+鈹?  鈹?  鈹溾攢鈹€ xray/                    # Xray share links (VLESS, VMess, Trojan, Hysteria2): parse, export, client config
+鈹?  鈹?  鈹溾攢鈹€ xray_worker_runner.rs    # Xray-core sidecar lifecycle
+鈹?  鈹?  鈹溾攢鈹€ xray_worker_storage.rs   # Private Xray worker state and runtime files
+鈹?  鈹?  鈹溾攢鈹€ wayfern_manager.rs       # Wayfern (Chromium) browser management
 │   │   ├── fingerprint_chromium.rs  # Open-source fingerprint browser configuration
-│   │   ├── downloader.rs           # Browser binary downloader
-│   │   ├── extraction.rs           # Archive extraction (zip, tar, dmg, msi)
-│   │   ├── settings_manager.rs     # App settings persistence
-│   │   ├── cookie_manager.rs       # Cookie import/export
-│   │   ├── profile_importer.rs     # Bulk profile import (Chromium-family detection, ZIP, batch)
-│   │   ├── fingerprint_consistency.rs # Launch-time proxy exit vs fingerprint timezone/language check
-│   │   ├── dns_blocklist.rs         # Hagezi DNS blocklists + user custom lists/allowlist
-│   │   ├── traffic_stats.rs         # Per-profile traffic stats + secure history erase
-│   │   ├── extension_manager.rs    # Browser extension management
-│   │   ├── group_manager.rs        # Profile group management
-│   │   ├── synchronizer.rs         # Real-time profile synchronizer
-│   │   ├── daemon/                 # Background daemon + tray icon (currently disabled)
-│   │   └── cloud_auth.rs           # Cloud authentication
-│   ├── tests/                      # Integration tests
-│   └── Cargo.toml                  # Rust dependencies
-├── donut-sync/                     # NestJS sync server (self-hostable)
-│   └── src/                        # Controllers, services, auth, S3 sync
-├── e2e/                            # Isolated native UI/sync/Wayfern E2E system
-│   ├── app/                        # Test-only Tauri harness that injects the private driver
-│   ├── lib/                        # WebDriver, CDP, fixtures, app-session helpers
-│   └── tests/                      # Smoke, UI, entity, integration, sync, browser suites
-├── patches/                        # pnpm compatibility patches for secured dependencies
-├── flake.nix                       # Nix development environment
-└── .github/workflows/              # CI/CD pipelines
+鈹?  鈹?  鈹溾攢鈹€ downloader.rs           # Browser binary downloader
+鈹?  鈹?  鈹溾攢鈹€ extraction.rs           # Archive extraction (zip, tar, dmg, msi)
+鈹?  鈹?  鈹溾攢鈹€ portable_update.rs      # Portable Windows ZIP self-update: staged in .update/, files swapped at restart
+鈹?  鈹?  鈹溾攢鈹€ settings_manager.rs     # App settings persistence (atomic writes), tips + paid-welcome state
+鈹?  鈹?  鈹溾攢鈹€ system_proxy.rs         # The OS proxy Donut's own requests use; named in the error when it is unreachable
+鈹?  鈹?  鈹溾攢鈹€ vault.rs                # Per-install key that seals local secrets; opens legacy build-password seals once
+鈹?  鈹?  鈹溾攢鈹€ cookie_manager.rs       # Cookie import/export
+鈹?  鈹?  鈹溾攢鈹€ local_storage.rs        # Local Storage LevelDB read/write, Playwright storageState import/export
+鈹?  鈹?  鈹溾攢鈹€ site_storage.rs         # Oversized per-site storage: measure, notice after an early exit, move aside, delete backup
+鈹?  鈹?  鈹溾攢鈹€ profile_importer.rs     # Bulk profile import (Chromium-family detection, ZIP, batch)
+鈹?  鈹?  鈹溾攢鈹€ profile_templates.rs    # Synced profile templates and bulk create from a template
+鈹?  鈹?  鈹溾攢鈹€ profile_statuses.rs     # Synced profile statuses (name + color) set on profiles
+鈹?  鈹?  鈹溾攢鈹€ totp.rs                 # RFC 6238 codes; profile_totp.rs keeps sealed per-profile keys (device only)
+鈹?  鈹?  鈹溾攢鈹€ fingerprint_consistency.rs # Launch-time proxy exit vs fingerprint timezone/language check
+鈹?  鈹?  鈹溾攢鈹€ dns_blocklist.rs         # Hagezi DNS blocklists + user custom lists/allowlist
+鈹?  鈹?  鈹溾攢鈹€ traffic_stats.rs         # Per-profile traffic stats + secure history erase
+鈹?  鈹?  鈹溾攢鈹€ extension_manager.rs    # Browser extension management
+鈹?  鈹?  鈹溾攢鈹€ extension_fetch.rs      # Web Store link/id and direct .crx/.zip import, CRX3 unwrapping
+鈹?  鈹?  鈹溾攢鈹€ group_manager.rs        # Profile group management
+鈹?  鈹?  鈹溾攢鈹€ synchronizer.rs         # Real-time profile synchronizer (pause/resume, hold a follower out, window layouts)
+鈹?  鈹?  鈹溾攢鈹€ legacy_autostart.rs     # Removes the autostart entry the removed tray daemon (0.14-0.17) left behind
+鈹?  鈹?  鈹溾攢鈹€ team_roles.rs           # Launcher seat: refuses team-data commands and MCP tools, read-only sync
+鈹?  鈹?  鈹溾攢鈹€ team_activity.rs        # Team activity log: batched reports of member edits, owner/admin viewer
+鈹?  鈹?  鈹斺攢鈹€ cloud_auth.rs           # Cloud authentication
+鈹?  鈹溾攢鈹€ tests/                      # Integration tests
+鈹?  鈹斺攢鈹€ Cargo.toml                  # Rust dependencies
+鈹溾攢鈹€ donut-sync/                     # Sync server in Rust (self-hostable): auth, presigned S3 URLs, team rules
+鈹?  鈹溾攢鈹€ src/                        # http.rs routing, sync.rs object routes, locks.rs profile leases (/v1/locks/*), auth.rs, s3.rs + sigv4.rs, subscribe.rs (SSE),
+鈹?  鈹?                              # at_rest.rs + sealed_store.rs + transfer.rs (optional encryption at rest, SYNC_AT_REST_KEY), migrate.rs (migrate/verify-at-rest)
+鈹?  鈹斺攢鈹€ tests/                      # End-to-end tests: the binary against the compose S3 server
+鈹?  鈹斺攢鈹€ src/                        # Controllers, services, auth, S3 sync
+鈹溾攢鈹€ e2e/                            # Isolated native UI/sync/Wayfern E2E system
+鈹?  鈹溾攢鈹€ app/                        # Test-only Tauri harness that injects the private driver
+鈹?  鈹溾攢鈹€ lib/                        # WebDriver, CDP, fixtures, app-session helpers
+鈹?  鈹斺攢鈹€ tests/                      # Smoke, UI/motion, entity, network, integration, sync, browser suites
+鈹溾攢鈹€ sdk/                            # Standalone Python + Node clients for the local REST API
+鈹?  鈹溾攢鈹€ api-paths.json              # Snapshot of every published operation; drift check for both SDKs
+鈹?  鈹溾攢鈹€ python/                     # `donutbrowser` (stdlib only, pytest)
+鈹?  鈹斺攢鈹€ node/                       # `@donutbrowser/sdk` (ESM TypeScript, node --test)
+鈹溾攢鈹€ packaging/                      # Flatpak manifest, shared AppStream metainfo, Linux package smoke tests
+鈹溾攢鈹€ snap/                           # snapcraft.yaml (strict confinement, repackages the .deb)
+鈹溾攢鈹€ flake.nix                       # Nix development environment
+鈹斺攢鈹€ .github/workflows/              # CI/CD pipelines
 ```
 
 ## Testing and Quality
@@ -65,7 +110,7 @@ donutbrowser/
 - After making changes, run `pnpm format && pnpm lint && pnpm test` at the root of the project
 - Always run this command before finishing a task to ensure the application isn't broken
 - `pnpm lint` includes spellcheck via [typos](https://github.com/crate-ci/typos). False positives can be allowlisted in `_typos.toml`
-- The full `pnpm test` output dumps every test name (≈400+ lines) which burns context for no signal. Filter:
+- The full `pnpm test` output dumps every test name (鈮?00+ lines) which burns context for no signal. Filter:
   `pnpm test 2>&1 | grep -E "test result|panicked|FAILED"`. Four "test result: ok" lines means everything passed.
 
 ### Native app E2E tests are mandatory for affected behavior
@@ -80,6 +125,16 @@ The native suites use the published `tauri-wd` driver (pinned in `e2e/app/Cargo.
 into the ignored `e2e/.driver` root) and launch an `e2e`-feature build.
 Every session gets its own temporary Donut data/cache/log root, home directory,
 WebView store, ports, and sync bucket. Never point a suite at production or development data.
+A run never pops a window on the desktop or steals focus. On macOS and Windows every suite runs the
+Donut window headless (`DONUT_E2E_HEADLESS=1`, forwarded as the tauri-wd `headless` capability). On
+Linux `e2e/run.mjs` starts its own Xvfb display and shows the window there, because GTK never sizes
+a window it never shows and WebKitGTK then lays the page out at 0x0; Linux runs need Xvfb
+installed. `DONUT_E2E_HEADED=1` shows the window on the current display when a failure needs
+watching.
+
+`e2e/app/Cargo.lock` is generated, gitignored, and never edited by hand. `e2e/run.mjs` seeds it
+from `src-tauri/Cargo.lock` whenever that file is newer, so the harness always links the exact
+dependency versions Donut ships and a version bump or a Dependabot upgrade needs no second edit.
 
 After a behavior change, run the smallest affected subset below in addition to the standard
 format/lint/unit-test command. A code change is not verified until its affected native
@@ -94,7 +149,7 @@ suite passes:
 | REST API/OpenAPI, MCP, cloud/update contracts, team locks, real-time synchronizer | `pnpm e2e:integrations` |
 | Sync client/server, manifests, timestamps, deletion, encryption, password rollover | `pnpm e2e:sync` |
 | Wayfern download/terms/fingerprint, browser runner, CDP, automation endpoints, process cleanup | `pnpm e2e:browser` |
-| `donut-sync/` server code (controllers, services, auth, S3 endpoints) | `pnpm --filter donut-sync test:e2e` against a local MinIO |
+| `donut-sync/` server code (routes, auth, S3 client, presigning, subscriptions) | `cd donut-sync && cargo test` against the compose S3 server |
 | E2E harness, WebDriver plugin/driver, app isolation hooks, or changes spanning multiple rows | Run every affected row; use `pnpm e2e` for cross-cutting changes |
 
 `e2e:browser` requires `WAYFERN_TEST_TOKEN` in the environment or local `.env`. `e2e:network`
@@ -104,18 +159,15 @@ and the full suite additionally require Docker plus `RESIDENTIAL_PROXY_URL_ONE_H
 Keep failed artifacts and inspect the per-session app/driver logs and screenshot before changing
 assertions.
 
-The `donut-sync` row is the one suite the root `pnpm test` does not cover (`test:sync-e2e` runs
-the Rust sync harness only). It needs a MinIO on port 8987:
+The root `pnpm test` runs only the unit tests of `donut-sync` (`test:donut-sync`); its
+end-to-end tests are the `donut-sync` row. They run the binary against the S3 server in
+`donut-sync/docker-compose.yml` (`rclone serve s3` on port 8987; MinIO no longer publishes
+community images or binaries):
 
 ```bash
-docker run -d --rm --name minio -p 8987:9000 \
-  -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-  minio/minio:latest server /data
-SYNC_TOKEN=test-sync-token S3_ENDPOINT=http://127.0.0.1:8987 \
-  S3_ACCESS_KEY_ID=minioadmin S3_SECRET_ACCESS_KEY=minioadmin \
-  S3_BUCKET=donut-sync-test S3_FORCE_PATH_STYLE=true \
-  pnpm --filter donut-sync test:e2e
-docker rm -f minio
+docker compose -f donut-sync/docker-compose.yml up -d --wait
+(cd donut-sync && cargo test)
+docker compose -f donut-sync/docker-compose.yml down -v
 ```
 
 When adding a Tauri command, assign it exactly once in `e2e/coverage-map.mjs` and add executable
@@ -125,10 +177,23 @@ evidence to the owning suite. `e2e:smoke` fails if command registration and the 
 
 Three log surfaces, in order of usefulness:
 
-- Donut Browser GUI: `~/Library/Logs/com.donutbrowser/DonutBrowser.log` on macOS (newest = active session; older `DonutBrowser_<date>.log` are rotated). The GUI, Tauri, `browser_runner`, `proxy_manager`, and `sync` all log here. Search for `Wayfern`, `Starting local proxy`, `Configured local proxy` to find a launch chain. Dev builds write to `DonutBrowserDev.log` instead.
-- donut-proxy worker: `$TMPDIR/donut-proxy-<config_id>.log`. One file per proxy worker process (each profile launch spawns a fresh one). Map a worker to its launch via the `Cleanup: browser PID X is dead, stopping proxy worker <id>` lines in DonutBrowser.log, or by mtime. CONNECT requests, upstream accept/reject (status lines like `HTTP/1.1 402 user reached limit`), and tunnel errors are at INFO/WARN. Anything finer is at TRACE and requires `RUST_LOG=donut_proxy=trace`. The `Upstream CONNECT response coalesced N byte(s) of payload` warning (those bytes would be dropped without forwarding) marks a real bug in `handle_connect_from_buffer` if it ever fires.
+- Donut Browser GUI: `~/Library/Logs/com.donutbrowser/DonutBrowser.log` on macOS (newest = active session; older `DonutBrowser_<date>.log` are rotated). The GUI, Tauri, `browser_runner`, `proxy_manager`, and `sync` all log here, and uncaught frontend errors arrive with the `webview` target. Search for `profile=<uuid>` to follow a launch: `Proxy worker started`, then `Browser launched` (or `Browser launch failed` / `Browser launch blocked`), then `Browser stopped` or `Browser exited`. Dev builds write to `DonutBrowserDev.log` instead.
+- donut-proxy worker: `$TMPDIR/donut-proxy-<config_id>.log`. One file per worker process (each profile launch spawns a fresh one); same line shape as the app log, with UTC timestamps. Its first line is `Worker started kind=proxy|vpn id= pid= listen= upstream=<scheme://host:port|direct> ...` (never credentials) and, when it stops on its own, its last is `Worker exiting ... reason=`; a worker the app kills writes no last line, so read the app's `Proxy worker stopped id=<id>` instead. Map a worker to its launch via `Proxy worker started id=<id> ... profile=<uuid>` and `Proxy worker stopped id=<id> ... reason=...` (`browser_exited(<browser pid>)`, `orphan_at_startup`, ...) in DonutBrowser.log. Upstream rejects (status lines like `HTTP/1.1 402 user reached limit`) and tunnel errors are at WARN as `CONNECT tunnel failed err="..." suppressed_30s=N`, at most once per 30s per message, with the destination host replaced by `<target>`. Destinations (accepted CONNECT requests, per-request detail) are at DEBUG or TRACE on purpose, so the log is not a list of visited sites; set `RUST_LOG=donutbrowser_lib::proxy_server=debug` (or `=trace`) in the app's environment to see them; it overrides the INFO default. The worker writes its traffic stats file at most once a minute, and again when it gets SIGTERM.
 
 Linux/Windows swap `~/Library/Logs/com.donutbrowser/` for the platform-appropriate location (see `app_dirs::app_name()`), but the `$TMPDIR` worker logs are always under the system temp dir.
+
+### Writing log lines
+
+Agents read these files; people rarely do. Every line must tell an agent something it cannot get elsewhere, at the lowest byte cost.
+
+- Line shape: `[2026-10-08 17:53:49.362][sync::scheduler][INFO] Profile synced profile=<uuid> files=12 bytes=4096 elapsed_ms=812`. The target drops the `donutbrowser_lib::` prefix (`app` is `lib.rs`). Start with what happened, then the facts as `key=value`. Quote values that can hold spaces: `err="..."`.
+- Each session opens with `Donut started version=... os=... pid=...`, and closes with `Donut exiting browsers=[...] proxy_workers=[...] ...`, which lists what outlives the app as `id@pid` (`process_report.rs`). The same fields follow `Found from an earlier run` at startup.
+- Name entities by id: `profile=<uuid>`, `proxy=<id>`, `vpn=<id>`, `group=<id>`, `pid=`. Never log profile names, emails, visited URLs, or credentials: people attach these files to public issues.
+- Levels: `error` = an operation the person asked for failed, or data is at risk. `warn` = degraded or unexpected, but work continues. `info` = a state change worth knowing later (start, launch, spawn, exit, kill, sync result, install), once per change. `debug` = per-poll, per-request, per-file and steady-state detail ("already in sync", "using cache", "nothing to do"). The file keeps `info` and above.
+- A loop or retry never logs each tick or attempt. A failure that can repeat goes through `log_streak`: `Streak` (one line when it starts, one reminder an hour, one line with the count when it recovers; a failure within a minute of a recovery continues the streak as a flap), `KeyedStreak` when the failure belongs to one entity (one streak per `profile=`/`key=`, so one entity's success never hides another's failure), or `Throttle` for events that are normal one at a time but noisy in bulk, such as refused requests (one line per key per window, with `suppressed=N`).
+- No banners and no `Starting X...` line before a result line: put `elapsed_ms` on the result line.
+- Log an error chain once (`err=...`); do not wrap it in the same context again (`Failed to X: Failed to X: ...`).
+- Processes: log every spawn with `pid` and what it serves, and every exit or kill with `pid` and the exit status. Child process output (browser stdout, worker stderr) is `debug` unless it explains a failure.
 
 ## Code Quality
 
@@ -140,7 +205,7 @@ Linux/Windows swap `~/Library/Logs/com.donutbrowser/` for the platform-appropria
 
 - Never write user-facing strings as raw English literals in JSX, toast messages, dialog titles/descriptions, button labels, placeholders, table headers, tooltips, or empty-state text. Always go through `t("namespace.key")` from `useTranslation()`.
 - This applies to every component under `src/`, including new ones. If a component doesn't already import `useTranslation`, add it.
-- Adding a new string means adding the key to EVERY locale file in `src/i18n/locales/` (currently en, es, fr, ja, ko, pt, ru, tr, vi, zh), not just `en.json`. The English version alone is incomplete work. Don't trust this list: enumerate `src/i18n/locales/*.json` and update every file you find, because a newly added locale is exactly what a hardcoded list silently skips.
+- Adding a new string means adding the key to EVERY locale file in `src/i18n/locales/` (currently de, en, es, fr, ja, ko, pt, ru, tr, vi, zh), not just `en.json`. The English version alone is incomplete work. Don't trust this list: enumerate `src/i18n/locales/*.json` and update every file you find, because a newly added locale is exactly what a hardcoded list silently skips.
 - Reuse existing keys (`common.buttons.*`, `common.labels.*`, `createProfile.*`, etc.) before creating new namespaces. Check `en.json` first.
 - Strings excluded from this rule: `console.log/warn/error`, dev-only debug labels, internal IDs, CSS class names, type names. If unsure whether a string renders to the user, assume it does and translate it.
 - Never use `t(key, "fallback")` with a default-value second argument. The 2-arg form is forbidden: every key must exist in every locale file before the call site lands. Fallbacks mask missing translations, so a key missing from `ru.json` silently renders the English fallback to Russian users and the bug never surfaces in CI or review. Only call `t("namespace.key")`. If a translation is missing for any locale, that's a bug to fix at the JSON, not a hole to paper over at the call site.
@@ -225,7 +290,7 @@ Reference implementations: `src/components/account-page.tsx`, `src/components/pr
 
 ### Cross-component tab control
 
-When a tabbed sub-page dialog needs to be opened to a specific tab by an external trigger (e.g. a keyboard shortcut that toggles `proxies` ↔ `vpns`), expose an `initialTab` prop and key the `Tabs` component off it. The `key` change forces a remount so the new tab is selected even though the internal `activeTab` state is otherwise sticky:
+When a tabbed sub-page dialog needs to be opened to a specific tab by an external trigger (e.g. a keyboard shortcut that toggles `proxies` 鈫?`vpns`), expose an `initialTab` prop and key the `Tabs` component off it. The `key` change forces a remount so the new tab is selected even though the internal `activeTab` state is otherwise sticky:
 
 ```tsx
 <AnimatedTabs key={initialTab} defaultValue={initialTab} ...>
@@ -233,12 +298,135 @@ When a tabbed sub-page dialog needs to be opened to a specific tab by an externa
 
 Reference implementations: `proxy-management-dialog.tsx`, `extension-management-dialog.tsx`, `integrations-dialog.tsx`. The owning page in `src/app/page.tsx` keeps one piece of `useState` per dialog (`proxyManagementInitialTab`, `extensionManagementInitialTab`, `integrationsInitialTab`) and flips it on repeated shortcut presses.
 
+## Feature tips and the paid welcome
+
+Tips are short feature walkthroughs: a short recording of the app with the
+feature in use, a title, two or three lines of copy, and a button into the
+feature. The catalog is
+`src/lib/tips.ts` (ids, sections, deep-link actions, the anchors a tip points
+at, the plan capability a tip needs, the `inUse` relevance check); the
+recordings are `public/clips/<id>-<light|dark>.webp` with a `-still.webp`
+frame, shown by `src/components/feature-clip.tsx`; icons are
+in `src/components/tips/tip-icon.tsx`; the catalog dialog is `src/components/tips-dialog.tsx`; the
+day's tip on the Profiles page is `src/components/tips/tip-coach-mark.tsx`; the
+flow (what to show when) is `src/hooks/use-tips.ts`. State (`tips_auto_show`,
+`tips_seen`, `tips_used`, `tips_inline`, `tips_last_auto_shown_at`,
+`tips_next_auto_show_at`, `paid_welcome_seen_for`, `cloud_plan_memory`) is in
+`AppSettings`, behind the `get_tips_state`, `show_inline_tip`,
+`release_inline_tip`, `mark_tip_seen`, `note_tip_feature_used`,
+`set_tips_auto_show` and `observe_cloud_plan` commands.
+
+- Tips never open a dialog by themselves. The catalog opens from the rail,
+  the shortcut, the command palette, the coach mark's menu and the paid
+  welcome.
+- The day's tip is a coach mark (`src/components/ui/coach-mark.tsx`) on the
+  feature itself: a ring drawn around it, a beacon on its corner, and a card
+  beside it with an arrow. Each tip lists `anchors`, best first: the feature
+  when it is on the Profiles page (a column header, the search box, the New
+  button, a row's info button), then the rail item that leads to it (the
+  Settings button for DNS settings, More for the trash). The first anchor on
+  screen wins; the last one is always on screen (`pnpm test:tips` checks it).
+  When the feature lives on another page, the card's button deep-links to it;
+  when it is on the page, the card has only "Got it".
+- An anchor is any element with `data-tip-anchor="<id>"`, spread with
+  `tipAnchor(id, side)` from `src/lib/coach-mark.ts`; the ids are the typed
+  `COACH_ANCHORS` list. `data-tip-side` names the side the card prefers (the
+  rail uses `right`). The coach mark follows its anchor through scrolling,
+  resizing and re-renders, flips to stay on screen, hides while a modal
+  surface is open, never takes the focus, describes the anchor with its text
+  (`aria-describedby`), and closes with Escape. An anchor counts only while
+  most of it shows: not scrolled out of any container, under a `.scroll-fade`
+  sticky header or fade band, or covered. The followed element keeps the mark
+  while it shows; then the nearest element of the same id, the next anchor,
+  or nothing (the mark hides until one comes back). Events schedule one
+  measure per frame (`frame.read`). The card stays inside the anchor's scroll
+  container when it fits there. Placement and choice are the pure
+  `placeCoachMark` and `pickAnchor` (tests in `src/lib/coach-mark.test.mjs`).
+- One new tip a day, only on the Profiles page with at least one profile,
+  after a settled launch (onboarding done, terms accepted, never in the
+  first-run session), once the page has been quiet a few seconds with nothing
+  modal open. The backend pins it (`tips_inline`), so a restart shows the same
+  tip until it is dismissed ("Got it", Escape), acted on (its button, or a
+  click on the feature it points at) or read in the catalog (`mark_tip_seen`).
+  Closing it sets `tips_next_auto_show_at` to the next local day, at least 12
+  hours later (`next_inline_tip_at`). `tips_auto_show` is the "Show tips on
+  the Profiles page" switch; off removes the mark unread and counts as the
+  day's tip. `save_app_settings` keeps the stored tips fields
+  (`keep_tips_state`): only the tips commands write them. The E2E harness seeds
+  `tips_auto_show: false`; a test that wants the day's tip passes
+  `settings: { tips_auto_show: true }` or calls `set_tips_auto_show`.
+- "Show me" in the catalog closes it and points the same coach mark at the
+  feature (`showOnPage`). The tip is read already, so closing it records
+  nothing and the day's tip, if one is pinned, waits behind it.
+- The pick is random among the unseen tips whose feature is not in use
+  (`pickInlineTip`). Each tip's `inUse` reads a `FeatureUsage` snapshot:
+  profile fields, groups, VPNs, extension groups, team, Cookie Bot
+  enrolments and the sync server come from data `page.tsx` has loaded; API,
+  remote control, fingerprint gate, launch guard, proxy check history,
+  templates, default browser, trash, agent runs and sent feedback are read
+  by `use-tips.ts` through existing commands, and only for the tips still in
+  the running. Features that leave no trace (command palette, field search,
+  shortcuts page, import page, 2FA tool, synchronizer) are noted as they are
+  used (`note_tip_feature_used`, `tips_used`). An unknown fact never hides a
+  tip. A mark whose feature comes into use leaves by itself; backend facts
+  are read again when the window or the Profiles page comes back, at most
+  once a minute. A launcher seat is not offered tips marked `editsTeamData`.
+  A pinned tip the seat is no longer offered (its plan is gone) is released
+  unread once the account has loaded (`pinnedTipFate`, `release_inline_tip`),
+  and the next tip still waits for the day after it appeared.
+- Plan tips carry `requires`; they are listed only when the signed-in plan
+  grants the capability. The paid welcome opens once per account when the
+  backend sees it turn paid (free -> paid, or a paid account first seen right
+  after signing in); `paid_welcome_due` in `settings_manager.rs` is the rule.
+- Adding a tip: append to `TIPS` with a `section`, `anchors` and an `inUse`
+  check, script its clip in `scripts/clips/clips.mjs` and record it, map an
+  icon, add `tips.items.<id>.{label,title,body,action}` to every locale, and
+  run `pnpm test:tips`, which checks every locale carries every tip and
+  section and every tip points somewhere.
+- `pnpm clips [ids] [--theme=dark|light]` records the clips again after a UI
+  change: a static build of the working tree (in the system temp folder, never
+  the checkout's `dist`) runs in Chrome with a mocked backend and invented
+  demo data (`scripts/clips/demo-data.js`), slowed down so every frame is
+  captured, then encoded as near-lossless animated WebP (`img2webp`). Each
+  clip holds one frame (no camera moves: a pan rewrites every pixel of every
+  frame) and loops cleanly: it ends where it started, or crossfades back.
+  Animated WebP plays in WKWebView, WebKitGTK without GStreamer codecs, and
+  WebView2. Keep a clip near 250 KB.
+- Clips are decorative and never hide the copy. Under reduced motion only the
+  still shows. The coach mark plays its clip for a few loops and then rests
+  on the still, so the main page does not animate all day; a return to the
+  page shows the mark at rest (`settled`).
+
+## Onboarding
+
+A new install sees `src/components/welcome-dialog.tsx`: intro, the
+profile-isolation example, licensing, macOS permissions, and the browser
+setup, with `StepDots` (`ui/step-dots.tsx`) for progress. The intro shows a
+recording of profiles launching and setup a recording of the first profile
+being made (`FeatureClip`); the download's own progress is in setup's text.
+Steps move, they never fade in: text and controls are opaque from the first
+frame. A user with no profile then gets the tour,
+`src/components/onboarding-tour.tsx`: the same coach mark with `spotlight`
+(the page dims around the anchor, and the anchor still takes clicks), first on
+the New button until a profile exists, then on that profile's DNS control.
+Skip or Escape completes onboarding; Finish also opens the thank-you dialog.
+
+## Timelines (`OperationFlow`)
+
+`src/components/ui/operation-flow.tsx` draws any measured operation as a row
+of stations: settled stations wear a check, the current one is a ring (a
+cross when `failed`), later ones wait as dots, wires fill as stations settle,
+and `busy` sends a pulse along the wire into the station being worked on.
+Pass `active` as the station the operation is AT, and `failed` when it
+stopped there: a proxy check that cannot connect is `active={1}` (the proxy),
+not the device. Reaching the last station with nothing failed settles the row.
+
 ## Keyboard shortcuts
 
 All app-wide shortcuts live in `src/lib/shortcuts.ts`:
 
 - `SHORTCUTS[]`: one entry per shortcut (id, label translation key, group, key, modifier flags). The label key must exist in every locale.
-- `formatShortcut(s)` returns platform-correct token strings (`["⌘", "K"]` on mac, `["Ctrl", "K"]` elsewhere), used by both the shortcuts page and the command palette.
+- `shortcutKeys(s)` returns the platform-correct keys (鈱?鈬?K on mac, Ctrl Shift K elsewhere) that `Kbd`/`KbdGroup` (`src/components/ui/kbd.tsx`) draw as keycaps in the shortcuts page and the command palette. `formatShortcut(s)` is the same as plain strings.
 - `matchesShortcut(s, event)` matches a real `KeyboardEvent` and rejects the wrong-platform modifier so Ctrl+K on macOS never fires a `mod: true` shortcut.
 - `matchesGroupDigit(event)` returns 1-9 if Mod+digit was pressed. Group switching is dynamic (driven by `orderedGroupTargets` in `page.tsx`) and isn't in the `SHORTCUTS` table.
 
@@ -247,9 +435,9 @@ Dispatch: the global `keydown` listener and the `runShortcut` callback both live
 1. Append to `SHORTCUTS` in `src/lib/shortcuts.ts`. Add the `ShortcutId` variant.
 2. Add a `case "yourId":` in `runShortcut` in `page.tsx`.
 3. Add the icon mapping in `src/components/command-palette.tsx::ICONS`.
-4. Add `shortcuts.yourId` (label) to every locale file in `src/i18n/locales/`.
+4. Add `shortcuts.yourId` (label) and `commandPalette.keywords.yourId` (search synonyms) to every locale file in `src/i18n/locales/`.
 
-The command palette (Mod+K) is built on the shadcn `Command` primitive with a token-AND fuzzy filter (`fuzzyFilter` in `command-palette.tsx`). The `CommandDialog` wrapper now forwards `filter`/`shouldFilter` to the inner `Command` for callers that need custom matching.
+The command palette (Mod+K) is built on the shadcn `Command` primitive. `paletteScore` in `src/lib/palette-search.ts` is its filter: every query word must appear in the label or the keywords, in any order. It keeps recent commands in `localStorage` (`donut.commandPalette.recent`), opens nested pages (launch, stop, profile info, groups) that Backspace or Escape leave, and runs any shortcut pressed inside it. `CommandGlide` (`ui/command.tsx`) draws the selection that glides between items.
 
 ## Singletons
 
@@ -273,6 +461,8 @@ The command palette (Mod+K) is built on the shadcn `Command` primitive with a to
   - `chart-1` through `chart-5`: data visualization
 - Use these as Tailwind classes: `bg-success`, `text-destructive`, `border-warning`, etc.
 - For lighter variants use opacity: `bg-destructive/10`, `bg-success/10`, `border-warning/50`
+- Quiet, borderless fills (soft buttons, fields, chips, hover and selected rows) are tints of the theme's own `foreground` (`bg-foreground/5`) or `primary` (`bg-primary/10`), never `muted`, `accent` or `secondary`: several custom themes make those loud (Tokyo Night's accent is purple, its secondary cyan). Reach for the `soft`/`subtle` Button, `soft` Badge, `soft`/`bare` Input and `soft` SelectTrigger variants, or wrap a form section in `SoftFields` (`ui/field-variant.tsx`).
+- Data tables use `.data-table` (globals.css) with `DATA_TABLE_CLASSES` and `SortableColumnHeader` from `table-controls.tsx`: no row rules, one tinted header strip, rounded row highlight. Secondary row controls take `row-reveal` to appear on row hover or focus.
 
 ## App data directory naming
 
@@ -310,7 +500,7 @@ Required env vars / secrets: `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_END
 ## Sync (cloud / self-hosted)
 
 Sync mirrors local state to S3-compatible storage (Donut cloud, or a self-hosted
-`donut-sync` NestJS server). Two distinct mechanisms live in `src-tauri/src/sync/`:
+`donut-sync` server). Two distinct mechanisms live in `src-tauri/src/sync/`:
 
 - Profile browser files (the Chromium/Firefox profile directory): a
   content-hash manifest (`manifest.rs` `generate_manifest`/`compute_diff`) does a
@@ -337,8 +527,7 @@ edit timestamp: an edit didn't bump it, so the stale remote always re-downloaded
 Reconcile (`engine.rs::remote_updated_at` + each `sync_X`):
 1. `stat` (HEAD) the remote object. Its `updated_at` is read from S3 object
    metadata (`x-amz-meta-updated-at`), with no body download when nothing changed.
-2. Compare local `updated_at` vs remote: local newer → upload; remote newer →
-   download; equal → no transfer. Legacy objects with no timestamp resolve to 0,
+2. Compare local `updated_at` vs remote: local newer 鈫?upload; remote newer 鈫?   download; equal 鈫?no transfer. Legacy objects with no timestamp resolve to 0,
    so any real edit wins.
 3. Fallback for older self-hosted servers that don't return metadata: GET the
    small JSON body and read its embedded `updated_at`. Correctness is preserved
@@ -352,11 +541,28 @@ path, and route its reconcile through `remote_updated_at` + `upload_config_json`
 
 ### Server (`donut-sync/`) metadata passthrough
 
-`presignUpload` signs request `metadata` into the PUT as `x-amz-meta-*` and
-echoes back what it signed (the Rust client must send exactly those headers on
-the PUT or S3 rejects it, hence the echo). `stat` returns `response.Metadata`.
-Older servers omit `metadata` → client falls back to the body-GET path. DTOs:
-`donut-sync/src/sync/dto/sync.dto.ts`; logic: `sync.service.ts`.
+`presign-upload` signs request `metadata` into the PUT as `x-amz-meta-*` and
+echoes back what it signed (the app must send exactly those headers on the PUT
+or S3 rejects it, hence the echo). `stat` returns the object's user metadata.
+Older servers omit `metadata` 鈫?client falls back to the body-GET path. Logic:
+`donut-sync/src/sync.rs` (`presign_upload`, `stat`).
+
+The server's HTTP API (routes, JSON shapes, error bodies, status codes, the SSE
+framing) is a public contract: self-hosters pull the latest image, and older
+apps keep talking to it. Change it only on purpose, together with the clients.
+
+## Team roles and the activity log
+
+- A `launcher` seat opens the team's profiles and keeps what a session changes, never the team's
+  settings. The sync server enforces it (`LAUNCHER_WRITABLE` in `donut-sync/src/sync.rs`: only a profile's
+  `files/` and `manifest.json`); the app mirrors it so an edit never appears and then reverts.
+- `team_roles.rs` lists every Tauri command and MCP tool that changes team data (profiles,
+  proxies, groups, VPNs, extensions, templates, statuses). A new command or tool of that kind goes
+  in the list; the tests check every name is registered. On a launcher seat the sync engine takes
+  the team's copy of every setting and skips its own uploads and deletes of them.
+- `team_activity::record` notes a person's edit of a synced entity, next to the `updated_at` bump.
+  Only a team seat with team collaboration reports; names leave the app only when E2E encryption
+  is off. Launches, stops and membership are written by the cloud itself, not reported.
 
 ## Proprietary Changes
 

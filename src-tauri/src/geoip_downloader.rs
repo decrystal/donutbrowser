@@ -1,4 +1,4 @@
-use crate::browser::GithubRelease;
+use crate::browser::{GithubAsset, GithubRelease};
 use crate::events;
 use crate::profile::manager::ProfileManager;
 use reqwest::Client;
@@ -25,14 +25,63 @@ pub struct GeoIPDownloadProgress {
 static DOWNLOAD_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 pub struct GeoIPDownloader {
-  client: Client,
+  /// A client a test supplies; otherwise `HTTP`.
+  client: Option<Client>,
+}
+
+// A stalled connection must not hold the one download slot forever. The
+// overall limit leaves room for a 60 MB file on a slow link.
+static HTTP: crate::app_proxy::SharedClient = crate::app_proxy::SharedClient::new(|builder| {
+  builder
+    .connect_timeout(std::time::Duration::from_secs(30))
+    .timeout(std::time::Duration::from_secs(30 * 60))
+});
+
+/// How the files are checked before they replace the ones in use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatabaseKind {
+  City,
+  Asn,
+}
+
+impl DatabaseKind {
+  /// What the file's own metadata names it, e.g. `GeoLite2-City`.
+  fn type_suffix(self) -> &'static str {
+    match self {
+      Self::City => "City",
+      Self::Asn => "ASN",
+    }
+  }
+}
+
+/// A finished download that is not the database it claims to be: cut short,
+/// an error page, or another file. It never replaces the file in use.
+fn verify_database(
+  path: &std::path::Path,
+  kind: DatabaseKind,
+  expected_size: u64,
+) -> Result<(), String> {
+  let size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+  if expected_size > 0 && size != expected_size {
+    return Err(format!(
+      "size {size} differs from the published {expected_size}"
+    ));
+  }
+  let reader = maxminddb::Reader::open_readfile(path).map_err(|e| e.to_string())?;
+  let database_type = &reader.metadata().database_type;
+  if !database_type.ends_with(kind.type_suffix()) {
+    return Err(format!("the file is a {database_type} database"));
+  }
+  Ok(())
 }
 
 impl GeoIPDownloader {
   fn new() -> Self {
-    Self {
-      client: Client::new(),
-    }
+    Self { client: None }
+  }
+
+  fn client(&self) -> Client {
+    self.client.clone().unwrap_or_else(|| HTTP.get())
   }
 
   pub fn instance() -> &'static GeoIPDownloader {
@@ -42,7 +91,9 @@ impl GeoIPDownloader {
   /// Create a new downloader with custom client (for testing)
   #[cfg(test)]
   pub fn new_with_client(client: Client) -> Self {
-    Self { client }
+    Self {
+      client: Some(client),
+    }
   }
 
   fn get_cache_dir() -> PathBuf {
@@ -51,6 +102,32 @@ impl GeoIPDownloader {
 
   pub fn get_mmdb_file_path() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     Ok(Self::get_cache_dir().join("GeoLite2-City.mmdb"))
+  }
+
+  /// Where the autonomous-system database lives. It is the only MaxMind file
+  /// that carries an organisation for an address, which is what a proxy check
+  /// reports as the exit's ISP; the city database has no such field. Same
+  /// release, same publisher, fetched by the same code — it is simply a second
+  /// asset off the download the city database already comes from.
+  pub fn get_asn_mmdb_file_path() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(Self::get_cache_dir().join("GeoLite2-ASN.mmdb"))
+  }
+
+  fn get_release_path() -> PathBuf {
+    crate::app_dirs::cache_dir().join("geoip_release")
+  }
+
+  /// The release the files in place came from, so an unchanged release is not
+  /// downloaded again.
+  fn installed_release() -> Option<String> {
+    std::fs::read_to_string(Self::get_release_path())
+      .ok()
+      .map(|tag| tag.trim().to_string())
+      .filter(|tag| !tag.is_empty())
+  }
+
+  fn asn_missing() -> bool {
+    Self::get_asn_mmdb_file_path().map_or(true, |path| !path.exists())
   }
 
   pub fn is_geoip_database_available() -> bool {
@@ -92,19 +169,39 @@ impl GeoIPDownloader {
     let needs_geoip = profiles.iter().any(|profile| profile.browser == "wayfern");
 
     if needs_geoip {
-      return Ok(!Self::is_geoip_database_available() || Self::is_geoip_stale());
+      return Ok(
+        !Self::is_geoip_database_available() || Self::is_geoip_stale() || Self::asn_missing(),
+      );
     }
 
     Ok(false)
   }
 
-  fn find_city_mmdb_asset(&self, release: &GithubRelease) -> Option<String> {
-    for asset in &release.assets {
-      if asset.name.ends_with("-City.mmdb") {
-        return Some(asset.browser_download_url.clone());
-      }
+  fn find_mmdb_asset<'a>(release: &'a GithubRelease, suffix: &str) -> Option<&'a GithubAsset> {
+    release
+      .assets
+      .iter()
+      .find(|asset| asset.name.ends_with(suffix))
+  }
+
+  /// The newest published release that has a City database.
+  fn pick_release(releases: &[GithubRelease]) -> Option<&GithubRelease> {
+    releases
+      .iter()
+      .filter(|release| !release.prerelease)
+      .find(|release| Self::find_mmdb_asset(release, "-City.mmdb").is_some())
+  }
+
+  fn write_timestamp() {
+    let now = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .unwrap_or_default()
+      .as_secs();
+    let path = Self::get_timestamp_path();
+    if let Some(parent) = path.parent() {
+      let _ = std::fs::create_dir_all(parent);
     }
-    None
+    let _ = std::fs::write(&path, now.to_string());
   }
 
   pub async fn download_geoip_database(
@@ -115,7 +212,7 @@ impl GeoIPDownloader {
       .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
       .is_err()
     {
-      log::info!("GeoIP database download already in progress, skipping");
+      log::debug!("GeoIP download already running");
       return Ok(());
     }
     let result = self.download_geoip_database_inner(_app_handle).await;
@@ -148,15 +245,63 @@ impl GeoIPDownloader {
     #[cfg(not(feature = "e2e"))]
     let fixture_url: Option<String> = None;
 
-    let download_url = if let Some(url) = fixture_url {
-      url
+    #[cfg(feature = "e2e")]
+    let asn_fixture_url = std::env::var("DONUT_E2E_GEOIP_ASN_DOWNLOAD_URL")
+      .ok()
+      .filter(|url| !url.is_empty());
+    #[cfg(not(feature = "e2e"))]
+    let asn_fixture_url: Option<String> = None;
+
+    // The ASN asset comes off the same release as the city one, so the release
+    // is kept rather than looked up twice.
+    let (download_url, city_size, asn_url, asn_size, release_tag) = if let Some(url) = fixture_url {
+      (url, 0, asn_fixture_url, 0, None)
     } else {
       let releases = self.fetch_geoip_releases().await?;
-      let latest_release = releases.first().ok_or("No GeoIP database releases found")?;
-      self
-        .find_city_mmdb_asset(latest_release)
-        .ok_or("No compatible GeoIP database asset found")?
+      let release =
+        Self::pick_release(&releases).ok_or("No compatible GeoIP database release found")?;
+      let city = Self::find_mmdb_asset(release, "-City.mmdb")
+        .ok_or("No compatible GeoIP database asset found")?;
+      let asn = Self::find_mmdb_asset(release, "-ASN.mmdb");
+      (
+        city.browser_download_url.clone(),
+        city.size,
+        asn.map(|asset| asset.browser_download_url.clone()),
+        asn.map_or(0, |asset| asset.size),
+        Some(release.tag_name.clone()),
+      )
     };
+
+    // The same release as the files in place: nothing to fetch but a missing
+    // ASN file. A 60 MB file is not downloaded again to learn that.
+    let city_current = release_tag.is_some()
+      && release_tag == Self::installed_release()
+      && Self::is_geoip_database_available();
+    if city_current {
+      Self::write_timestamp();
+      if let (true, Some(url)) = (Self::asn_missing(), asn_url.as_deref()) {
+        if let Err(e) = self.download_asn_database(url, asn_size).await {
+          log::warn!(
+            "GeoIP ASN database download failed err=\"{}\"",
+            crate::log_redaction::text(&e.to_string())
+          );
+        }
+      }
+      log::debug!("GeoIP database already current, download skipped");
+      let _ = events::emit(
+        "geoip-download-progress",
+        GeoIPDownloadProgress {
+          stage: "completed".to_string(),
+          percentage: 100.0,
+          message: "GeoIP database is current".to_string(),
+          downloaded_bytes: None,
+          total_bytes: None,
+          speed_bytes_per_sec: None,
+          eta_seconds: None,
+        },
+      );
+      return Ok(());
+    }
 
     // Create cache directory
     let cache_dir = Self::get_cache_dir();
@@ -172,7 +317,7 @@ impl GeoIPDownloader {
     let _ = fs::remove_file(&temp_path).await;
 
     // Download the file
-    let response = self.client.get(&download_url).send().await?;
+    let response = self.client().get(&download_url).send().await?;
 
     if !response.status().is_success() {
       return Err(
@@ -236,19 +381,33 @@ impl GeoIPDownloader {
     file.flush().await?;
     drop(file);
 
+    if let Err(reason) = verify_database(&temp_path, DatabaseKind::City, city_size) {
+      let _ = fs::remove_file(&temp_path).await;
+      return Err(format!("Downloaded GeoIP database failed verification: {reason}").into());
+    }
+
     // Atomically replace the old database with the new one
     fs::rename(&temp_path, &mmdb_path).await?;
-
-    // Write download timestamp
-    let timestamp_path = Self::get_timestamp_path();
-    if let Some(parent) = timestamp_path.parent() {
-      let _ = fs::create_dir_all(parent).await;
+    Self::write_timestamp();
+    if let Some(tag) = &release_tag {
+      let _ = fs::write(Self::get_release_path(), tag).await;
     }
-    let now = std::time::SystemTime::now()
-      .duration_since(std::time::UNIX_EPOCH)
-      .unwrap_or_default()
-      .as_secs();
-    let _ = fs::write(&timestamp_path, now.to_string()).await;
+    log::info!(
+      "GeoIP database updated release={} bytes={downloaded}",
+      release_tag.as_deref().unwrap_or("fixture")
+    );
+
+    // The autonomous-system database, best effort. It only feeds the exit
+    // organisation a proxy check reports, so a failure here must never fail
+    // the download that fingerprint geolocation actually depends on.
+    if let Some(url) = asn_url {
+      if let Err(e) = self.download_asn_database(&url, asn_size).await {
+        log::warn!(
+          "GeoIP ASN database download failed err=\"{}\"",
+          crate::log_redaction::text(&e.to_string())
+        );
+      }
+    }
 
     // Emit completion
     let _ = events::emit(
@@ -267,12 +426,45 @@ impl GeoIPDownloader {
     Ok(())
   }
 
+  /// Fetch the ASN database to a temp file and rename it into place, so a
+  /// half-written file is never left where a lookup would read it.
+  async fn download_asn_database(
+    &self,
+    url: &str,
+    expected_size: u64,
+  ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let path = Self::get_asn_mmdb_file_path()?;
+    let temp_path = path.with_extension("mmdb.downloading");
+    let _ = fs::remove_file(&temp_path).await;
+
+    let response = self.client().get(url).send().await?;
+    if !response.status().is_success() {
+      return Err(format!("HTTP {}", response.status()).into());
+    }
+
+    let mut file = fs::File::create(&temp_path).await?;
+    let mut stream = response.bytes_stream();
+    use futures_util::StreamExt;
+    while let Some(chunk) = stream.next().await {
+      file.write_all(&chunk?).await?;
+    }
+    file.flush().await?;
+    drop(file);
+
+    if let Err(reason) = verify_database(&temp_path, DatabaseKind::Asn, expected_size) {
+      let _ = fs::remove_file(&temp_path).await;
+      return Err(format!("failed verification: {reason}").into());
+    }
+    fs::rename(&temp_path, &path).await?;
+    Ok(())
+  }
+
   async fn fetch_geoip_releases(
     &self,
   ) -> Result<Vec<GithubRelease>, Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("https://api.github.com/repos/{MMDB_REPO}/releases");
     let response = self
-      .client
+      .client()
       .get(&url)
       .header("User-Agent", "Mozilla/5.0 (compatible; donutbrowser)")
       .send()
@@ -296,9 +488,8 @@ pub fn check_missing_geoip_database() -> Result<bool, String> {
 }
 
 // Global singleton instance
-lazy_static::lazy_static! {
-  static ref GEOIP_DOWNLOADER: GeoIPDownloader = GeoIPDownloader::new();
-}
+static GEOIP_DOWNLOADER: std::sync::LazyLock<GeoIPDownloader> =
+  std::sync::LazyLock::new(GeoIPDownloader::new);
 
 #[cfg(test)]
 mod tests {
@@ -359,7 +550,7 @@ mod tests {
     // Override the URL for testing
     let url = format!("{}/repos/{}/releases", mock_server.uri(), MMDB_REPO);
     let response = downloader
-      .client
+      .client()
       .get(&url)
       .header("User-Agent", "Mozilla/5.0 (compatible; donutbrowser)")
       .send()
@@ -373,24 +564,48 @@ mod tests {
     assert_eq!(fetched_releases[0].tag_name, "v1.0.0");
   }
 
-  #[tokio::test]
-  async fn test_find_city_mmdb_asset() {
-    let downloader = GeoIPDownloader::new();
+  #[test]
+  fn test_find_city_mmdb_asset() {
     let release = create_mock_release();
-
-    let asset_url = downloader.find_city_mmdb_asset(&release);
-    assert!(asset_url.is_some());
-    assert_eq!(asset_url.unwrap(), "https://example.com/GeoLite2-City.mmdb");
+    let asset = GeoIPDownloader::find_mmdb_asset(&release, "-City.mmdb");
+    assert_eq!(
+      asset.map(|asset| asset.browser_download_url.as_str()),
+      Some("https://example.com/GeoLite2-City.mmdb")
+    );
   }
 
-  #[tokio::test]
-  async fn test_find_city_mmdb_asset_not_found() {
-    let downloader = GeoIPDownloader::new();
+  #[test]
+  fn test_find_city_mmdb_asset_not_found() {
     let mut release = create_mock_release();
     release.assets[0].name = "wrong-file.txt".to_string();
+    assert!(GeoIPDownloader::find_mmdb_asset(&release, "-City.mmdb").is_none());
+  }
 
-    let asset_url = downloader.find_city_mmdb_asset(&release);
-    assert!(asset_url.is_none());
+  #[test]
+  fn a_prerelease_or_a_release_without_a_city_file_is_skipped() {
+    let mut prerelease = create_mock_release();
+    prerelease.tag_name = "pre".to_string();
+    prerelease.prerelease = true;
+    let mut empty = create_mock_release();
+    empty.tag_name = "empty".to_string();
+    empty.assets.clear();
+    let releases = vec![prerelease, empty, create_mock_release()];
+    assert_eq!(
+      GeoIPDownloader::pick_release(&releases).map(|r| r.tag_name.as_str()),
+      Some("v1.0.0")
+    );
+  }
+
+  #[test]
+  fn a_file_that_is_not_the_database_never_replaces_the_one_in_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let page = dir.path().join("City.mmdb.downloading");
+    std::fs::write(&page, b"<html>rate limited</html>").unwrap();
+    assert!(verify_database(&page, DatabaseKind::City, 0).is_err());
+    assert!(verify_database(&page, DatabaseKind::City, 25).is_err());
+    assert!(verify_database(&page, DatabaseKind::City, 999)
+      .unwrap_err()
+      .contains("differs"));
   }
 
   #[test]

@@ -1,0 +1,110 @@
+name: Translation Review
+
+# Reviews the locale strings a push to main or a pull request changed.
+# Deterministic part: translations left stale after their English source
+# changed. Model part: wrong meaning, wrong language, English left
+# untranslated, broken placeholders. Advisory: neither its findings nor a
+# model API that is down, rate-limited or not configured fail the run; what
+# was not reviewed shows as a warning.
+# The key-set, empty-string and placeholder gates stay in
+# src/lib/i18n-parity.test.mjs, which runs in the Lint Rust job.
+#
+# pull_request_target runs in the base repository with a write token, so it
+# can comment on pull requests from forks. It checks out only the trusted
+# base branch; .github/scripts/i18n-review.mjs reads the pull request's locale
+# files through the API as data and never runs anything from the fork.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/i18n/locales/**"
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "src/i18n/locales/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: translation-review-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # GitHub Models was retired on 2026-07-30, and Copilot through the workflow
+  # token needs an org policy that bills the org. A free OpenRouter model
+  # answers instead.
+  # Free models allow 20 requests a minute and 50 a day per account (1000
+  # with credits bought), and the free list changes: when this model goes,
+  # pick another `:free` id from https://openrouter.ai/models. A free model is
+  # often down or rate-limited upstream, so each model is asked in turn.
+  AI_API_URL: https://openrouter.ai/api/v1/chat/completions
+  AI_MODEL: google/gemma-4-31b-it:free
+  AI_FALLBACK_MODELS: nvidia/nemotron-3-ultra-550b-a55b:free,google/gemma-4-26b-a4b-it:free,nvidia/nemotron-3-super-120b-a12b:free
+  # At most 3 batches of 48 KB of strings each per run. Keys whose English
+  # is new or changed go first; the rest are reported as not reviewed.
+  AI_MAX_REQUESTS: "3"
+  AI_BATCH_BYTES: "48000"
+
+jobs:
+  review:
+    if: >-
+      github.repository == 'donutbrowser/donutbrowser' &&
+      (github.event_name == 'push' ||
+       (github.event.pull_request.draft == false &&
+        github.event.pull_request.user.type != 'Bot'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout trusted scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+
+      # RUNNER_TEMP belongs to this job alone; a fixed /tmp path does not.
+      - name: Use a private work directory
+        run: echo "I18N_REVIEW_DIR=$RUNNER_TEMP/i18n-review" >> "$GITHUB_ENV"
+
+      - name: Collect changed strings
+        id: collect
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: node .github/scripts/i18n-review.mjs collect
+
+      # The model gets the strings as data and no tools. The API key is the
+      # only secret here, and it never enters the prompt.
+      - name: Ask the model
+        id: ai
+        if: steps.collect.outputs.review == 'true'
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          AI_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: node .github/scripts/i18n-review.mjs review
+
+      - name: Report
+        if: always() && steps.collect.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: node .github/scripts/i18n-review.mjs report
+
+      - name: Warn about strings the model did not review
+        if: always()
+        run: |
+          if [ -f "$I18N_REVIEW_DIR/ai-degraded" ]; then
+            while IFS= read -r line; do
+              echo "::warning title=Translation review::$line"
+            done < "$I18N_REVIEW_DIR/ai-degraded"
+          fi

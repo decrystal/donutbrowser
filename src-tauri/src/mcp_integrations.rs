@@ -1,17 +1,79 @@
-// MCP client integrations — installs/removes the donut-browser MCP server in
-// 14 popular AI assistant clients. Ports the add-mcp registry to Rust.
-//
-// Claude Desktop is managed via Claude's local extensions bundle
-// (manifest.json + node bridge), since the desktop app supports only stdio
-// servers via its plain JSON config but exposes HTTP through the extension
-// framework. See `add_mcp_to_claude_desktop_internal` in lib.rs. All other
-// agents (including Claude Code) use the generic config-file installer here.
+//! MCP client installer: writes the Donut Browser server entry into the global
+//! config of twenty-two AI clients and reads it back for the Integrations page.
+//!
+//! The endpoint lives under `CLOUD_API_URL`, needs a bearer credential and is
+//! only offered to accounts with remote control. `server_entry` decides per
+//! client where the credential goes: most clients take a `headers` map, Codex
+//! calls it `http_headers`, and fx refuses a literal header and reads the
+//! token from `DONUT_MCP_TOKEN` instead.
+//!
+//! Every write edits the user's file in place. JSON goes through a concrete
+//! syntax tree so comments, key order, indentation and trailing commas survive
+//! (`~/.claude.json` is a large file with many unrelated keys; VS Code, Zed,
+//! Gemini, OpenCode, Kilo and MCPorter files carry comments by design). TOML
+//! goes through `toml_edit`, which keeps comments and table order. YAML is
+//! rewritten from an order-preserving mapping; Goose tolerates that. A file
+//! that does not parse aborts the operation with the file untouched: the old
+//! installer treated a parse failure as an empty file and wiped configs that
+//! merely had a comment in them.
+//!
+//! Copilot CLI is the exception: it refuses comments and trailing commas, so a
+//! file that has them is written back as plain JSON. OpenCode keeps servers
+//! either directly under `mcp` or, in its newer layout, under `mcp.servers`;
+//! the entry goes where the file already keeps its servers.
+//!
+//! Claude Desktop has no HTTP entry in its config file; lib.rs installs a
+//! local extension bundle with a node bridge instead. This module only
+//! resolves its directory.
 
+use jsonc_parser::cst::{CstInputValue, CstObject, CstRootNode};
+use jsonc_parser::ParseOptions;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use toml_edit::{DocumentMut, Item, Table};
+use yaml_rust2::yaml::Hash as YamlMap;
+use yaml_rust2::{Yaml, YamlEmitter, YamlLoader};
 
-const SERVER_NAME: &str = "donut-browser";
+pub const SERVER_NAME: &str = "donut-browser";
+const REMOTE_MCP_PATH: &str = "/api/mcp";
+/// fx rejects a literal `Authorization` header in its config and reads the
+/// bearer from an environment variable named in the entry instead.
+pub const FX_TOKEN_ENV: &str = "DONUT_MCP_TOKEN";
+
+pub fn remote_mcp_url() -> String {
+  format!("{}{REMOTE_MCP_PATH}", crate::cloud_auth::CLOUD_API_URL)
+}
+
+/// What gets written into a client: the endpoint URL and its bearer
+/// credential.
+#[derive(Debug, Clone)]
+pub struct McpTarget {
+  pub url: String,
+  pub bearer: String,
+}
+
+impl McpTarget {
+  #[cfg(test)]
+  pub fn remote(key: String) -> Self {
+    Self::remote_with(key, &[])
+  }
+
+  /// With toolsets, the client lists only the core tools and those groups
+  /// (`mcp_toolsets`); with none, every tool.
+  pub fn remote_with(key: String, toolsets: &[String]) -> Self {
+    let url = if toolsets.is_empty() {
+      remote_mcp_url()
+    } else {
+      format!("{}?toolsets={}", remote_mcp_url(), toolsets.join(","))
+    };
+    Self { url, bearer: key }
+  }
+
+  pub fn authorization(&self) -> String {
+    format!("Bearer {}", self.bearer)
+  }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
@@ -22,7 +84,7 @@ pub enum AgentCategory {
   EditorExt,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigFormat {
   Json,
   Toml,
@@ -34,7 +96,7 @@ struct AgentSpec {
   id: &'static str,
   display_name: &'static str,
   category: AgentCategory,
-  /// Top-level key (supports dot notation) where the server is written.
+  /// Top-level key under which the client keeps its server map.
   config_key: &'static str,
   format: ConfigFormat,
 }
@@ -44,179 +106,302 @@ pub struct McpAgentInfo {
   pub id: String,
   pub display_name: String,
   pub category: AgentCategory,
+  /// True when the client's config has an entry pointing at the endpoint,
+  /// or names it in a file that does not parse.
   pub connected: bool,
-  /// True when the underlying client appears to be installed on the system
-  /// (its config directory exists), regardless of whether we have installed
-  /// the donut-browser server into it.
+  /// True when every such entry presents the stored key. A connected client
+  /// that is not current holds an older key or a file Donut cannot read, and
+  /// the page offers to update it.
+  #[serde(default)]
+  pub current: bool,
+  /// True when the client itself appears to be installed (its config
+  /// directory exists), whether or not Donut is configured in it.
   pub detected: bool,
+  /// Set for clients that read the bearer from an environment variable
+  /// instead of the config file, so the UI can tell the user to export it.
+  pub token_env: Option<String>,
 }
 
-fn home() -> Option<PathBuf> {
-  dirs::home_dir()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+  MacOs,
+  Linux,
+  Windows,
 }
 
-#[cfg(target_os = "macos")]
-fn vscode_user_dir() -> Option<PathBuf> {
-  home().map(|h| {
-    h.join("Library")
-      .join("Application Support")
-      .join("Code")
-      .join("User")
-  })
-}
-
-#[cfg(target_os = "windows")]
-fn vscode_user_dir() -> Option<PathBuf> {
-  std::env::var("APPDATA")
-    .ok()
-    .map(|a| PathBuf::from(a).join("Code").join("User"))
-}
-
-#[cfg(target_os = "linux")]
-fn vscode_user_dir() -> Option<PathBuf> {
-  let base = std::env::var("XDG_CONFIG_HOME")
-    .ok()
-    .map(PathBuf::from)
-    .or_else(|| home().map(|h| h.join(".config")))?;
-  Some(base.join("Code").join("User"))
-}
-
-#[cfg(target_os = "macos")]
-fn zed_config_dir() -> Option<PathBuf> {
-  home().map(|h| h.join("Library").join("Application Support").join("Zed"))
-}
-
-#[cfg(target_os = "windows")]
-fn zed_config_dir() -> Option<PathBuf> {
-  std::env::var("APPDATA")
-    .ok()
-    .map(|a| PathBuf::from(a).join("Zed"))
-}
-
-#[cfg(target_os = "linux")]
-fn zed_config_dir() -> Option<PathBuf> {
-  let base = std::env::var("XDG_CONFIG_HOME")
-    .ok()
-    .map(PathBuf::from)
-    .or_else(|| home().map(|h| h.join(".config")))?;
-  Some(base.join("zed"))
-}
-
-#[cfg(target_os = "windows")]
-fn goose_config_path() -> Option<PathBuf> {
-  std::env::var("APPDATA").ok().map(|a| {
-    PathBuf::from(a)
-      .join("Block")
-      .join("goose")
-      .join("config")
-      .join("config.yaml")
-  })
-}
-
-#[cfg(not(target_os = "windows"))]
-fn goose_config_path() -> Option<PathBuf> {
-  let base = std::env::var("XDG_CONFIG_HOME")
-    .ok()
-    .map(PathBuf::from)
-    .or_else(|| home().map(|h| h.join(".config")))?;
-  Some(base.join("goose").join("config.yaml"))
-}
-
-/// Resolve the global config path for an agent. Returns `None` on unsupported
-/// platforms (none currently — every supported agent has a defined path on
-/// macOS/Linux/Windows).
-fn config_path_for(agent_id: &str) -> Option<PathBuf> {
-  let h = home()?;
-  match agent_id {
-    "antigravity" => Some(
-      h.join(".gemini")
-        .join("antigravity")
-        .join("mcp_config.json"),
-    ),
-    "cline" => vscode_user_dir().map(|d| {
-      d.join("globalStorage")
-        .join("saoudrizwan.claude-dev")
-        .join("settings")
-        .join("cline_mcp_settings.json")
-    }),
-    "cline-cli" => {
-      let base = std::env::var("CLINE_DIR")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| h.join(".cline"));
-      Some(
-        base
-          .join("data")
-          .join("settings")
-          .join("cline_mcp_settings.json"),
-      )
+impl Platform {
+  pub fn current() -> Self {
+    if cfg!(target_os = "windows") {
+      Self::Windows
+    } else if cfg!(target_os = "macos") {
+      Self::MacOs
+    } else {
+      Self::Linux
     }
-    "claude-code" => Some(h.join(".claude.json")),
-    "claude-desktop" => claude_desktop_config_path(),
-    "codex" => {
-      let base = std::env::var("CODEX_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| h.join(".codex"));
-      Some(base.join("config.toml"))
-    }
-    "cursor" => Some(h.join(".cursor").join("mcp.json")),
-    "gemini-cli" => Some(h.join(".gemini").join("settings.json")),
-    "goose" => goose_config_path(),
-    "github-copilot-cli" => Some(
-      std::env::var("XDG_CONFIG_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| h.join(".copilot"))
-        .join("mcp-config.json"),
-    ),
-    "mcporter" => {
-      // add-mcp's resolveMcporterConfigPath: prefer mcporter.json, fall back
-      // to mcporter.jsonc if it already exists, else default to mcporter.json.
-      let dir = h.join(".mcporter");
-      let json_path = dir.join("mcporter.json");
-      let jsonc_path = dir.join("mcporter.jsonc");
-      if json_path.exists() {
-        Some(json_path)
-      } else if jsonc_path.exists() {
-        Some(jsonc_path)
-      } else {
-        Some(json_path)
-      }
-    }
-    "opencode" => Some(h.join(".config").join("opencode").join("opencode.json")),
-    "vscode" => vscode_user_dir().map(|d| d.join("mcp.json")),
-    "zed" => zed_config_dir().map(|d| d.join("settings.json")),
-    _ => None,
   }
 }
 
-#[cfg(target_os = "macos")]
-fn claude_desktop_config_path() -> Option<PathBuf> {
-  home().map(|h| {
-    h.join("Library")
-      .join("Application Support")
-      .join("Claude")
-      .join("claude_desktop_config.json")
-  })
+/// Everything path resolution reads from the environment, captured once.
+/// Tests build one over a temp directory instead of mutating the process
+/// environment, which parallel tests would race on.
+#[derive(Debug, Clone)]
+pub struct AgentEnv {
+  pub platform: Platform,
+  pub home: PathBuf,
+  pub appdata: Option<PathBuf>,
+  pub xdg_config_home: Option<PathBuf>,
+  pub codex_home: Option<PathBuf>,
+  pub grok_home: Option<PathBuf>,
+  pub kimi_code_home: Option<PathBuf>,
+  pub cline_dir: Option<PathBuf>,
+  pub copilot_home: Option<PathBuf>,
+  pub pi_agent_dir: Option<PathBuf>,
 }
 
-#[cfg(target_os = "windows")]
-fn claude_desktop_config_path() -> Option<PathBuf> {
-  std::env::var("APPDATA").ok().map(|a| {
-    PathBuf::from(a)
-      .join("Claude")
-      .join("claude_desktop_config.json")
-  })
-}
-
-#[cfg(target_os = "linux")]
-fn claude_desktop_config_path() -> Option<PathBuf> {
-  let base = std::env::var("XDG_CONFIG_HOME")
-    .ok()
+fn env_path(name: &str) -> Option<PathBuf> {
+  std::env::var_os(name)
+    .filter(|value| !value.is_empty())
     .map(PathBuf::from)
-    .or_else(|| home().map(|h| h.join(".config")))?;
-  Some(base.join("Claude").join("claude_desktop_config.json"))
+}
+
+impl AgentEnv {
+  pub fn from_process() -> Option<Self> {
+    Some(Self {
+      platform: Platform::current(),
+      // std, not `dirs`: on Windows `dirs` asks for the Profile known folder
+      // and ignores USERPROFILE, while the clients themselves (Node's
+      // os.homedir(), Rust's home_dir) follow USERPROFILE.
+      home: std::env::home_dir()?,
+      appdata: env_path("APPDATA"),
+      xdg_config_home: env_path("XDG_CONFIG_HOME"),
+      codex_home: env_path("CODEX_HOME"),
+      grok_home: env_path("GROK_HOME"),
+      kimi_code_home: env_path("KIMI_CODE_HOME"),
+      cline_dir: env_path("CLINE_DIR"),
+      copilot_home: env_path("COPILOT_HOME"),
+      pi_agent_dir: env_path("PI_CODING_AGENT_DIR"),
+    })
+  }
+
+  /// `$XDG_CONFIG_HOME`, else `~/.config`, on every platform: the clients that
+  /// follow the XDG layout do so on Windows too.
+  fn config_home(&self) -> PathBuf {
+    self
+      .xdg_config_home
+      .clone()
+      .unwrap_or_else(|| self.home.join(".config"))
+  }
+
+  fn appdata(&self) -> PathBuf {
+    self
+      .appdata
+      .clone()
+      .unwrap_or_else(|| self.home.join("AppData").join("Roaming"))
+  }
+
+  /// Where desktop apps keep per-user data: Application Support on macOS,
+  /// roaming AppData on Windows, the XDG config dir on Linux.
+  fn app_support(&self) -> PathBuf {
+    match self.platform {
+      Platform::MacOs => self.home.join("Library").join("Application Support"),
+      Platform::Windows => self.appdata(),
+      Platform::Linux => self.config_home(),
+    }
+  }
+
+  fn vscode_user_dir(&self) -> PathBuf {
+    self.app_support().join("Code").join("User")
+  }
+
+  pub fn claude_desktop_dir(&self) -> PathBuf {
+    self.app_support().join("Claude")
+  }
+
+  fn zed_config_dir(&self) -> PathBuf {
+    match self.platform {
+      // Zed's Linux directory is lower-case; the other two keep the app name.
+      Platform::Linux => self.config_home().join("zed"),
+      _ => self.app_support().join("Zed"),
+    }
+  }
+
+  fn goose_config_path(&self) -> PathBuf {
+    match self.platform {
+      Platform::Windows => self
+        .appdata()
+        .join("Block")
+        .join("goose")
+        .join("config")
+        .join("config.yaml"),
+      // Goose on macOS reads ~/.config even when XDG_CONFIG_HOME is set.
+      Platform::MacOs => self.home.join(".config").join("goose").join("config.yaml"),
+      Platform::Linux => self.config_home().join("goose").join("config.yaml"),
+    }
+  }
+
+  fn codex_home(&self) -> PathBuf {
+    self
+      .codex_home
+      .clone()
+      .unwrap_or_else(|| self.home.join(".codex"))
+  }
+
+  fn grok_home(&self) -> PathBuf {
+    self
+      .grok_home
+      .clone()
+      .unwrap_or_else(|| self.home.join(".grok"))
+  }
+
+  fn kimi_code_home(&self) -> PathBuf {
+    self
+      .kimi_code_home
+      .clone()
+      .unwrap_or_else(|| self.home.join(".kimi-code"))
+  }
+
+  fn cline_dir(&self) -> PathBuf {
+    self
+      .cline_dir
+      .clone()
+      .unwrap_or_else(|| self.home.join(".cline"))
+  }
+
+  fn kilo_config_dir(&self) -> PathBuf {
+    self.config_home().join("kilo")
+  }
+
+  /// `$COPILOT_HOME`, else `~/.copilot`. Copilot CLI ignores XDG_CONFIG_HOME.
+  fn copilot_home(&self) -> PathBuf {
+    self
+      .copilot_home
+      .clone()
+      .unwrap_or_else(|| self.home.join(".copilot"))
+  }
+
+  fn pi_agent_dir(&self) -> PathBuf {
+    self
+      .pi_agent_dir
+      .clone()
+      .unwrap_or_else(|| self.home.join(".pi").join("agent"))
+  }
+}
+
+/// The first candidate that already exists, else `default`, which the install
+/// will create. Clients that accept both `.json` and `.jsonc` must not end up
+/// with two competing files.
+fn first_existing(candidates: &[PathBuf], default: PathBuf) -> PathBuf {
+  candidates
+    .iter()
+    .find(|candidate| candidate.exists())
+    .cloned()
+    .unwrap_or(default)
+}
+
+fn config_path(env: &AgentEnv, agent_id: &str) -> Option<PathBuf> {
+  let home = &env.home;
+  let path = match agent_id {
+    "antigravity" => home.join(".gemini").join("config").join("mcp_config.json"),
+    "cline" => env
+      .vscode_user_dir()
+      .join("globalStorage")
+      .join("saoudrizwan.claude-dev")
+      .join("settings")
+      .join("cline_mcp_settings.json"),
+    "cline-cli" => env
+      .cline_dir()
+      .join("data")
+      .join("settings")
+      .join("cline_mcp_settings.json"),
+    "claude-code" => home.join(".claude.json"),
+    "claude-desktop" => env.claude_desktop_dir().join("claude_desktop_config.json"),
+    "codex" => env.codex_home().join("config.toml"),
+    "cursor" => home.join(".cursor").join("mcp.json"),
+    "fx" => home.join(".fx").join("mcp.json"),
+    "gemini-cli" => home.join(".gemini").join("settings.json"),
+    "goose" => env.goose_config_path(),
+    "github-copilot-cli" => env.copilot_home().join("mcp-config.json"),
+    "grok-build" => env.grok_home().join("config.toml"),
+    "kilo-code" => {
+      let dir = env.kilo_config_dir();
+      first_existing(
+        &[dir.join("kilo.jsonc"), dir.join("kilo.json")],
+        dir.join("kilo.json"),
+      )
+    }
+    "kimi-code" => env.kimi_code_home().join("mcp.json"),
+    "kiro-cli" => home.join(".kiro").join("settings").join("mcp.json"),
+    "mastracode" => home.join(".mastracode").join("mcp.json"),
+    "pi" => env.pi_agent_dir().join("mcp.json"),
+    "mcporter" => {
+      let dir = home.join(".mcporter");
+      first_existing(
+        &[dir.join("mcporter.json"), dir.join("mcporter.jsonc")],
+        dir.join("mcporter.json"),
+      )
+    }
+    "opencode" => {
+      // OpenCode reads ~/.config on every platform, with no XDG override, and
+      // its own docs prefer the .jsonc spelling for new files.
+      let dir = home.join(".config").join("opencode");
+      first_existing(
+        &[dir.join("opencode.jsonc"), dir.join("opencode.json")],
+        dir.join("opencode.jsonc"),
+      )
+    }
+    "vscode" => env.vscode_user_dir().join("mcp.json"),
+    "windsurf" => home
+      .join(".codeium")
+      .join("windsurf")
+      .join("mcp_config.json"),
+    "zed" => env.zed_config_dir().join("settings.json"),
+    _ => return None,
+  };
+  Some(path)
+}
+
+/// Whether the client itself looks installed. A UI annotation only: install
+/// and uninstall always operate on the resolved config path.
+fn detected(env: &AgentEnv, agent_id: &str) -> bool {
+  let home = &env.home;
+  let parent_exists = || {
+    config_path(env, agent_id)
+      .and_then(|path| path.parent().map(Path::exists))
+      .unwrap_or(false)
+  };
+  match agent_id {
+    "antigravity" => home.join(".gemini").join("config").exists(),
+    "cline" | "cline-cli" => parent_exists(),
+    "github-copilot-cli" => env.copilot_home().exists(),
+    "mastracode" => home.join(".mastracode").exists(),
+    "pi" => env.pi_agent_dir().exists(),
+    "claude-code" => home.join(".claude").exists(),
+    "claude-desktop" => env.claude_desktop_dir().exists(),
+    // Codex detection looks at the default directory even when CODEX_HOME
+    // points elsewhere; the install still honours the override.
+    "codex" => home.join(".codex").exists(),
+    "cursor" => home.join(".cursor").exists(),
+    "fx" => home.join(".fx").exists(),
+    "gemini-cli" => home.join(".gemini").exists(),
+    "goose" => env.goose_config_path().exists(),
+    "grok-build" => env.grok_home().exists(),
+    "kilo-code" => {
+      env.kilo_config_dir().exists()
+        || env
+          .vscode_user_dir()
+          .join("globalStorage")
+          .join("kilocode.kilo-code")
+          .exists()
+    }
+    "kimi-code" => env.kimi_code_home().exists(),
+    "kiro-cli" => home.join(".kiro").exists(),
+    "mcporter" => home.join(".mcporter").exists(),
+    "opencode" => home.join(".config").join("opencode").exists(),
+    "vscode" => env.vscode_user_dir().exists(),
+    "windsurf" => home.join(".codeium").join("windsurf").exists(),
+    "zed" => env.zed_config_dir().exists(),
+    _ => false,
+  }
 }
 
 const AGENT_SPECS: &[AgentSpec] = &[
@@ -249,6 +434,13 @@ const AGENT_SPECS: &[AgentSpec] = &[
     format: ConfigFormat::Json,
   },
   AgentSpec {
+    id: "windsurf",
+    display_name: "Windsurf",
+    category: AgentCategory::Editor,
+    config_key: "mcpServers",
+    format: ConfigFormat::Json,
+  },
+  AgentSpec {
     id: "zed",
     display_name: "Zed",
     category: AgentCategory::Editor,
@@ -277,6 +469,13 @@ const AGENT_SPECS: &[AgentSpec] = &[
     format: ConfigFormat::Toml,
   },
   AgentSpec {
+    id: "fx",
+    display_name: "fx",
+    category: AgentCategory::Cli,
+    config_key: "mcp",
+    format: ConfigFormat::Json,
+  },
+  AgentSpec {
     id: "gemini-cli",
     display_name: "Gemini CLI",
     category: AgentCategory::Cli,
@@ -298,9 +497,37 @@ const AGENT_SPECS: &[AgentSpec] = &[
     format: ConfigFormat::Yaml,
   },
   AgentSpec {
+    id: "grok-build",
+    display_name: "Grok Build",
+    category: AgentCategory::Cli,
+    config_key: "mcp_servers",
+    format: ConfigFormat::Toml,
+  },
+  AgentSpec {
     id: "antigravity",
     display_name: "Antigravity",
     category: AgentCategory::DesktopApp,
+    config_key: "mcpServers",
+    format: ConfigFormat::Json,
+  },
+  AgentSpec {
+    id: "kilo-code",
+    display_name: "Kilo Code",
+    category: AgentCategory::Cli,
+    config_key: "mcp",
+    format: ConfigFormat::Json,
+  },
+  AgentSpec {
+    id: "kimi-code",
+    display_name: "Kimi Code",
+    category: AgentCategory::Cli,
+    config_key: "mcpServers",
+    format: ConfigFormat::Json,
+  },
+  AgentSpec {
+    id: "kiro-cli",
+    display_name: "Kiro CLI",
+    category: AgentCategory::Cli,
     config_key: "mcpServers",
     format: ConfigFormat::Json,
   },
@@ -318,252 +545,843 @@ const AGENT_SPECS: &[AgentSpec] = &[
     config_key: "mcpServers",
     format: ConfigFormat::Json,
   },
+  // Pi reads MCP servers only with its MCP adapter extension installed.
+  AgentSpec {
+    id: "pi",
+    display_name: "Pi",
+    category: AgentCategory::Cli,
+    config_key: "mcpServers",
+    format: ConfigFormat::Json,
+  },
+  AgentSpec {
+    id: "mastracode",
+    display_name: "Mastra Code",
+    category: AgentCategory::Cli,
+    config_key: "mcpServers",
+    format: ConfigFormat::Json,
+  },
 ];
 
 fn spec_for(agent_id: &str) -> Option<&'static AgentSpec> {
-  AGENT_SPECS.iter().find(|s| s.id == agent_id)
+  AGENT_SPECS.iter().find(|spec| spec.id == agent_id)
 }
 
-fn detect_agent_directory(agent_id: &str) -> bool {
-  // Mirrors add-mcp's `detectGlobalInstall` checks — typically the immediate
-  // parent of the config file. Used only for UI annotation; install/uninstall
-  // always operates on the resolved config path.
-  let Some(h) = home() else {
-    return false;
+fn token_env_for(agent_id: &str) -> Option<String> {
+  (agent_id == "fx").then(|| FX_TOKEN_ENV.to_string())
+}
+
+/// A server entry with its keys in the order the client's own docs show them.
+/// `serde_json::Map` sorts keys, so the shape stays a list until written.
+type Entry = Vec<(&'static str, serde_json::Value)>;
+
+/// The per-client shape of the Donut entry, including where the credential
+/// goes. Every install replaces the entry wholesale so stale keys from an
+/// earlier shape never linger.
+fn server_entry(agent_id: &str, target: &McpTarget) -> Entry {
+  use serde_json::json;
+  let url = json!(target.url);
+  let headers = json!({ "Authorization": target.authorization() });
+  let mut entry: Entry = match agent_id {
+    "antigravity" | "windsurf" => vec![("serverUrl", url)],
+    "cursor" | "kiro-cli" | "grok-build" | "pi" | "mastracode" => vec![("url", url)],
+    "cline" | "cline-cli" => vec![
+      ("url", url),
+      ("type", json!("streamableHttp")),
+      ("disabled", json!(false)),
+    ],
+    "kimi-code" => vec![("transport", json!("http")), ("url", url)],
+    "github-copilot-cli" => vec![
+      ("type", json!("http")),
+      ("url", url),
+      ("tools", json!(["*"])),
+    ],
+    "zed" => vec![
+      ("source", json!("custom")),
+      ("type", json!("http")),
+      ("url", url),
+    ],
+    "opencode" | "kilo-code" => vec![
+      ("type", json!("remote")),
+      ("url", url),
+      ("enabled", json!(true)),
+    ],
+    "goose" => vec![
+      ("name", json!(SERVER_NAME)),
+      ("description", json!("")),
+      ("type", json!("streamable_http")),
+      ("uri", url),
+    ],
+    "fx" => vec![
+      ("type", json!("http")),
+      ("url", url),
+      ("enabled", json!(true)),
+    ],
+    // claude-code, codex, gemini-cli, mcporter, vscode: the standard
+    // streamable HTTP shape.
+    _ => vec![("type", json!("http")), ("url", url)],
   };
   match agent_id {
-    "antigravity" => h.join(".gemini").exists(),
-    "cline" => config_path_for("cline")
-      .and_then(|p| p.parent().map(|d| d.exists()))
-      .unwrap_or(false),
-    "cline-cli" => config_path_for("cline-cli")
-      .and_then(|p| p.parent().map(|d| d.exists()))
-      .unwrap_or(false),
-    "claude-code" => h.join(".claude").exists(),
-    "claude-desktop" => claude_desktop_config_path()
-      .and_then(|p| p.parent().map(|d| d.exists()))
-      .unwrap_or(false),
-    "codex" => h.join(".codex").exists(),
-    "cursor" => h.join(".cursor").exists(),
-    "gemini-cli" => h.join(".gemini").exists(),
-    "github-copilot-cli" => config_path_for("github-copilot-cli")
-      .and_then(|p| p.parent().map(|d| d.exists()))
-      .unwrap_or(false),
-    "goose" => goose_config_path().is_some_and(|p| p.exists()),
-    "mcporter" => h.join(".mcporter").exists(),
-    "opencode" => h.join(".config").join("opencode").exists(),
-    "vscode" => vscode_user_dir().is_some_and(|d| d.exists()),
-    "zed" => zed_config_dir().is_some_and(|d| d.exists()),
-    _ => false,
+    "codex" => entry.push(("http_headers", headers)),
+    "fx" => entry.push(("bearer_token_env", json!(FX_TOKEN_ENV))),
+    _ => entry.push(("headers", headers)),
+  }
+  if agent_id == "goose" {
+    entry.push(("enabled", json!(true)));
+    entry.push(("timeout", json!(300)));
+  }
+  entry
+}
+
+/// Whether a URL is Donut's endpoint, a trailing slash and a query (the
+/// toolsets) tolerated.
+pub fn is_remote_url(url: &str) -> bool {
+  let base = url.trim().split(['?', '#']).next().unwrap_or_default();
+  base.trim_end_matches('/') == remote_mcp_url().trim_end_matches('/')
+}
+
+fn points_at_remote(value: &serde_json::Value) -> bool {
+  ["url", "uri", "serverUrl"].iter().any(|key| {
+    value
+      .get(key)
+      .and_then(|v| v.as_str())
+      .is_some_and(is_remote_url)
+  })
+}
+
+/// Whether an entry presents `key`: in its Authorization header, or, for fx,
+/// by naming the variable the key is exported in.
+fn presents(value: &serde_json::Value, key: &str) -> bool {
+  let bearer = format!("Bearer {key}");
+  ["headers", "http_headers"].iter().any(|field| {
+    value
+      .get(field)
+      .and_then(|headers| headers.get("Authorization"))
+      .and_then(|v| v.as_str())
+      == Some(bearer.as_str())
+  }) || value.get("bearer_token_env").and_then(|v| v.as_str()) == Some(FX_TOKEN_ENV)
+}
+
+/// An entry an earlier version wrote for the old local server: our name and
+/// a loopback URL.
+fn is_legacy_entry(name: &str, value: &serde_json::Value) -> bool {
+  name == SERVER_NAME
+    && ["url", "uri", "serverUrl"].iter().any(|key| {
+      let url = value.get(key).and_then(|v| v.as_str()).unwrap_or_default();
+      let rest = url.trim().strip_prefix("http://").unwrap_or_default();
+      ["127.0.0.1", "localhost", "[::1]"].iter().any(|host| {
+        rest
+          .strip_prefix(host)
+          .is_some_and(|after| after.is_empty() || after.starts_with([':', '/']))
+      })
+    })
+}
+
+/// Ours by name, or ours by URL under any name, so a renamed entry is removed
+/// along with the one we wrote.
+fn is_donut_entry(name: &str, value: &serde_json::Value) -> bool {
+  name == SERVER_NAME || points_at_remote(value)
+}
+
+fn json_to_cst(value: &serde_json::Value) -> CstInputValue {
+  match value {
+    serde_json::Value::Null => CstInputValue::Null,
+    serde_json::Value::Bool(b) => CstInputValue::Bool(*b),
+    serde_json::Value::Number(n) => CstInputValue::Number(n.to_string()),
+    serde_json::Value::String(s) => CstInputValue::String(s.clone()),
+    serde_json::Value::Array(items) => {
+      CstInputValue::Array(items.iter().map(json_to_cst).collect())
+    }
+    serde_json::Value::Object(map) => CstInputValue::Object(
+      map
+        .iter()
+        .map(|(key, value)| (key.clone(), json_to_cst(value)))
+        .collect(),
+    ),
   }
 }
 
-/// Transform the donut-browser HTTP server config into the per-agent shape.
-/// All agents speak HTTP except Claude Desktop, which uses a node stdio bridge
-/// (handled by the extension installer in lib.rs).
-fn transform_remote_config(agent_id: &str, url: &str) -> serde_json::Value {
+fn entry_to_cst(entry: &Entry) -> CstInputValue {
+  CstInputValue::Object(
+    entry
+      .iter()
+      .map(|(key, value)| (key.to_string(), json_to_cst(value)))
+      .collect(),
+  )
+}
+
+fn json_to_toml(value: &serde_json::Value) -> Result<toml_edit::Value, String> {
+  Ok(match value {
+    serde_json::Value::Null => return Err("TOML has no null value".to_string()),
+    serde_json::Value::Bool(b) => toml_edit::Value::from(*b),
+    serde_json::Value::Number(n) => match (n.as_i64(), n.as_f64()) {
+      (Some(i), _) => toml_edit::Value::from(i),
+      (None, Some(f)) => toml_edit::Value::from(f),
+      (None, None) => return Err(format!("{n} does not fit a TOML number")),
+    },
+    serde_json::Value::String(s) => toml_edit::Value::from(s.as_str()),
+    serde_json::Value::Array(items) => toml_edit::Value::Array(
+      items
+        .iter()
+        .map(json_to_toml)
+        .collect::<Result<toml_edit::Array, String>>()?,
+    ),
+    serde_json::Value::Object(map) => toml_edit::Value::InlineTable(
+      map
+        .iter()
+        .map(|(key, value)| json_to_toml(value).map(|v| (key.clone(), v)))
+        .collect::<Result<toml_edit::InlineTable, String>>()?,
+    ),
+  })
+}
+
+fn entry_to_toml(entry: &Entry) -> Result<Table, String> {
+  let mut table = Table::new();
+  for (key, value) in entry {
+    table.insert(key, Item::Value(json_to_toml(value)?));
+  }
+  Ok(table)
+}
+
+fn toml_value_to_json(value: &toml_edit::Value) -> serde_json::Value {
   use serde_json::json;
-  match agent_id {
-    "zed" => json!({ "source": "custom", "type": "http", "url": url }),
-    "opencode" => json!({ "type": "remote", "url": url, "enabled": true }),
-    "antigravity" => json!({ "serverUrl": url }),
-    "cursor" => json!({ "url": url }),
-    "cline" | "cline-cli" => json!({
-      "url": url,
-      "type": "streamableHttp",
-      "disabled": false,
-    }),
-    "codex" => json!({ "type": "http", "url": url }),
-    "github-copilot-cli" => json!({ "type": "http", "url": url, "tools": ["*"] }),
-    "goose" => json!({
-      "name": SERVER_NAME,
-      "description": "",
-      "type": "streamable_http",
-      "uri": url,
-      "headers": {},
-      "enabled": true,
-      "timeout": 300,
-    }),
-    "vscode" => json!({ "type": "http", "url": url }),
-    // claude-code, claude-desktop, gemini-cli, mcporter — passthrough
-    _ => json!({ "type": "http", "url": url }),
+  match value {
+    toml_edit::Value::String(s) => json!(s.value()),
+    toml_edit::Value::Integer(i) => json!(*i.value()),
+    toml_edit::Value::Float(f) => json!(*f.value()),
+    toml_edit::Value::Boolean(b) => json!(*b.value()),
+    toml_edit::Value::Datetime(d) => json!(d.value().to_string()),
+    toml_edit::Value::Array(items) => {
+      serde_json::Value::Array(items.iter().map(toml_value_to_json).collect())
+    }
+    toml_edit::Value::InlineTable(table) => serde_json::Value::Object(
+      table
+        .iter()
+        .map(|(key, value)| (key.to_string(), toml_value_to_json(value)))
+        .collect(),
+    ),
   }
 }
 
-/// Detect whether a server config object looks like our donut-browser HTTP
-/// endpoint by URL prefix. Matches across the various per-agent key shapes
-/// (`url`, `uri`, `serverUrl`).
-fn config_matches_donut(value: &serde_json::Value) -> bool {
-  for key in ["url", "uri", "serverUrl"] {
-    if let Some(s) = value.get(key).and_then(|v| v.as_str()) {
-      if s.contains("/mcp/")
-        && (s.starts_with("http://127.0.0.1") || s.starts_with("http://localhost"))
-      {
-        return true;
+fn toml_item_to_json(item: &Item) -> serde_json::Value {
+  match item {
+    Item::None => serde_json::Value::Null,
+    Item::Value(value) => toml_value_to_json(value),
+    Item::Table(table) => serde_json::Value::Object(
+      table
+        .iter()
+        .map(|(key, item)| (key.to_string(), toml_item_to_json(item)))
+        .collect(),
+    ),
+    Item::ArrayOfTables(tables) => serde_json::Value::Array(
+      tables
+        .iter()
+        .map(|table| toml_item_to_json(&Item::Table(table.clone())))
+        .collect(),
+    ),
+  }
+}
+
+fn json_to_yaml(value: &serde_json::Value) -> Yaml {
+  match value {
+    serde_json::Value::Null => Yaml::Null,
+    serde_json::Value::Bool(b) => Yaml::Boolean(*b),
+    serde_json::Value::Number(n) => match n.as_i64() {
+      Some(i) => Yaml::Integer(i),
+      None => Yaml::Real(n.to_string()),
+    },
+    serde_json::Value::String(s) => Yaml::String(s.clone()),
+    serde_json::Value::Array(items) => Yaml::Array(items.iter().map(json_to_yaml).collect()),
+    serde_json::Value::Object(map) => Yaml::Hash(
+      map
+        .iter()
+        .map(|(k, v)| (Yaml::String(k.clone()), json_to_yaml(v)))
+        .collect(),
+    ),
+  }
+}
+
+/// A YAML value as plain JSON, for inspection. Keys that are not strings and
+/// values JSON cannot hold (aliases, bad values) read as null.
+fn yaml_to_json(value: &Yaml) -> serde_json::Value {
+  match value {
+    Yaml::Boolean(b) => serde_json::Value::Bool(*b),
+    Yaml::Integer(i) => serde_json::Value::from(*i),
+    Yaml::Real(text) => text
+      .parse::<f64>()
+      .ok()
+      .and_then(serde_json::Number::from_f64)
+      .map(serde_json::Value::Number)
+      .unwrap_or(serde_json::Value::Null),
+    Yaml::String(s) => serde_json::Value::String(s.clone()),
+    Yaml::Array(items) => serde_json::Value::Array(items.iter().map(yaml_to_json).collect()),
+    Yaml::Hash(map) => serde_json::Value::Object(
+      map
+        .iter()
+        .filter_map(|(k, v)| Some((k.as_str()?.to_string(), yaml_to_json(v))))
+        .collect(),
+    ),
+    _ => serde_json::Value::Null,
+  }
+}
+
+fn entry_to_yaml(entry: &Entry) -> Yaml {
+  Yaml::Hash(
+    entry
+      .iter()
+      .map(|(key, value)| (Yaml::String(key.to_string()), json_to_yaml(value)))
+      .collect(),
+  )
+}
+
+/// The mapping at `key` in a YAML mapping, if it is one.
+fn yaml_child<'a>(root: &'a mut Yaml, key: &str) -> Option<&'a mut YamlMap> {
+  match root {
+    Yaml::Hash(map) => match map.get_mut(&Yaml::String(key.to_string())) {
+      Some(Yaml::Hash(child)) => Some(child),
+      _ => None,
+    },
+    _ => None,
+  }
+}
+
+/// A parsed config file that can be edited without disturbing what the user
+/// wrote around the Donut entry.
+enum Document {
+  Json(CstRootNode),
+  Toml(DocumentMut),
+  Yaml(Yaml),
+}
+
+impl Document {
+  fn parse(content: &str, format: ConfigFormat) -> Result<Self, String> {
+    Ok(match format {
+      ConfigFormat::Json => Self::Json(
+        CstRootNode::parse(content, &ParseOptions::default()).map_err(|e| e.to_string())?,
+      ),
+      ConfigFormat::Toml => Self::Toml(content.parse::<DocumentMut>().map_err(|e| e.to_string())?),
+      ConfigFormat::Yaml => {
+        let mut documents = YamlLoader::load_from_str(content).map_err(|e| e.to_string())?;
+        if documents.len() > 1 {
+          return Err("the file holds more than one YAML document".to_string());
+        }
+        Self::Yaml(documents.pop().unwrap_or(Yaml::Null))
+      }
+    })
+  }
+
+  /// The server map at `key`; a dotted key (`mcp.servers`) is a nested map.
+  fn json_servers(root: &CstRootNode, key: &str) -> Option<CstObject> {
+    let mut object = root.object_value()?;
+    for part in key.split('.') {
+      object = object.object_value(part)?;
+    }
+    Some(object)
+  }
+
+  /// Every entry under the server map, as plain JSON for inspection.
+  fn entries(&self, key: &str) -> Vec<(String, serde_json::Value)> {
+    match self {
+      Self::Json(root) => Self::json_servers(root, key)
+        .map(|servers| {
+          servers
+            .properties()
+            .into_iter()
+            .filter_map(|prop| {
+              let name = prop.name()?.decoded_value().ok()?;
+              let value = prop.to_serde_value()?;
+              Some((name, value))
+            })
+            .collect()
+        })
+        .unwrap_or_default(),
+      Self::Toml(doc) => doc
+        .get(key)
+        .and_then(Item::as_table_like)
+        .map(|servers| {
+          servers
+            .iter()
+            .map(|(name, item)| (name.to_string(), toml_item_to_json(item)))
+            .collect()
+        })
+        .unwrap_or_default(),
+      Self::Yaml(root) => match &root[key] {
+        Yaml::Hash(servers) => servers
+          .iter()
+          .filter_map(|(name, value)| Some((name.as_str()?.to_string(), yaml_to_json(value))))
+          .collect(),
+        _ => Vec::new(),
+      },
+    }
+  }
+
+  /// Write the Donut entry, replacing any entry of that name wholesale. A root
+  /// or server map that exists but is not an object is an error rather than
+  /// something to overwrite.
+  fn set_entry(&mut self, key: &str, entry: &Entry) -> Result<(), String> {
+    match self {
+      Self::Json(root) => {
+        let mut servers = root
+          .object_value_or_create()
+          .ok_or("the file's top level is not a JSON object")?;
+        for part in key.split('.') {
+          servers = servers
+            .object_value_or_create(part)
+            .ok_or_else(|| format!("\"{key}\" is not a JSON object"))?;
+        }
+        match servers.get(SERVER_NAME) {
+          Some(prop) => prop.set_value(entry_to_cst(entry)),
+          None => {
+            servers.append(SERVER_NAME, entry_to_cst(entry));
+          }
+        }
+      }
+      Self::Toml(doc) => {
+        let servers = doc.entry(key).or_insert_with(|| {
+          // Implicit: the entry renders as [mcp_servers.donut-browser] with no
+          // bare [mcp_servers] header above it, the way Codex writes it.
+          let mut table = Table::new();
+          table.set_implicit(true);
+          Item::Table(table)
+        });
+        let servers = servers
+          .as_table_like_mut()
+          .ok_or_else(|| format!("\"{key}\" is not a TOML table"))?;
+        servers.insert(SERVER_NAME, Item::Table(entry_to_toml(entry)?));
+      }
+      Self::Yaml(root) => {
+        if root.is_null() {
+          *root = Yaml::Hash(YamlMap::new());
+        }
+        let Yaml::Hash(root_map) = root else {
+          return Err("the file's top level is not a YAML mapping".to_string());
+        };
+        let servers = root_map
+          .entry(Yaml::String(key.to_string()))
+          .or_insert_with(|| Yaml::Hash(YamlMap::new()));
+        if servers.is_null() {
+          *servers = Yaml::Hash(YamlMap::new());
+        }
+        let Yaml::Hash(servers) = servers else {
+          return Err(format!("\"{key}\" is not a YAML mapping"));
+        };
+        servers.insert(Yaml::String(SERVER_NAME.to_string()), entry_to_yaml(entry));
+      }
+    }
+    Ok(())
+  }
+
+  fn remove_entries(&mut self, key: &str, names: &[String]) {
+    match self {
+      Self::Json(root) => {
+        if let Some(servers) = Self::json_servers(root, key) {
+          for name in names {
+            if let Some(prop) = servers.get(name) {
+              prop.remove();
+            }
+          }
+        }
+      }
+      Self::Toml(doc) => {
+        if let Some(servers) = doc.get_mut(key).and_then(Item::as_table_like_mut) {
+          for name in names {
+            servers.remove(name);
+          }
+        }
+      }
+      Self::Yaml(root) => {
+        if let Some(servers) = yaml_child(root, key) {
+          for name in names {
+            servers.remove(&Yaml::String(name.clone()));
+          }
+        }
       }
     }
   }
-  false
-}
 
-fn read_value(path: &Path, format: ConfigFormat) -> serde_json::Value {
-  let Ok(content) = fs::read_to_string(path) else {
-    return serde_json::Value::Null;
-  };
-  match format {
-    ConfigFormat::Json => serde_json::from_str(&content).unwrap_or(serde_json::Value::Null),
-    ConfigFormat::Toml => toml::from_str::<toml::Value>(&content)
-      .ok()
-      .and_then(|t| serde_json::to_value(t).ok())
-      .unwrap_or(serde_json::Value::Null),
-    ConfigFormat::Yaml => serde_yaml::from_str::<serde_yaml::Value>(&content)
-      .ok()
-      .and_then(|y| serde_json::to_value(y).ok())
-      .unwrap_or(serde_json::Value::Null),
+  fn to_text(&self) -> Result<String, String> {
+    match self {
+      Self::Json(root) => Ok(root.to_string()),
+      Self::Toml(doc) => Ok(doc.to_string()),
+      Self::Yaml(root) => {
+        let mut text = String::new();
+        YamlEmitter::new(&mut text)
+          .dump(root)
+          .map_err(|e| format!("Failed to serialize YAML: {e}"))?;
+        // The emitter opens with a document marker the file never had.
+        let body = text.strip_prefix("---\n").unwrap_or(&text);
+        Ok(format!("{body}\n"))
+      }
+    }
   }
 }
 
-fn write_value(path: &Path, value: &serde_json::Value, format: ConfigFormat) -> Result<(), String> {
-  if let Some(parent) = path.parent() {
-    fs::create_dir_all(parent).map_err(|e| format!("Failed to create config dir: {e}"))?;
-  }
-  let content = match format {
-    ConfigFormat::Json => {
-      serde_json::to_string_pretty(value).map_err(|e| format!("Failed to serialize JSON: {e}"))?
-    }
-    ConfigFormat::Toml => {
-      let toml_val: toml::Value = serde_json::from_value(value.clone())
-        .map_err(|e| format!("Failed to convert to TOML: {e}"))?;
-      toml::to_string_pretty(&toml_val).map_err(|e| format!("Failed to serialize TOML: {e}"))?
-    }
-    ConfigFormat::Yaml => {
-      let yaml_val: serde_yaml::Value = serde_yaml::from_str(
-        &serde_json::to_string(value).map_err(|e| format!("Failed to serialize: {e}"))?,
-      )
-      .map_err(|e| format!("Failed to convert to YAML: {e}"))?;
-      serde_yaml::to_string(&yaml_val).map_err(|e| format!("Failed to serialize YAML: {e}"))?
-    }
+fn read_document(path: &Path, format: ConfigFormat) -> Result<(Document, bool), String> {
+  let content = if path.exists() {
+    fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?
+  } else {
+    String::new()
   };
-  fs::write(path, content).map_err(|e| format!("Failed to write config: {e}"))?;
+  let document = Document::parse(&content, format).map_err(|e| {
+    format!(
+      "{} could not be parsed, so it was left untouched: {e}",
+      path.display()
+    )
+  })?;
+  Ok((document, content.is_empty()))
+}
+
+/// Replace the file through a sibling temp file and rename, so a crash mid
+/// write never leaves half of `~/.claude.json` behind. An existing file keeps
+/// its permission bits. A new one is owner-only when `private` (the entry
+/// carries the remote credential) and otherwise gets the process default.
+fn write_text(path: &Path, text: &str, private: bool) -> Result<(), String> {
+  let parent = path
+    .parent()
+    .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+  fs::create_dir_all(parent).map_err(|e| format!("Failed to create config dir: {e}"))?;
+  let file_name = path
+    .file_name()
+    .and_then(|name| name.to_str())
+    .ok_or_else(|| format!("{} has no file name", path.display()))?;
+  let tmp = parent.join(format!(".{file_name}.donut-tmp"));
+  let existing = fs::metadata(path).ok();
+  // Owner-only from the first byte whenever the content is secret or the
+  // target's own bits are about to be copied over it: a temp file created
+  // with the default mode and tightened afterwards is readable by everyone
+  // in between.
+  let written = if private || existing.is_some() {
+    crate::app_dirs::write_owner_only(&tmp, text.as_bytes())
+  } else {
+    fs::write(&tmp, text)
+  };
+  written.map_err(|e| format!("Failed to write config: {e}"))?;
+  if let Some(metadata) = existing {
+    if let Err(e) = fs::set_permissions(&tmp, metadata.permissions()) {
+      let _ = fs::remove_file(&tmp);
+      return Err(format!("Failed to keep config permissions: {e}"));
+    }
+  }
+  if let Err(e) = fs::rename(&tmp, path) {
+    let _ = fs::remove_file(&tmp);
+    return Err(format!("Failed to save config: {e}"));
+  }
   Ok(())
 }
 
-/// Navigate `config_key` (dot notation), creating object literals at each
-/// missing level. Returns a mutable reference to the bottom container so the
-/// caller can set/remove server entries.
-fn ensure_nested_object<'a>(
-  root: &'a mut serde_json::Value,
-  config_key: &str,
-) -> &'a mut serde_json::Map<String, serde_json::Value> {
-  if !root.is_object() {
-    *root = serde_json::Value::Object(serde_json::Map::new());
+/// fx expects its config to be private: the directory 700 and the file 600,
+/// matching what its own installer does.
+#[cfg(unix)]
+fn restrict_to_owner(path: &Path) -> Result<(), String> {
+  use std::os::unix::fs::PermissionsExt;
+  if let Some(dir) = path.parent() {
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+      .map_err(|e| format!("Failed to restrict config dir permissions: {e}"))?;
   }
-  let mut current = root.as_object_mut().expect("just set to object");
-  let parts: Vec<&str> = config_key.split('.').collect();
-  for part in &parts {
-    let entry = current
-      .entry(part.to_string())
-      .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    if !entry.is_object() {
-      *entry = serde_json::Value::Object(serde_json::Map::new());
-    }
-    current = entry.as_object_mut().expect("just ensured object");
-  }
-  current
+  fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+    .map_err(|e| format!("Failed to restrict config permissions: {e}"))
 }
 
-fn nested_object<'a>(
-  root: &'a serde_json::Value,
-  config_key: &str,
-) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
-  let mut current = root.as_object()?;
-  for part in config_key.split('.') {
-    current = current.get(part)?.as_object()?;
-  }
-  Some(current)
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &Path) -> Result<(), String> {
+  Ok(())
 }
 
-fn is_generic_agent_connected(agent_id: &str) -> bool {
-  let Some(spec) = spec_for(agent_id) else {
-    return false;
+/// OpenCode's newer layout keeps servers under `mcp.servers`.
+const OPENCODE_SERVERS_KEY: &str = "mcp.servers";
+
+/// Every key a client may keep its servers under.
+fn server_keys(spec: &AgentSpec) -> Vec<&'static str> {
+  if spec.id == "opencode" {
+    vec![spec.config_key, OPENCODE_SERVERS_KEY]
+  } else {
+    vec![spec.config_key]
+  }
+}
+
+fn is_opencode_server(value: &serde_json::Value) -> bool {
+  value
+    .get("type")
+    .and_then(|t| t.as_str())
+    .is_some_and(|t| t == "local" || t == "remote")
+    || value.get("url").is_some()
+    || value.get("command").is_some()
+}
+
+/// Where OpenCode's entry goes: where it already is, else the newer map when
+/// the file uses it and keeps nothing in the older place.
+fn opencode_key(document: &Document) -> &'static str {
+  let Document::Json(root) = document else {
+    return "mcp";
   };
-  let Some(path) = config_path_for(agent_id) else {
-    return false;
+  let native_map = Document::json_servers(root, "mcp")
+    .and_then(|mcp| mcp.get("servers"))
+    .and_then(|servers| servers.to_serde_value())
+    .is_some_and(|servers| servers.is_object() && !is_opencode_server(&servers));
+  let native = document.entries(OPENCODE_SERVERS_KEY);
+  let legacy: Vec<(String, serde_json::Value)> = document
+    .entries("mcp")
+    .into_iter()
+    .filter(|(name, value)| !(native_map && name == "servers") && is_opencode_server(value))
+    .collect();
+  if native_map && native.iter().any(|(name, _)| name == SERVER_NAME) {
+    OPENCODE_SERVERS_KEY
+  } else if legacy.iter().any(|(name, _)| name == SERVER_NAME) {
+    "mcp"
+  } else if native_map && legacy.is_empty() {
+    OPENCODE_SERVERS_KEY
+  } else {
+    "mcp"
+  }
+}
+
+/// Copilot CLI refuses comments and trailing commas; a file that has them is
+/// written back as plain JSON.
+fn strict_json(text: &str) -> Result<String, String> {
+  if serde_json::from_str::<serde_json::Value>(text).is_ok() {
+    return Ok(text.to_string());
+  }
+  let value = CstRootNode::parse(text, &ParseOptions::default())
+    .map_err(|e| e.to_string())?
+    .to_serde_value()
+    .unwrap_or_else(|| serde_json::json!({}));
+  serde_json::to_string_pretty(&value)
+    .map(|text| text + "\n")
+    .map_err(|e| e.to_string())
+}
+
+fn install_in(env: &AgentEnv, agent_id: &str, target: &McpTarget) -> Result<(), String> {
+  let spec = spec_for(agent_id).ok_or_else(|| format!("Unknown agent: {agent_id}"))?;
+  let path = config_path(env, agent_id)
+    .ok_or_else(|| format!("Unable to resolve config path for {agent_id}"))?;
+  let (mut document, was_empty) = read_document(&path, spec.format)?;
+  let mut entry = server_entry(agent_id, target);
+  let key = if agent_id == "opencode" {
+    opencode_key(&document)
+  } else {
+    spec.config_key
+  };
+  if key == OPENCODE_SERVERS_KEY {
+    // The newer layout enables a server unless it says `disabled`.
+    entry.retain(|(name, _)| *name != "enabled");
+  }
+  document.set_entry(key, &entry)?;
+  let mut text = document.to_text()?;
+  if agent_id == "github-copilot-cli" {
+    text = strict_json(&text)?;
+  }
+  if was_empty && !text.ends_with('\n') {
+    text.push('\n');
+  }
+  write_text(&path, &text, true)?;
+  if agent_id == "fx" {
+    restrict_to_owner(&path)?;
+  }
+  Ok(())
+}
+
+fn uninstall_in(env: &AgentEnv, agent_id: &str) -> Result<(), String> {
+  let spec = spec_for(agent_id).ok_or_else(|| format!("Unknown agent: {agent_id}"))?;
+  let Some(path) = config_path(env, agent_id) else {
+    return Ok(());
   };
   if !path.exists() {
-    return false;
+    return Ok(());
   }
-  let root = read_value(&path, spec.format);
-  let Some(servers) = nested_object(&root, spec.config_key) else {
-    return false;
-  };
-  if let Some(entry) = servers.get(SERVER_NAME) {
-    return config_matches_donut(entry);
+  let (mut document, _) = read_document(&path, spec.format)?;
+  let mut changed = false;
+  for key in server_keys(spec) {
+    let names: Vec<String> = document
+      .entries(key)
+      .into_iter()
+      .filter(|(name, value)| is_donut_entry(name, value))
+      .map(|(name, _)| name)
+      .collect();
+    if !names.is_empty() {
+      document.remove_entries(key, &names);
+      changed = true;
+    }
   }
-  servers.values().any(config_matches_donut)
+  if !changed {
+    return Ok(());
+  }
+  let mut text = document.to_text()?;
+  if agent_id == "github-copilot-cli" {
+    text = strict_json(&text)?;
+  }
+  write_text(&path, &text, false)
 }
 
-/// Install or remove the donut-browser entry from a generic agent. Returns
-/// `true` if a write happened. Callers handle higher-level dispatch (Claude
-/// Desktop extension setup, Claude Code CLI invocation).
-pub fn install_generic(agent_id: &str, url: &str) -> Result<(), String> {
-  let spec = spec_for(agent_id).ok_or_else(|| format!("Unknown agent: {agent_id}"))?;
-  let path = config_path_for(agent_id)
-    .ok_or_else(|| format!("Unable to resolve config path for {agent_id}"))?;
+/// What a client's config says about Donut's endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Connection {
+  Absent,
+  /// Our entry from an earlier version, pointing at the old local server.
+  /// Not connected; the next reinstall points it at the endpoint.
+  Legacy,
+  /// An entry points at the endpoint. `current` when every such entry
+  /// presents the stored key.
+  Connected {
+    current: bool,
+  },
+  /// The file names the endpoint but does not parse, so it can be neither
+  /// read nor rewritten.
+  Unreadable,
+}
 
-  let mut root = if path.exists() {
-    read_value(&path, spec.format)
-  } else {
-    serde_json::Value::Object(serde_json::Map::new())
+/// Any entry pointing at the endpoint makes the client connected, so a
+/// renamed entry still reads as connected. An entry under our name that points
+/// anywhere else (an old local server) does not: adding replaces it.
+fn connection_in(env: &AgentEnv, agent_id: &str, key: Option<&str>) -> Connection {
+  let Some(spec) = spec_for(agent_id) else {
+    return Connection::Absent;
   };
-  if !root.is_object() {
-    root = serde_json::Value::Object(serde_json::Map::new());
+  let Some(path) = config_path(env, agent_id) else {
+    return Connection::Absent;
+  };
+  if !path.exists() {
+    return Connection::Absent;
   }
+  let Ok((document, _)) = read_document(&path, spec.format) else {
+    let names_endpoint =
+      fs::read_to_string(&path).is_ok_and(|text| text.contains(&remote_mcp_url()));
+    return if names_endpoint {
+      Connection::Unreadable
+    } else {
+      Connection::Absent
+    };
+  };
+  let entries: Vec<(String, serde_json::Value)> = server_keys(spec)
+    .into_iter()
+    .flat_map(|server_key| document.entries(server_key))
+    .collect();
+  let mut remote = entries
+    .iter()
+    .filter(|(_, value)| points_at_remote(value))
+    .peekable();
+  if remote.peek().is_some() {
+    let current = match key {
+      Some(key) => remote.all(|(_, value)| presents(value, key)),
+      None => false,
+    };
+    return Connection::Connected { current };
+  }
+  if entries
+    .iter()
+    .any(|(name, value)| is_legacy_entry(name, value))
+  {
+    Connection::Legacy
+  } else {
+    Connection::Absent
+  }
+}
 
-  let container = ensure_nested_object(&mut root, spec.config_key);
-  container.insert(
-    SERVER_NAME.to_string(),
-    transform_remote_config(agent_id, url),
-  );
+fn connected_in(env: &AgentEnv, agent_id: &str) -> bool {
+  matches!(
+    connection_in(env, agent_id, None),
+    Connection::Connected { .. }
+  )
+}
 
-  write_value(&path, &root, spec.format)
+/// Rewrite Donut's entry in every client that has one: the connected ones,
+/// and an entry an earlier version pointed at the local server. Returns the
+/// ids that could not be rewritten, a file that names the endpoint but does
+/// not parse among them. Claude Desktop is lib.rs's.
+fn reinstall_in(env: &AgentEnv, target: &McpTarget) -> Vec<String> {
+  let mut failed = Vec::new();
+  for spec in AGENT_SPECS
+    .iter()
+    .filter(|spec| spec.id != "claude-desktop")
+  {
+    let connection = connection_in(env, spec.id, None);
+    if connection == Connection::Absent {
+      continue;
+    }
+    match install_in(env, spec.id, target) {
+      Ok(()) if connection == Connection::Legacy => {
+        log::info!(
+          "MCP client entry moved to the remote endpoint agent={}",
+          spec.id
+        );
+      }
+      Ok(()) => {}
+      Err(e) => {
+        log::warn!(
+          "MCP client entry refresh failed agent={} err=\"{e}\"",
+          spec.id
+        );
+        failed.push(spec.id.to_string());
+      }
+    }
+  }
+  failed
+}
+
+fn process_env() -> Result<AgentEnv, String> {
+  AgentEnv::from_process().ok_or_else(|| "Home directory unavailable".to_string())
+}
+
+pub fn install_generic(agent_id: &str, target: &McpTarget) -> Result<(), String> {
+  install_in(&process_env()?, agent_id, target)
 }
 
 pub fn uninstall_generic(agent_id: &str) -> Result<(), String> {
-  let spec = spec_for(agent_id).ok_or_else(|| format!("Unknown agent: {agent_id}"))?;
-  let Some(path) = config_path_for(agent_id) else {
-    return Ok(());
-  };
-  if !path.exists() {
-    return Ok(());
-  }
-
-  let mut root = read_value(&path, spec.format);
-  if !root.is_object() {
-    return Ok(());
-  }
-
-  let container = ensure_nested_object(&mut root, spec.config_key);
-  container.remove(SERVER_NAME);
-
-  write_value(&path, &root, spec.format)
+  uninstall_in(&process_env()?, agent_id)
 }
 
-pub fn list_agents_with_status(connected_overrides: &[(&str, bool)]) -> Vec<McpAgentInfo> {
+pub fn reinstall_generic(target: &McpTarget) -> Vec<String> {
+  match process_env() {
+    Ok(env) => reinstall_in(&env, target),
+    Err(e) => {
+      log::warn!("MCP client refresh skipped err=\"{e}\"");
+      Vec::new()
+    }
+  }
+}
+
+/// Ids of the connected file-based clients. Claude Desktop is not included:
+/// its bundle is inspected by lib.rs.
+pub fn connected_agents() -> Vec<String> {
+  let Some(env) = AgentEnv::from_process() else {
+    return Vec::new();
+  };
+  AGENT_SPECS
+    .iter()
+    .filter(|spec| spec.id != "claude-desktop")
+    .filter(|spec| connected_in(&env, spec.id))
+    .map(|spec| spec.id.to_string())
+    .collect()
+}
+
+/// Every client with its state against the stored `key`. `overrides` gives
+/// `(id, connected, current)` for a client this module does not read (Claude
+/// Desktop).
+pub fn list_agents_with_status(
+  key: Option<&str>,
+  overrides: &[(&str, bool, bool)],
+) -> Vec<McpAgentInfo> {
+  let env = AgentEnv::from_process();
   AGENT_SPECS
     .iter()
     .map(|spec| {
-      let connected = connected_overrides
+      let (connected, current) = overrides
         .iter()
-        .find(|(id, _)| *id == spec.id)
-        .map(|(_, c)| *c)
-        .unwrap_or_else(|| is_generic_agent_connected(spec.id));
+        .find(|(id, ..)| *id == spec.id)
+        .map(|(_, connected, current)| (*connected, *current))
+        .unwrap_or_else(
+          || match env.as_ref().map(|env| connection_in(env, spec.id, key)) {
+            Some(Connection::Connected { current }) => (true, current),
+            Some(Connection::Unreadable) => (true, false),
+            _ => (false, false),
+          },
+        );
       McpAgentInfo {
         id: spec.id.to_string(),
         display_name: spec.display_name.to_string(),
         category: spec.category,
         connected,
-        detected: detect_agent_directory(spec.id),
+        current,
+        detected: env.as_ref().is_some_and(|env| detected(env, spec.id)),
+        token_env: token_env_for(spec.id),
       }
     })
     .collect()
@@ -571,4 +1389,979 @@ pub fn list_agents_with_status(connected_overrides: &[(&str, bool)]) -> Vec<McpA
 
 pub fn agent_exists(agent_id: &str) -> bool {
   spec_for(agent_id).is_some()
+}
+
+/// `<app support>/Claude`: where Claude Desktop keeps its config, its
+/// extension bundles and the extension registry.
+pub fn claude_desktop_dir() -> Option<PathBuf> {
+  AgentEnv::from_process().map(|env| env.claude_desktop_dir())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use serde_json::json;
+
+  const KEY: &str = "dmk_test_credential";
+
+  fn test_env(root: &Path, platform: Platform) -> AgentEnv {
+    AgentEnv {
+      platform,
+      home: root.join("home"),
+      appdata: None,
+      xdg_config_home: None,
+      codex_home: None,
+      grok_home: None,
+      kimi_code_home: None,
+      cline_dir: None,
+      copilot_home: None,
+      pi_agent_dir: None,
+    }
+  }
+
+  fn remote() -> McpTarget {
+    McpTarget::remote(KEY.to_string())
+  }
+
+  fn read(path: &Path) -> String {
+    fs::read_to_string(path).unwrap()
+  }
+
+  fn entry_of(env: &AgentEnv, agent_id: &str) -> serde_json::Value {
+    let spec = spec_for(agent_id).unwrap();
+    let path = config_path(env, agent_id).unwrap();
+    let (document, _) = read_document(&path, spec.format).unwrap();
+    document
+      .entries(spec.config_key)
+      .into_iter()
+      .find(|(name, _)| name == SERVER_NAME)
+      .map(|(_, value)| value)
+      .unwrap_or_else(|| panic!("{agent_id} has no {SERVER_NAME} entry"))
+  }
+
+  fn generic_ids() -> impl Iterator<Item = &'static str> {
+    AGENT_SPECS
+      .iter()
+      .map(|spec| spec.id)
+      .filter(|id| *id != "claude-desktop")
+  }
+
+  #[test]
+  fn registry_has_the_twenty_clients() {
+    let mut ids: Vec<&str> = AGENT_SPECS.iter().map(|spec| spec.id).collect();
+    ids.sort_unstable();
+    assert_eq!(
+      ids,
+      vec![
+        "antigravity",
+        "claude-code",
+        "claude-desktop",
+        "cline",
+        "cline-cli",
+        "codex",
+        "cursor",
+        "fx",
+        "gemini-cli",
+        "github-copilot-cli",
+        "goose",
+        "grok-build",
+        "kilo-code",
+        "kimi-code",
+        "kiro-cli",
+        "mastracode",
+        "mcporter",
+        "opencode",
+        "pi",
+        "vscode",
+        "windsurf",
+        "zed",
+      ]
+    );
+  }
+
+  #[test]
+  fn paths_per_platform_match_the_registry() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let h = root.join("home");
+    let cases: Vec<(Platform, &str, PathBuf)> = vec![
+      (Platform::MacOs, "antigravity", h.join(".gemini/config/mcp_config.json")),
+      (Platform::Linux, "antigravity", h.join(".gemini/config/mcp_config.json")),
+      (Platform::Windows, "antigravity", h.join(".gemini/config/mcp_config.json")),
+      (
+        Platform::MacOs,
+        "cline",
+        h.join("Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"),
+      ),
+      (
+        Platform::Linux,
+        "cline",
+        h.join(".config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"),
+      ),
+      (
+        Platform::Windows,
+        "cline",
+        h.join("AppData/Roaming/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"),
+      ),
+      (Platform::MacOs, "cline-cli", h.join(".cline/data/settings/cline_mcp_settings.json")),
+      (Platform::Windows, "cline-cli", h.join(".cline/data/settings/cline_mcp_settings.json")),
+      (Platform::MacOs, "claude-code", h.join(".claude.json")),
+      (Platform::Linux, "claude-code", h.join(".claude.json")),
+      (Platform::Windows, "claude-code", h.join(".claude.json")),
+      (
+        Platform::MacOs,
+        "claude-desktop",
+        h.join("Library/Application Support/Claude/claude_desktop_config.json"),
+      ),
+      (Platform::Linux, "claude-desktop", h.join(".config/Claude/claude_desktop_config.json")),
+      (
+        Platform::Windows,
+        "claude-desktop",
+        h.join("AppData/Roaming/Claude/claude_desktop_config.json"),
+      ),
+      (Platform::MacOs, "codex", h.join(".codex/config.toml")),
+      (Platform::Windows, "codex", h.join(".codex/config.toml")),
+      (Platform::MacOs, "cursor", h.join(".cursor/mcp.json")),
+      (Platform::Windows, "cursor", h.join(".cursor/mcp.json")),
+      (Platform::MacOs, "fx", h.join(".fx/mcp.json")),
+      (Platform::Windows, "fx", h.join(".fx/mcp.json")),
+      (Platform::MacOs, "gemini-cli", h.join(".gemini/settings.json")),
+      (Platform::Windows, "gemini-cli", h.join(".gemini/settings.json")),
+      (Platform::MacOs, "goose", h.join(".config/goose/config.yaml")),
+      (Platform::Linux, "goose", h.join(".config/goose/config.yaml")),
+      (
+        Platform::Windows,
+        "goose",
+        h.join("AppData/Roaming/Block/goose/config/config.yaml"),
+      ),
+      (Platform::MacOs, "github-copilot-cli", h.join(".copilot/mcp-config.json")),
+      (Platform::Windows, "github-copilot-cli", h.join(".copilot/mcp-config.json")),
+      (Platform::MacOs, "grok-build", h.join(".grok/config.toml")),
+      (Platform::Windows, "grok-build", h.join(".grok/config.toml")),
+      (Platform::MacOs, "kilo-code", h.join(".config/kilo/kilo.json")),
+      (Platform::Linux, "kilo-code", h.join(".config/kilo/kilo.json")),
+      (Platform::Windows, "kilo-code", h.join(".config/kilo/kilo.json")),
+      (Platform::MacOs, "kimi-code", h.join(".kimi-code/mcp.json")),
+      (Platform::Windows, "kimi-code", h.join(".kimi-code/mcp.json")),
+      (Platform::MacOs, "kiro-cli", h.join(".kiro/settings/mcp.json")),
+      (Platform::Windows, "kiro-cli", h.join(".kiro/settings/mcp.json")),
+      (Platform::MacOs, "mcporter", h.join(".mcporter/mcporter.json")),
+      (Platform::Windows, "mcporter", h.join(".mcporter/mcporter.json")),
+      (Platform::MacOs, "opencode", h.join(".config/opencode/opencode.jsonc")),
+      (Platform::Linux, "opencode", h.join(".config/opencode/opencode.jsonc")),
+      (Platform::Windows, "opencode", h.join(".config/opencode/opencode.jsonc")),
+      (Platform::MacOs, "vscode", h.join("Library/Application Support/Code/User/mcp.json")),
+      (Platform::Linux, "vscode", h.join(".config/Code/User/mcp.json")),
+      (Platform::Windows, "vscode", h.join("AppData/Roaming/Code/User/mcp.json")),
+      (Platform::MacOs, "windsurf", h.join(".codeium/windsurf/mcp_config.json")),
+      (Platform::Windows, "windsurf", h.join(".codeium/windsurf/mcp_config.json")),
+      (Platform::MacOs, "zed", h.join("Library/Application Support/Zed/settings.json")),
+      (Platform::Linux, "zed", h.join(".config/zed/settings.json")),
+      (Platform::Windows, "zed", h.join("AppData/Roaming/Zed/settings.json")),
+    ];
+    for (platform, agent_id, expected) in cases {
+      let env = test_env(root, platform);
+      assert_eq!(
+        config_path(&env, agent_id).unwrap(),
+        expected,
+        "{agent_id} on {platform:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn env_overrides_move_the_config_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let mut env = test_env(root, Platform::Linux);
+    env.xdg_config_home = Some(root.join("xdg"));
+    env.codex_home = Some(root.join("codex-home"));
+    env.grok_home = Some(root.join("grok-home"));
+    env.kimi_code_home = Some(root.join("kimi-home"));
+    env.cline_dir = Some(root.join("cline-dir"));
+
+    let expect = |env: &AgentEnv, agent_id: &str, path: PathBuf| {
+      assert_eq!(config_path(env, agent_id).unwrap(), path, "{agent_id}");
+    };
+    expect(&env, "codex", root.join("codex-home/config.toml"));
+    expect(&env, "grok-build", root.join("grok-home/config.toml"));
+    expect(&env, "kimi-code", root.join("kimi-home/mcp.json"));
+    expect(
+      &env,
+      "cline-cli",
+      root.join("cline-dir/data/settings/cline_mcp_settings.json"),
+    );
+    expect(&env, "vscode", root.join("xdg/Code/User/mcp.json"));
+    expect(&env, "zed", root.join("xdg/zed/settings.json"));
+    expect(&env, "goose", root.join("xdg/goose/config.yaml"));
+    expect(&env, "kilo-code", root.join("xdg/kilo/kilo.json"));
+    // Copilot ignores XDG_CONFIG_HOME and reads COPILOT_HOME instead.
+    expect(
+      &env,
+      "github-copilot-cli",
+      root.join("home/.copilot/mcp-config.json"),
+    );
+    env.copilot_home = Some(root.join("copilot-home"));
+    expect(
+      &env,
+      "github-copilot-cli",
+      root.join("copilot-home/mcp-config.json"),
+    );
+    expect(&env, "pi", root.join("home/.pi/agent/mcp.json"));
+    env.pi_agent_dir = Some(root.join("pi-dir"));
+    expect(&env, "pi", root.join("pi-dir/mcp.json"));
+    expect(&env, "mastracode", root.join("home/.mastracode/mcp.json"));
+    expect(
+      &env,
+      "claude-desktop",
+      root.join("xdg/Claude/claude_desktop_config.json"),
+    );
+    // OpenCode ignores XDG_CONFIG_HOME, and Goose on macOS does too.
+    expect(
+      &env,
+      "opencode",
+      root.join("home/.config/opencode/opencode.jsonc"),
+    );
+    env.platform = Platform::MacOs;
+    expect(&env, "goose", root.join("home/.config/goose/config.yaml"));
+
+    let mut windows = test_env(root, Platform::Windows);
+    windows.appdata = Some(root.join("roaming"));
+    assert_eq!(
+      config_path(&windows, "vscode").unwrap(),
+      root.join("roaming/Code/User/mcp.json")
+    );
+    assert_eq!(
+      config_path(&windows, "goose").unwrap(),
+      root.join("roaming/Block/goose/config/config.yaml")
+    );
+    assert_eq!(
+      config_path(&windows, "zed").unwrap(),
+      root.join("roaming/Zed/settings.json")
+    );
+    assert_eq!(
+      config_path(&windows, "claude-desktop").unwrap(),
+      root.join("roaming/Claude/claude_desktop_config.json")
+    );
+  }
+
+  #[test]
+  fn jsonc_variants_are_preferred_when_present() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path(), Platform::Linux);
+    let home = &env.home;
+
+    fs::create_dir_all(home.join(".config/opencode")).unwrap();
+    fs::write(home.join(".config/opencode/opencode.json"), "{}").unwrap();
+    assert_eq!(
+      config_path(&env, "opencode").unwrap(),
+      home.join(".config/opencode/opencode.json")
+    );
+    fs::write(home.join(".config/opencode/opencode.jsonc"), "{}").unwrap();
+    assert_eq!(
+      config_path(&env, "opencode").unwrap(),
+      home.join(".config/opencode/opencode.jsonc")
+    );
+
+    fs::create_dir_all(home.join(".mcporter")).unwrap();
+    fs::write(home.join(".mcporter/mcporter.jsonc"), "{}").unwrap();
+    assert_eq!(
+      config_path(&env, "mcporter").unwrap(),
+      home.join(".mcporter/mcporter.jsonc")
+    );
+    fs::write(home.join(".mcporter/mcporter.json"), "{}").unwrap();
+    assert_eq!(
+      config_path(&env, "mcporter").unwrap(),
+      home.join(".mcporter/mcporter.json")
+    );
+
+    fs::create_dir_all(home.join(".config/kilo")).unwrap();
+    fs::write(home.join(".config/kilo/kilo.jsonc"), "{}").unwrap();
+    assert_eq!(
+      config_path(&env, "kilo-code").unwrap(),
+      home.join(".config/kilo/kilo.jsonc")
+    );
+  }
+
+  #[test]
+  fn detection_follows_the_registry_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path(), Platform::MacOs);
+    let home = &env.home;
+    for id in AGENT_SPECS.iter().map(|spec| spec.id) {
+      assert!(!detected(&env, id), "{id} detected in an empty home");
+    }
+
+    // Gemini CLI alone must not make Antigravity look installed.
+    fs::create_dir_all(home.join(".gemini")).unwrap();
+    assert!(detected(&env, "gemini-cli"));
+    assert!(!detected(&env, "antigravity"));
+    fs::create_dir_all(home.join(".gemini/config")).unwrap();
+    assert!(detected(&env, "antigravity"));
+
+    fs::create_dir_all(home.join(".config/kilo")).unwrap();
+    assert!(detected(&env, "kilo-code"));
+    fs::create_dir_all(home.join(".codeium/windsurf")).unwrap();
+    assert!(detected(&env, "windsurf"));
+    fs::create_dir_all(home.join(".kiro")).unwrap();
+    assert!(detected(&env, "kiro-cli"));
+    fs::create_dir_all(home.join(".fx")).unwrap();
+    assert!(detected(&env, "fx"));
+    fs::create_dir_all(home.join(".grok")).unwrap();
+    assert!(detected(&env, "grok-build"));
+    fs::create_dir_all(home.join(".kimi-code")).unwrap();
+    assert!(detected(&env, "kimi-code"));
+    assert!(!detected(&env, "goose"));
+    fs::create_dir_all(home.join(".config/goose")).unwrap();
+    fs::write(home.join(".config/goose/config.yaml"), "").unwrap();
+    assert!(detected(&env, "goose"));
+    fs::create_dir_all(home.join("Library/Application Support/Claude")).unwrap();
+    assert!(detected(&env, "claude-desktop"));
+  }
+
+  #[test]
+  fn remote_shapes_put_the_credential_where_each_client_reads_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path(), Platform::Linux);
+    let url = remote_mcp_url();
+    let auth = json!({ "Authorization": format!("Bearer {KEY}") });
+    let expected: Vec<(&str, serde_json::Value)> = vec![
+      (
+        "claude-code",
+        json!({ "type": "http", "url": url, "headers": auth }),
+      ),
+      (
+        "gemini-cli",
+        json!({ "type": "http", "url": url, "headers": auth }),
+      ),
+      (
+        "mcporter",
+        json!({ "type": "http", "url": url, "headers": auth }),
+      ),
+      (
+        "vscode",
+        json!({ "type": "http", "url": url, "headers": auth }),
+      ),
+      ("cursor", json!({ "url": url, "headers": auth })),
+      ("kiro-cli", json!({ "url": url, "headers": auth })),
+      ("grok-build", json!({ "url": url, "headers": auth })),
+      ("antigravity", json!({ "serverUrl": url, "headers": auth })),
+      ("windsurf", json!({ "serverUrl": url, "headers": auth })),
+      (
+        "kimi-code",
+        json!({ "transport": "http", "url": url, "headers": auth }),
+      ),
+      (
+        "cline",
+        json!({ "url": url, "type": "streamableHttp", "disabled": false, "headers": auth }),
+      ),
+      (
+        "cline-cli",
+        json!({ "url": url, "type": "streamableHttp", "disabled": false, "headers": auth }),
+      ),
+      (
+        "github-copilot-cli",
+        json!({ "type": "http", "url": url, "tools": ["*"], "headers": auth }),
+      ),
+      ("pi", json!({ "url": url, "headers": auth })),
+      ("mastracode", json!({ "url": url, "headers": auth })),
+      (
+        "codex",
+        json!({ "type": "http", "url": url, "http_headers": auth }),
+      ),
+      (
+        "zed",
+        json!({ "source": "custom", "type": "http", "url": url, "headers": auth }),
+      ),
+      (
+        "opencode",
+        json!({ "type": "remote", "url": url, "enabled": true, "headers": auth }),
+      ),
+      (
+        "kilo-code",
+        json!({ "type": "remote", "url": url, "enabled": true, "headers": auth }),
+      ),
+      (
+        "goose",
+        json!({
+          "name": SERVER_NAME, "description": "", "type": "streamable_http", "uri": url,
+          "headers": auth, "enabled": true, "timeout": 300
+        }),
+      ),
+      (
+        "fx",
+        json!({ "type": "http", "url": url, "enabled": true, "bearer_token_env": FX_TOKEN_ENV }),
+      ),
+    ];
+    assert_eq!(expected.len(), generic_ids().count());
+    for (agent_id, shape) in expected {
+      install_in(&env, agent_id, &remote()).unwrap();
+      assert_eq!(entry_of(&env, agent_id), shape, "{agent_id}");
+      assert!(connected_in(&env, agent_id), "{agent_id}");
+    }
+    let fx_text = read(&config_path(&env, "fx").unwrap());
+    assert!(
+      !fx_text.contains("Authorization"),
+      "fx must never carry a literal header"
+    );
+  }
+
+  #[test]
+  fn jsonc_comments_indentation_and_trailing_commas_survive() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path(), Platform::MacOs);
+    let path = config_path(&env, "zed").unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let original = "// Zed settings\n{\n    \"theme\": \"One Dark\",\n    /* keep me */\n    \"context_servers\": {\n        \"other\": { \"command\": \"x\", },\n    },\n    \"vim_mode\": true,\n}\n";
+    fs::write(&path, original).unwrap();
+
+    install_in(&env, "zed", &remote()).unwrap();
+    let text = read(&path);
+    assert!(text.starts_with("// Zed settings\n"));
+    assert!(text.contains("/* keep me */"));
+    assert!(text.contains("\n    \"vim_mode\": true,\n"));
+    assert!(text.contains("\"other\": { \"command\": \"x\", }"));
+    assert!(
+      text.contains("\n        \"donut-browser\": {\n            \"source\": \"custom\","),
+      "entry must use the file's four-space indent: {text}"
+    );
+    assert!(text.ends_with("}\n"));
+    assert!(connected_in(&env, "zed"));
+
+    uninstall_in(&env, "zed").unwrap();
+    let text = read(&path);
+    assert!(text.starts_with("// Zed settings\n"));
+    assert!(text.contains("/* keep me */"));
+    assert!(!text.contains("donut-browser"));
+    assert!(text.contains("\"other\": { \"command\": \"x\", }"));
+    assert!(!connected_in(&env, "zed"));
+  }
+
+  #[test]
+  fn large_json_keeps_unrelated_keys_in_their_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path(), Platform::Linux);
+    let path = config_path(&env, "claude-code").unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let original = "{\n  \"zeta\": 1,\n  \"projects\": {\"/a\": {\"allowedTools\": []}},\n  \"alpha\": \"b\"\n}\n";
+    fs::write(&path, original).unwrap();
+    install_in(&env, "claude-code", &remote()).unwrap();
+    let text = read(&path);
+    let zeta = text.find("\"zeta\"").unwrap();
+    let projects = text.find("\"projects\"").unwrap();
+    let alpha = text.find("\"alpha\"").unwrap();
+    let servers = text.find("\"mcpServers\"").unwrap();
+    assert!(
+      zeta < projects && projects < alpha && alpha < servers,
+      "{text}"
+    );
+    assert!(text.contains("{\"/a\": {\"allowedTools\": []}}"));
+  }
+
+  #[test]
+  fn toml_comments_and_table_order_survive() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path(), Platform::Linux);
+    let path = config_path(&env, "codex").unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let original = "# codex config\nmodel = \"o3\"\n\n[projects.\"/tmp/x\"]\ntrust_level = \"trusted\"\n\n[notice]\nseen = true\n\n[mcp_servers.other]\ncommand = \"npx\"\n";
+    fs::write(&path, original).unwrap();
+
+    install_in(&env, "codex", &remote()).unwrap();
+    let text = read(&path);
+    assert!(text.starts_with("# codex config\nmodel = \"o3\"\n"));
+    let projects = text.find("[projects.\"/tmp/x\"]").unwrap();
+    let notice = text.find("[notice]").unwrap();
+    let other = text.find("[mcp_servers.other]").unwrap();
+    let donut = text.find("[mcp_servers.donut-browser]").unwrap();
+    assert!(
+      projects < notice && notice < other && other < donut,
+      "{text}"
+    );
+    assert!(
+      !text.contains("\n[mcp_servers]\n"),
+      "no bare header: {text}"
+    );
+    assert!(text.contains(&format!(
+      "http_headers = {{ Authorization = \"Bearer {KEY}\" }}"
+    )));
+    assert_eq!(
+      entry_of(&env, "codex")["http_headers"]["Authorization"],
+      json!(format!("Bearer {KEY}"))
+    );
+
+    uninstall_in(&env, "codex").unwrap();
+    let text = read(&path);
+    assert!(text.starts_with("# codex config\n"));
+    assert!(text.contains("[mcp_servers.other]\ncommand = \"npx\"\n"));
+    assert!(!text.contains("donut-browser"));
+  }
+
+  #[test]
+  fn grok_toml_entry_has_no_type_and_a_headers_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path(), Platform::Linux);
+    install_in(&env, "grok-build", &remote()).unwrap();
+    let text = read(&config_path(&env, "grok-build").unwrap());
+    assert!(text.contains("[mcp_servers.donut-browser]\n"));
+    assert!(text.contains(&format!("url = \"{}\"", remote_mcp_url())));
+    assert!(text.contains(&format!("headers = {{ Authorization = \"Bearer {KEY}\" }}")));
+    assert!(!text.contains("type ="));
+  }
+
+  #[test]
+  fn goose_yaml_keeps_other_extensions_and_their_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path(), Platform::Linux);
+    let path = config_path(&env, "goose").unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+      &path,
+      "GOOSE_PROVIDER: openai\nextensions:\n  zeta:\n    enabled: true\n    type: builtin\n  alpha:\n    enabled: false\n    type: builtin\n",
+    )
+    .unwrap();
+    install_in(&env, "goose", &remote()).unwrap();
+    let text = read(&path);
+    let provider = text.find("GOOSE_PROVIDER: openai").unwrap();
+    let zeta = text.find("zeta:").unwrap();
+    let alpha = text.find("alpha:").unwrap();
+    let donut = text.find("donut-browser:").unwrap();
+    assert!(provider < zeta && zeta < alpha && alpha < donut, "{text}");
+    let name = text.find("name: donut-browser").unwrap();
+    let uri = text.find("uri:").unwrap();
+    let timeout = text.find("timeout: 300").unwrap();
+    assert!(name < uri && uri < timeout, "{text}");
+    assert!(connected_in(&env, "goose"));
+
+    uninstall_in(&env, "goose").unwrap();
+    let text = read(&path);
+    assert!(text.contains("zeta:") && text.contains("alpha:"));
+    assert!(!text.contains("donut-browser"));
+  }
+
+  #[test]
+  fn parse_failures_abort_and_leave_the_file_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path(), Platform::Linux);
+    let cases = [
+      ("cursor", "{ \"mcpServers\": { \"a\": }"),
+      ("codex", "[mcp_servers\nbroken = "),
+      ("goose", "extensions:\n  - [unclosed\n"),
+    ];
+    for (agent_id, broken) in cases {
+      let path = config_path(&env, agent_id).unwrap();
+      fs::create_dir_all(path.parent().unwrap()).unwrap();
+      fs::write(&path, broken).unwrap();
+      let error = install_in(&env, agent_id, &remote()).unwrap_err();
+      assert!(error.contains("left untouched"), "{agent_id}: {error}");
+      assert_eq!(read(&path), broken, "{agent_id} was rewritten");
+      let error = uninstall_in(&env, agent_id).unwrap_err();
+      assert!(error.contains("left untouched"), "{agent_id}: {error}");
+      assert_eq!(read(&path), broken, "{agent_id} was rewritten on remove");
+      assert!(!connected_in(&env, agent_id));
+    }
+  }
+
+  #[test]
+  fn non_object_containers_are_an_error_not_an_overwrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path(), Platform::Linux);
+    let path = config_path(&env, "cursor").unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    for content in ["[1, 2]", "{ \"mcpServers\": \"nope\" }"] {
+      fs::write(&path, content).unwrap();
+      assert!(install_in(&env, "cursor", &remote()).is_err(), "{content}");
+      assert_eq!(read(&path), content);
+    }
+  }
+
+  #[test]
+  fn empty_and_missing_files_become_a_fresh_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path(), Platform::Linux);
+    let path = config_path(&env, "cursor").unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, "").unwrap();
+    install_in(&env, "cursor", &remote()).unwrap();
+    let text = read(&path);
+    assert!(
+      text.starts_with("{\n  \"mcpServers\": {\n    \"donut-browser\": {"),
+      "{text}"
+    );
+    assert!(text.ends_with("}\n"));
+
+    assert!(!config_path(&env, "vscode").unwrap().exists());
+    install_in(&env, "vscode", &remote()).unwrap();
+    assert!(connected_in(&env, "vscode"));
+    let text = read(&config_path(&env, "vscode").unwrap());
+    assert!(text.ends_with("\n"));
+    assert!(fs::read_to_string(config_path(&env, "codex").unwrap()).is_err());
+    install_in(&env, "codex", &remote()).unwrap();
+    assert!(connected_in(&env, "codex"));
+    install_in(&env, "goose", &remote()).unwrap();
+    assert!(connected_in(&env, "goose"));
+  }
+
+  #[test]
+  fn reinstall_replaces_the_entry_wholesale() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path(), Platform::Linux);
+    let path = config_path(&env, "cursor").unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+      &path,
+      "{\"mcpServers\": {\"donut-browser\": {\"url\": \"http://127.0.0.1:1/mcp/old\", \"disabled\": true, \"env\": {\"X\": \"1\"}}}}",
+    )
+    .unwrap();
+    assert!(!connected_in(&env, "cursor"));
+    install_in(&env, "cursor", &remote()).unwrap();
+    let entry = entry_of(&env, "cursor");
+    assert!(entry.get("disabled").is_none());
+    assert!(entry.get("env").is_none());
+    assert_eq!(entry["url"], json!(remote_mcp_url()));
+    assert!(connected_in(&env, "cursor"));
+  }
+
+  #[test]
+  fn renamed_entries_are_detected_and_removed_while_foreign_ones_stay() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path(), Platform::Linux);
+    let path = config_path(&env, "cursor").unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+      &path,
+      format!(
+        "{{\"mcpServers\": {{\"github\": {{\"url\": \"https://api.githubcopilot.com/mcp/\"}}, \"donut\": {{\"url\": \"{}\"}}, \"donut-browser\": {{\"url\": \"https://example.com/mcp\"}}}}}}",
+        remote_mcp_url()
+      ),
+    )
+    .unwrap();
+    assert!(connected_in(&env, "cursor"));
+    uninstall_in(&env, "cursor").unwrap();
+    assert!(!connected_in(&env, "cursor"));
+    let text = read(&path);
+    assert!(text.contains("\"github\""));
+    assert!(!text.contains("\"donut\""));
+    assert!(!text.contains("\"donut-browser\""));
+
+    // Nothing of ours left: removal is a no-op that does not rewrite the file.
+    let before = read(&path);
+    uninstall_in(&env, "cursor").unwrap();
+    assert_eq!(read(&path), before);
+    uninstall_in(&env, "vscode").unwrap();
+    assert!(!config_path(&env, "vscode").unwrap().exists());
+  }
+
+  #[test]
+  fn only_the_remote_url_is_ours() {
+    assert!(is_remote_url(&remote_mcp_url()));
+    assert!(is_remote_url(&format!("{}/", remote_mcp_url())));
+    assert!(!is_remote_url("http://127.0.0.1:51080/mcp/tok"));
+    assert!(!is_remote_url("http://localhost:51080/mcp"));
+    assert!(!is_remote_url("https://api.githubcopilot.com/mcp/"));
+    assert!(!is_remote_url(
+      "https://api.donutbrowser.com/api/mcp-bridge"
+    ));
+  }
+
+  #[test]
+  fn agent_info_reports_the_fx_token_variable() {
+    assert_eq!(token_env_for("fx").as_deref(), Some(FX_TOKEN_ENV));
+    assert_eq!(token_env_for("cursor"), None);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn fx_config_is_private_to_the_owner() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path(), Platform::Linux);
+    install_in(&env, "fx", &remote()).unwrap();
+    let path = config_path(&env, "fx").unwrap();
+    assert_eq!(
+      fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+      0o600
+    );
+    assert_eq!(
+      fs::metadata(path.parent().unwrap())
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777,
+      0o700
+    );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn a_first_time_config_carrying_the_credential_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path(), Platform::Linux);
+    let path = config_path(&env, "cursor").unwrap();
+    assert!(!path.exists());
+    install_in(&env, "cursor", &remote()).unwrap();
+    // No file existed to copy bits from, and the entry carries the remote
+    // credential: the file is owner-only from its first byte, not after a
+    // chmod that follows a world-readable write.
+    assert_eq!(
+      fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+      0o600
+    );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn rewrites_keep_the_existing_permission_bits() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path(), Platform::Linux);
+    let path = config_path(&env, "cursor").unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, "{}").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+    install_in(&env, "cursor", &remote()).unwrap();
+    assert_eq!(
+      fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+      0o640
+    );
+    assert!(!path.parent().unwrap().join(".mcp.json.donut-tmp").exists());
+  }
+
+  #[test]
+  fn copilot_gets_plain_json_and_reads_copilot_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path(), Platform::Linux);
+    let path = config_path(&env, "github-copilot-cli").unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+      &path,
+      "{\n  // mine\n  \"mcpServers\": { \"other\": { \"url\": \"https://x.example\" }, },\n}\n",
+    )
+    .unwrap();
+    assert!(detected(&env, "github-copilot-cli"));
+    install_in(&env, "github-copilot-cli", &remote()).unwrap();
+    let text = read(&path);
+    let parsed: serde_json::Value = serde_json::from_str(&text).expect("plain JSON");
+    assert_eq!(parsed["mcpServers"]["other"]["url"], "https://x.example");
+    assert!(connected_in(&env, "github-copilot-cli"));
+    uninstall_in(&env, "github-copilot-cli").unwrap();
+    assert!(serde_json::from_str::<serde_json::Value>(&read(&path)).is_ok());
+    assert!(!connected_in(&env, "github-copilot-cli"));
+  }
+
+  #[test]
+  fn opencode_writes_where_the_file_keeps_its_servers() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path(), Platform::Linux);
+    let path = config_path(&env, "opencode").unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+    // Newer layout: servers under mcp.servers, written without `enabled`.
+    fs::write(
+      &path,
+      "{\n  \"mcp\": { \"servers\": { \"other\": { \"type\": \"remote\", \"url\": \"https://x.example\" } } }\n}\n",
+    )
+    .unwrap();
+    install_in(&env, "opencode", &remote()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&read(&path)).unwrap();
+    let entry = &parsed["mcp"]["servers"][SERVER_NAME];
+    assert_eq!(entry["type"], "remote");
+    assert!(entry.get("enabled").is_none());
+    assert!(parsed["mcp"].get(SERVER_NAME).is_none(), "no mixed layout");
+    assert!(connected_in(&env, "opencode"));
+    uninstall_in(&env, "opencode").unwrap();
+    assert!(!connected_in(&env, "opencode"));
+
+    // Older layout, or a fresh file: directly under mcp, with `enabled`.
+    fs::write(
+      &path,
+      "{\n  \"mcp\": { \"other\": { \"type\": \"local\", \"command\": [\"x\"] } }\n}\n",
+    )
+    .unwrap();
+    install_in(&env, "opencode", &remote()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&read(&path)).unwrap();
+    assert_eq!(parsed["mcp"][SERVER_NAME]["enabled"], true);
+  }
+
+  #[test]
+  fn toolsets_go_into_the_url_and_still_read_as_connected() {
+    let target = McpTarget::remote_with(KEY.to_string(), &["network".into(), "cookies".into()]);
+    assert!(target.url.ends_with("/api/mcp?toolsets=network,cookies"));
+    assert!(is_remote_url(&target.url));
+    assert!(is_remote_url(&format!("{}/", remote_mcp_url())));
+    assert!(!is_remote_url("https://example.com/api/mcp?toolsets=core"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path(), Platform::MacOs);
+    install_in(&env, "cursor", &target).unwrap();
+    assert!(connected_in(&env, "cursor"));
+    assert_eq!(entry_of(&env, "cursor")["url"], json!(target.url));
+  }
+
+  #[test]
+  fn a_new_key_reaches_every_connected_client_and_nothing_else() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path(), Platform::Linux);
+    let old = McpTarget::remote("dmk_old_key".to_string());
+    let new = McpTarget::remote("dmk_new_key".to_string());
+    for agent_id in generic_ids() {
+      install_in(&env, agent_id, &old).unwrap();
+    }
+    uninstall_in(&env, "cursor").unwrap();
+    for agent_id in generic_ids().filter(|id| *id != "cursor" && *id != "fx") {
+      assert_eq!(
+        connection_in(&env, agent_id, Some("dmk_new_key")),
+        Connection::Connected { current: false },
+        "{agent_id}"
+      );
+    }
+
+    assert!(reinstall_in(&env, &new).is_empty());
+    for agent_id in generic_ids().filter(|id| *id != "cursor") {
+      assert_eq!(
+        connection_in(&env, agent_id, Some("dmk_new_key")),
+        Connection::Connected { current: true },
+        "{agent_id}"
+      );
+      let text = read(&config_path(&env, agent_id).unwrap());
+      assert!(!text.contains("dmk_old_key"), "{agent_id}: {text}");
+    }
+    // fx reads the key from the environment: its entry names the variable
+    // and never holds a key, before or after.
+    assert_eq!(
+      entry_of(&env, "fx")["bearer_token_env"],
+      json!(FX_TOKEN_ENV)
+    );
+    assert!(!read(&config_path(&env, "fx").unwrap()).contains("dmk_"));
+    assert_eq!(
+      connection_in(&env, "cursor", Some("dmk_new_key")),
+      Connection::Absent,
+      "a removed entry stays removed"
+    );
+  }
+
+  #[test]
+  fn an_entry_with_an_older_key_is_not_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path(), Platform::Linux);
+    for agent_id in ["cursor", "codex", "goose"] {
+      install_in(&env, agent_id, &remote()).unwrap();
+      assert_eq!(
+        connection_in(&env, agent_id, Some(KEY)),
+        Connection::Connected { current: true },
+        "{agent_id}"
+      );
+      assert_eq!(
+        connection_in(&env, agent_id, Some("dmk_newer")),
+        Connection::Connected { current: false },
+        "{agent_id}"
+      );
+      assert_eq!(
+        connection_in(&env, agent_id, None),
+        Connection::Connected { current: false },
+        "{agent_id}: no stored key"
+      );
+    }
+    install_in(&env, "fx", &remote()).unwrap();
+    assert_eq!(
+      connection_in(&env, "fx", Some("dmk_newer")),
+      Connection::Connected { current: true },
+      "fx holds no key to be stale"
+    );
+
+    // A renamed entry that still carries an older key keeps the client stale.
+    let path = config_path(&env, "vscode").unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+      &path,
+      format!(
+        "{{\"servers\": {{\"donut\": {{\"type\": \"http\", \"url\": \"{}\", \"headers\": {{\"Authorization\": \"Bearer dmk_older\"}}}}}}}}",
+        remote_mcp_url()
+      ),
+    )
+    .unwrap();
+    install_in(&env, "vscode", &remote()).unwrap();
+    assert_eq!(
+      connection_in(&env, "vscode", Some(KEY)),
+      Connection::Connected { current: false }
+    );
+  }
+
+  #[test]
+  fn a_file_that_names_the_endpoint_but_does_not_parse_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path(), Platform::Linux);
+    let path = config_path(&env, "cursor").unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let broken = format!(
+      "{{ \"mcpServers\": {{ \"donut-browser\": {{ \"url\": \"{}\" }}",
+      remote_mcp_url()
+    );
+    fs::write(&path, &broken).unwrap();
+    // A broken file that never named the endpoint is not ours to report.
+    let other = config_path(&env, "codex").unwrap();
+    fs::create_dir_all(other.parent().unwrap()).unwrap();
+    fs::write(&other, "[mcp_servers\nbroken = ").unwrap();
+
+    assert_eq!(
+      connection_in(&env, "cursor", Some(KEY)),
+      Connection::Unreadable
+    );
+    assert!(!connected_in(&env, "cursor"));
+    assert_eq!(connection_in(&env, "codex", Some(KEY)), Connection::Absent);
+    assert_eq!(reinstall_in(&env, &remote()), vec!["cursor".to_string()]);
+    assert_eq!(read(&path), broken, "left untouched");
+  }
+
+  #[test]
+  fn a_legacy_local_entry_is_moved_to_the_endpoint() {
+    assert!(is_legacy_entry(
+      SERVER_NAME,
+      &json!({ "url": "http://127.0.0.1:51080/mcp/tok" })
+    ));
+    assert!(is_legacy_entry(
+      SERVER_NAME,
+      &json!({ "serverUrl": "http://localhost:51080/mcp" })
+    ));
+    assert!(!is_legacy_entry(
+      "other",
+      &json!({ "url": "http://127.0.0.1:3000/mcp" })
+    ));
+    assert!(!is_legacy_entry(
+      SERVER_NAME,
+      &json!({ "url": "http://127.0.0.10:3000/mcp" })
+    ));
+    assert!(!is_legacy_entry(
+      SERVER_NAME,
+      &json!({ "url": "https://example.com/mcp" })
+    ));
+
+    let dir = tempfile::tempdir().unwrap();
+    let env = test_env(dir.path(), Platform::Linux);
+    let path = config_path(&env, "cursor").unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(
+      &path,
+      "{\"mcpServers\": {\"donut-browser\": {\"url\": \"http://127.0.0.1:51080/mcp/tok\"}}}",
+    )
+    .unwrap();
+    // Somebody else's local server is theirs, under any key.
+    let foreign = config_path(&env, "vscode").unwrap();
+    fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+    let foreign_text = "{\"servers\": {\"other\": {\"url\": \"http://127.0.0.1:3000/mcp\"}}}";
+    fs::write(&foreign, foreign_text).unwrap();
+
+    assert_eq!(connection_in(&env, "cursor", Some(KEY)), Connection::Legacy);
+    assert!(!connected_in(&env, "cursor"));
+    assert_eq!(connection_in(&env, "vscode", Some(KEY)), Connection::Absent);
+
+    assert!(reinstall_in(&env, &remote()).is_empty());
+    assert_eq!(entry_of(&env, "cursor")["url"], json!(remote_mcp_url()));
+    assert_eq!(
+      connection_in(&env, "cursor", Some(KEY)),
+      Connection::Connected { current: true }
+    );
+    assert_eq!(read(&foreign), foreign_text);
+  }
 }

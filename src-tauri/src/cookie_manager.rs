@@ -12,54 +12,33 @@ use tauri::AppHandle;
 /// so no encryption path is needed here — Chromium reads plaintext when
 /// `encrypted_value` is empty, regardless of what other cookies store.
 pub mod chrome_decrypt {
-  use aes::cipher::{block_padding::Pkcs7, BlockModeDecrypt, KeyIvInit};
-  use ring::pbkdf2;
+  use crate::profile_import::os_crypt;
   use sha2::{Digest, Sha256};
-  use std::num::NonZeroU32;
   use std::path::Path;
 
-  type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
-
-  /// PBKDF2 iteration count for deriving the AES key from the password stored
-  /// in `os_crypt_key`. Must match Chromium's `OSCryptImpl` on each platform:
-  /// macOS uses 1003 iterations, Linux uses 1. Getting this wrong produces a
-  /// different AES key → silent decryption failure → empty cookie values.
-  /// See `components/os_crypt/sync/os_crypt_{mac.mm,linux.cc}` in Chromium.
-  #[cfg(target_os = "macos")]
-  const PBKDF2_ITERATIONS: u32 = 1003;
-  #[cfg(not(target_os = "macos"))]
-  const PBKDF2_ITERATIONS: u32 = 1;
-
-  const KEY_LEN: usize = 16; // AES-128
-  const SALT: &[u8] = b"saltysalt";
-  const IV: [u8; 16] = [b' '; 16]; // 16 spaces
   const HOST_HASH_LEN: usize = 32; // SHA-256 output length
 
-  fn derive_key(password: &[u8]) -> [u8; KEY_LEN] {
-    let mut key = [0u8; KEY_LEN];
-    // Using ring::pbkdf2 instead of the `pbkdf2` crate to avoid digest
-    // version conflicts between sha1 0.11 (digest 0.11) and pbkdf2 0.12
-    // (digest 0.10). ring's implementation is self-contained.
-    pbkdf2::derive(
-      pbkdf2::PBKDF2_HMAC_SHA1,
-      NonZeroU32::new(PBKDF2_ITERATIONS).expect("iterations must be non-zero"),
-      SALT,
-      password,
-      &mut key,
-    );
-    key
+  /// The exact contents of a profile's `os_crypt_key` file.
+  ///
+  /// Which cipher opens a record depends on the file's format and the record's
+  /// tag, never on the OS reading it, so a profile written on any OS decrypts
+  /// on every OS (see `os_crypt::key_for_tag`).
+  pub struct EncryptionKey {
+    contents: Vec<u8>,
   }
 
-  pub fn get_encryption_key(profile_data_path: &Path) -> Option<[u8; KEY_LEN]> {
-    let key_file = profile_data_path.join("os_crypt_key");
+  impl EncryptionKey {
+    pub fn from_contents(contents: Vec<u8>) -> Option<Self> {
+      (!contents.is_empty()).then_some(Self { contents })
+    }
+  }
+
+  pub fn get_encryption_key(profile_data_path: &Path) -> Option<EncryptionKey> {
     // Read as raw bytes and do NOT trim — Chromium's `ReadFileToString`
     // passes the exact file contents to `Pbkdf2(file_contents)`. Any
     // normalisation we do here would produce a different derived key.
-    let contents = std::fs::read(&key_file).ok()?;
-    if contents.is_empty() {
-      return None;
-    }
-    Some(derive_key(&contents))
+    let contents = std::fs::read(profile_data_path.join(os_crypt::KEY_FILE_NAME)).ok()?;
+    EncryptionKey::from_contents(contents)
   }
 
   /// Decrypt a Chrome encrypted cookie value.
@@ -70,34 +49,36 @@ pub mod chrome_decrypt {
   /// when present. Passing `host_key` is required to do that verification —
   /// without it we'd return 32 bytes of hash noise plus the actual value,
   /// which is not valid UTF-8 and gets thrown away.
-  pub fn decrypt(encrypted: &[u8], host_key: &str, key: &[u8; KEY_LEN]) -> Option<String> {
+  ///
+  /// An AES-128-CBC record that does not open under the key file's key is
+  /// retried with Chromium's fixed fallback keys; the first key whose output
+  /// is a valid value wins.
+  pub fn decrypt(encrypted: &[u8], host_key: &str, key: &EncryptionKey) -> Option<String> {
     if encrypted.len() < 3 {
       return None;
     }
-    let prefix = &encrypted[..3];
-    if prefix != b"v10" && prefix != b"v11" {
-      return None;
-    }
-    let ciphertext = &encrypted[3..];
+    let (tag, ciphertext) = encrypted.split_at(3);
+    let primary = os_crypt::key_for_tag(&key.contents, tag)?;
     if ciphertext.is_empty() {
       return Some(String::new());
     }
+    primary
+      .with_fallbacks()
+      .iter()
+      .filter_map(|candidate| candidate.decrypt(ciphertext))
+      .find_map(|plaintext| cookie_value(&plaintext, host_key))
+  }
 
-    let mut buf = ciphertext.to_vec();
-    let decrypted = Aes128CbcDec::new(key.into(), &IV.into())
-      .decrypt_padded::<Pkcs7>(&mut buf)
-      .ok()?;
-
-    // Strip the SHA-256(host_key) integrity prefix if present. Older cookies
-    // (pre-M100) didn't have this prefix, so we fall back to the raw bytes
-    // when the first 32 bytes don't match the expected hash.
+  /// Strip the SHA-256(host_key) integrity prefix if present. Older cookies
+  /// (pre-M100) didn't have this prefix, so we fall back to the raw bytes
+  /// when the first 32 bytes don't match the expected hash.
+  fn cookie_value(decrypted: &[u8], host_key: &str) -> Option<String> {
     if decrypted.len() >= HOST_HASH_LEN {
       let expected: [u8; HOST_HASH_LEN] = Sha256::digest(host_key.as_bytes()).into();
       if decrypted[..HOST_HASH_LEN] == expected {
         return String::from_utf8(decrypted[HOST_HASH_LEN..].to_vec()).ok();
       }
     }
-
     String::from_utf8(decrypted.to_vec()).ok()
   }
 }
@@ -184,26 +165,129 @@ pub struct CookieImportResult {
   pub errors: Vec<String>,
 }
 
+/// What a write does to cookies the profile already has.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CookieWriteMode {
+  /// Update the rows the incoming cookies match, insert the rest, delete
+  /// nothing.
+  #[default]
+  Merge,
+  /// Clear every cookie the profile holds for the sites named in this write
+  /// before applying it, so the result is exactly what was pasted. Subdomains
+  /// and every other site are left alone.
+  ReplaceMatchingSites,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CookieWriteCounts {
+  pub added: usize,
+  pub overwritten: usize,
+  pub deleted: usize,
+}
+
+/// One accepted cookie, as the paste preview shows it.
+///
+/// Deliberately has no `value`: the value IS the credential, and a preview that
+/// carries it puts every pasted session token into the frontend's state, its
+/// logs and any screenshot of the dialog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PastedCookiePreview {
+  pub name: String,
+  pub domain: String,
+  pub path: String,
+  pub expires: i64,
+  pub is_secure: bool,
+  pub is_http_only: bool,
+  pub same_site: i32,
+}
+
+impl From<&UnifiedCookie> for PastedCookiePreview {
+  fn from(cookie: &UnifiedCookie) -> Self {
+    Self {
+      name: cookie.name.clone(),
+      domain: cookie.domain.clone(),
+      path: cookie.path.clone(),
+      expires: cookie.expires,
+      is_secure: cookie.is_secure,
+      is_http_only: cookie.is_http_only,
+      same_site: cookie.same_site,
+    }
+  }
+}
+
+/// Everything the paste dialog needs to describe a paste before writing it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CookiePasteAnalysis {
+  pub format: Option<crate::cookie_paste::PasteFormat>,
+  pub cookies: Vec<PastedCookiePreview>,
+  pub issues: Vec<crate::cookie_paste::CookieIssue>,
+  pub site_required: bool,
+  pub expired_count: usize,
+  /// How many stored rows [`CookieWriteMode::ReplaceMatchingSites`] would
+  /// delete for the sites this paste names. `None` when the store cannot be
+  /// read — a profile that has never launched, a locked database, a browser
+  /// with no supported cookie store.
+  pub replace_delete_count: Option<usize>,
+  /// The profile wipes its browsing data when the browser exits, so an import
+  /// here lives exactly one session. Not an error, but silently losing a pasted
+  /// login is the worst thing this feature can do.
+  pub clears_on_close: bool,
+  /// The `{"code":…}` string explaining why an import would be refused right
+  /// now, ready for `translateBackendError`. `None` when the import can run.
+  pub blocked_by: Option<String>,
+}
+
+/// Result of writing a paste into a profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CookiePasteImportResult {
+  pub added: usize,
+  pub overwritten: usize,
+  pub deleted: usize,
+  /// Cookies that parsed cleanly but were not written, i.e. expired ones the
+  /// caller chose to leave out.
+  pub skipped: usize,
+  pub issues: Vec<crate::cookie_paste::CookieIssue>,
+}
+
 pub struct CookieManager;
 
 impl CookieManager {
   /// Windows epoch offset: seconds between 1601-01-01 and 1970-01-01
   const WINDOWS_EPOCH_DIFF: i64 = 11644473600;
 
-  fn get_chrome_encryption_key(profile: &BrowserProfile, profiles_dir: &Path) -> Option<[u8; 16]> {
+  fn get_chrome_encryption_key(
+    profile: &BrowserProfile,
+    profiles_dir: &Path,
+  ) -> Option<chrome_decrypt::EncryptionKey> {
     let profile_data_path = profile.get_profile_data_path(profiles_dir);
     chrome_decrypt::get_encryption_key(&profile_data_path)
   }
 
-  fn wayfern_cookie_path(profile_data_path: &Path) -> PathBuf {
+  /// The cookie database Chromium uses for this profile directory. A profile
+  /// written on another OS resolves to the file the browser reads here, not to
+  /// this host's default location.
+  ///
+  /// Chromium on Windows moves network data from `Default/` into
+  /// `Default/Network/` and leaves the `NetworkDataMigrated` checkpoint there.
+  /// Once that checkpoint exists, Chromium on every OS keeps using `Network/`;
+  /// without it, other OSes use `Default/`, and Windows migrates a
+  /// `Default/Cookies` it finds on the next launch.
+  pub(crate) fn wayfern_cookie_path(profile_data_path: &Path) -> PathBuf {
     let default_dir = profile_data_path.join("Default");
-    #[cfg(target_os = "windows")]
+    let network_dir = default_dir.join("Network");
+    let migrated = network_dir.join("Cookies");
+    let unmigrated = default_dir.join("Cookies");
+    if network_dir.join("NetworkDataMigrated").exists()
+      || (cfg!(target_os = "windows") && !unmigrated.exists())
     {
-      default_dir.join("Network").join("Cookies")
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-      default_dir.join("Cookies")
+      migrated
+    } else {
+      unmigrated
     }
   }
 
@@ -323,7 +407,7 @@ impl CookieManager {
   /// Handles encrypted cookies by decrypting encrypted_value using the profile's encryption key.
   fn read_chrome_cookies(
     db_path: &Path,
-    encryption_key: Option<&[u8; 16]>,
+    encryption_key: Option<&chrome_decrypt::EncryptionKey>,
   ) -> Result<Vec<UnifiedCookie>, String> {
     let conn = Connection::open(db_path).map_err(|e| format!("Failed to open database: {e}"))?;
 
@@ -391,19 +475,32 @@ impl CookieManager {
   /// the os_crypt key derivation between Wayfern's runtime and an external
   /// writer is not guaranteed to match, and a ciphertext Chromium can't
   /// decrypt silently produces an empty cookie value at runtime.
+  ///
+  /// The whole write runs in one transaction, so a row that fails cannot leave
+  /// half a paste applied — the half that would matter is the half holding the
+  /// login.
   fn write_chrome_cookies(
     db_path: &Path,
     cookies: &[UnifiedCookie],
-  ) -> Result<(usize, usize), String> {
-    let conn = Connection::open(db_path).map_err(|e| format!("Failed to open database: {e}"))?;
+    mode: CookieWriteMode,
+  ) -> Result<CookieWriteCounts, String> {
+    let mut conn =
+      Connection::open(db_path).map_err(|e| format!("Failed to open database: {e}"))?;
+    let tx = conn
+      .transaction()
+      .map_err(|e| format!("Failed to start cookie transaction: {e}"))?;
 
-    let mut copied = 0;
-    let mut replaced = 0;
+    let mut counts = CookieWriteCounts::default();
 
-    let now = std::time::SystemTime::now()
-      .duration_since(std::time::UNIX_EPOCH)
-      .unwrap()
-      .as_secs() as i64;
+    if mode == CookieWriteMode::ReplaceMatchingSites {
+      for host in Self::replace_host_keys(cookies) {
+        counts.deleted += tx
+          .execute("DELETE FROM cookies WHERE host_key = ?1", params![host])
+          .map_err(|e| format!("Failed to clear existing cookies: {e}"))?;
+      }
+    }
+
+    let now = Self::now_secs();
     // Session cookies get 30 days of persistence so they survive restart.
     // routinely exported as a session cookie; writing it as memory-only
     // (is_persistent = 0) makes Chromium drop it on the next flush, so the
@@ -424,43 +521,46 @@ impl CookieManager {
       let source_port: i32 = if cookie.is_secure { 443 } else { 80 };
       let source_scheme: i32 = if cookie.is_secure { 2 } else { 1 };
 
-      let existing: Option<i64> = conn
+      // Four columns, matching the store's own unique index. A three-column
+      // probe collapses every top-frame partition of one host/name/path into a
+      // single arbitrary row: the rest keep their old values and the write
+      // still reports one replacement.
+      let existing: Option<i64> = tx
         .query_row(
-          "SELECT rowid FROM cookies WHERE host_key = ?1 AND name = ?2 AND path = ?3",
+          "SELECT rowid FROM cookies
+           WHERE host_key = ?1 AND top_frame_site_key = '' AND name = ?2 AND path = ?3",
           params![&cookie.domain, &cookie.name, &cookie.path],
           |row| row.get(0),
         )
         .ok();
 
-      if existing.is_some() {
-        conn
-          .execute(
-            "UPDATE cookies SET value = ?1, encrypted_value = x'', expires_utc = ?2, is_secure = ?3,
+      if let Some(rowid) = existing {
+        // creation_utc is deliberately not written: Chromium evicts by it, so
+        // refreshing a cookie must not make it look brand new.
+        tx.execute(
+          "UPDATE cookies SET value = ?1, encrypted_value = x'', expires_utc = ?2, is_secure = ?3,
                      is_httponly = ?4, samesite = ?5, last_access_utc = ?6, last_update_utc = ?7,
                      has_expires = ?8, is_persistent = ?9, source_scheme = ?10, source_port = ?11
-                     WHERE host_key = ?12 AND name = ?13 AND path = ?14",
-            params![
-              &cookie.value,
-              Self::unix_to_chrome_time(expires),
-              cookie.is_secure as i32,
-              cookie.is_http_only as i32,
-              cookie.same_site,
-              Self::unix_to_chrome_time(cookie.last_accessed),
-              Self::unix_to_chrome_time(now),
-              has_expires,
-              is_persistent,
-              source_scheme,
-              source_port,
-              &cookie.domain,
-              &cookie.name,
-              &cookie.path,
-            ],
-          )
-          .map_err(|e| format!("Failed to update cookie: {e}"))?;
-        replaced += 1;
+                     WHERE rowid = ?12",
+          params![
+            &cookie.value,
+            Self::unix_to_chrome_time(expires),
+            cookie.is_secure as i32,
+            cookie.is_http_only as i32,
+            cookie.same_site,
+            Self::unix_to_chrome_time(cookie.last_accessed),
+            Self::unix_to_chrome_time(now),
+            has_expires,
+            is_persistent,
+            source_scheme,
+            source_port,
+            rowid,
+          ],
+        )
+        .map_err(|e| format!("Failed to update cookie: {e}"))?;
+        counts.overwritten += 1;
       } else {
-        conn
-          .execute(
+        tx.execute(
             "INSERT INTO cookies
                      (creation_utc, host_key, top_frame_site_key, name, value, encrypted_value,
                       path, expires_utc, is_secure, is_httponly, last_access_utc, has_expires,
@@ -486,11 +586,53 @@ impl CookieManager {
             ],
           )
           .map_err(|e| format!("Failed to insert cookie: {e}"))?;
-        copied += 1;
+        counts.added += 1;
       }
     }
 
-    Ok((copied, replaced))
+    tx.commit()
+      .map_err(|e| format!("Failed to commit cookies: {e}"))?;
+
+    Ok(counts)
+  }
+
+  /// Which `host_key` values a replace-mode write clears out first.
+  ///
+  /// `.example.com` and `example.com` are one site to the person pasting and
+  /// two distinct host keys to Chromium, so replacing one without the other
+  /// leaves the stale half of the login behind. Subdomains stay untouched:
+  /// nothing in the paste says anything about them.
+  fn replace_host_keys(cookies: &[UnifiedCookie]) -> Vec<String> {
+    let mut hosts = std::collections::BTreeSet::new();
+    for cookie in cookies {
+      let bare = cookie.domain.trim_start_matches('.');
+      if bare.is_empty() {
+        continue;
+      }
+      hosts.insert(bare.to_string());
+      hosts.insert(format!(".{bare}"));
+    }
+    hosts.into_iter().collect()
+  }
+
+  /// How many stored rows a replace-mode write of `cookies` would delete.
+  ///
+  /// Reads the snapshot view so a running browser's lock does not turn the
+  /// preview into an error.
+  fn count_replaceable_rows(db_path: &Path, cookies: &[UnifiedCookie]) -> Result<usize, String> {
+    let conn = Self::open_cookie_db_readonly(db_path)?;
+    let mut total = 0usize;
+    for host in Self::replace_host_keys(cookies) {
+      let count: i64 = conn
+        .query_row(
+          "SELECT COUNT(*) FROM cookies WHERE host_key = ?1",
+          params![host],
+          |row| row.get(0),
+        )
+        .map_err(|e| crate::backend_error_with_detail("COOKIE_DB_UNAVAILABLE", e))?;
+      total += count as usize;
+    }
+    Ok(total)
   }
 
   /// Public API: Read cookies from a profile
@@ -603,6 +745,23 @@ impl CookieManager {
       .iter()
       .find(|p| p.id.to_string() == profile_id)
       .ok_or_else(|| serde_json::json!({ "code": "PROFILE_NOT_FOUND" }).to_string())?;
+
+    // A profile that has never run has no cookie store yet, which is no
+    // cookies rather than a failure. A protected profile's store is sealed,
+    // so its absence there says nothing.
+    if matches!(
+      profile.browser.as_str(),
+      "wayfern" | crate::fingerprint_chromium::BROWSER_ID
+    ) && !profile.password_protected
+      && !Self::wayfern_cookie_path(&profile.get_profile_data_path(&profiles_dir)).exists()
+    {
+      return Ok(CookieStats {
+        profile_id: profile_id.to_string(),
+        browser_type: profile.browser.clone(),
+        total_count: 0,
+        domains: Vec::new(),
+      });
+    }
 
     let db_path = Self::get_cookie_db_path(profile, &profiles_dir).map_err(|e| {
       serde_json::json!({
@@ -761,7 +920,7 @@ impl CookieManager {
 
       let write_result = match target.browser.as_str() {
         "wayfern" | crate::fingerprint_chromium::BROWSER_ID => {
-          Self::write_chrome_cookies(&target_db_path, &cookies_to_copy)
+          Self::write_chrome_cookies(&target_db_path, &cookies_to_copy, CookieWriteMode::Merge)
         }
         _ => {
           results.push(CookieCopyResult {
@@ -775,11 +934,11 @@ impl CookieManager {
       };
 
       match write_result {
-        Ok((copied, replaced)) => {
+        Ok(counts) => {
           results.push(CookieCopyResult {
             target_profile_id: target_id.clone(),
-            cookies_copied: copied,
-            cookies_replaced: replaced,
+            cookies_copied: counts.added,
+            cookies_replaced: counts.overwritten,
             errors: vec![],
           });
         }
@@ -797,152 +956,12 @@ impl CookieManager {
     Ok(results)
   }
 
-  /// Parse Netscape format cookies from text content
-  fn parse_netscape_cookies(content: &str) -> (Vec<UnifiedCookie>, Vec<String>) {
-    let mut cookies = Vec::new();
-    let mut errors = Vec::new();
-    let now = std::time::SystemTime::now()
-      .duration_since(std::time::UNIX_EPOCH)
-      .unwrap()
-      .as_secs() as i64;
-
-    for (i, line) in content.lines().enumerate() {
-      let line = line.trim();
-      if line.is_empty() || line.starts_with('#') {
-        continue;
-      }
-
-      let fields: Vec<&str> = line.split('\t').collect();
-      if fields.len() < 7 {
-        errors.push(format!(
-          "Line {}: expected 7 tab-separated fields, got {}",
-          i + 1,
-          fields.len()
-        ));
-        continue;
-      }
-
-      let domain = fields[0].to_string();
-      let path = fields[2].to_string();
-      let is_secure = fields[3].eq_ignore_ascii_case("TRUE");
-      let expires = fields[4].parse::<i64>().unwrap_or(0);
-      let name = fields[5].to_string();
-      let value = fields[6].to_string();
-
-      cookies.push(UnifiedCookie {
-        name,
-        value,
-        domain,
-        path,
-        expires,
-        is_secure,
-        is_http_only: false,
-        same_site: 0,
-        creation_time: now,
-        last_accessed: now,
-      });
-    }
-
-    (cookies, errors)
-  }
-
-  /// Parse JSON format cookies (array of cookie objects, e.g. from browser extensions)
-  fn parse_json_cookies(content: &str) -> (Vec<UnifiedCookie>, Vec<String>) {
-    let mut cookies = Vec::new();
-    let mut errors = Vec::new();
-    let now = std::time::SystemTime::now()
-      .duration_since(std::time::UNIX_EPOCH)
-      .unwrap()
-      .as_secs() as i64;
-
-    let arr: Vec<Value> = match serde_json::from_str(content) {
-      Ok(v) => v,
-      Err(e) => {
-        errors.push(format!("Failed to parse JSON: {e}"));
-        return (cookies, errors);
-      }
-    };
-
-    for (i, obj) in arr.iter().enumerate() {
-      let name = match obj.get("name").and_then(|v| v.as_str()) {
-        Some(s) => s.to_string(),
-        None => {
-          errors.push(format!("Cookie {}: missing 'name' field", i + 1));
-          continue;
-        }
-      };
-      let value = obj
-        .get("value")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-      let domain = match obj.get("domain").and_then(|v| v.as_str()) {
-        Some(s) => s.to_string(),
-        None => {
-          errors.push(format!("Cookie {}: missing 'domain' field", i + 1));
-          continue;
-        }
-      };
-      let path = obj
-        .get("path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("/")
-        .to_string();
-      let is_secure = obj.get("secure").and_then(|v| v.as_bool()).unwrap_or(false);
-      let is_http_only = obj
-        .get("httpOnly")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-      let is_session = obj
-        .get("session")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-      let expires = if is_session {
-        0
-      } else {
-        obj
-          .get("expirationDate")
-          .and_then(|v| v.as_f64())
-          .map(|f| f as i64)
-          .unwrap_or(0)
-      };
-      let same_site = obj
-        .get("sameSite")
-        .and_then(|v| v.as_str())
-        .map(|s| match s {
-          "lax" => 1,
-          "strict" => 2,
-          _ => 0, // "no_restriction" or unrecognized
-        })
-        .unwrap_or(0);
-
-      cookies.push(UnifiedCookie {
-        name,
-        value,
-        domain,
-        path,
-        expires,
-        is_secure,
-        is_http_only,
-        same_site,
-        creation_time: now,
-        last_accessed: now,
-      });
-    }
-
-    (cookies, errors)
-  }
-
-  /// Auto-detect cookie format and parse
-  fn parse_cookies(content: &str) -> (Vec<UnifiedCookie>, Vec<String>) {
-    let trimmed = content.trim();
-    if trimmed.starts_with('[') && serde_json::from_str::<Vec<Value>>(trimmed).is_ok() {
-      return Self::parse_json_cookies(trimmed);
-    }
-    Self::parse_netscape_cookies(content)
-  }
-
   /// Format cookies as Netscape TXT
+  ///
+  /// http-only cookies carry the `#HttpOnly_` host prefix curl and the
+  /// cookies.txt extensions use. The plain format has no field for the flag, so
+  /// without the prefix an export of a login cookie re-imports as a cookie any
+  /// page script can read.
   pub fn format_netscape_cookies(cookies: &[UnifiedCookie]) -> String {
     let mut lines = Vec::new();
     lines.push("# Netscape HTTP Cookie File".to_string());
@@ -953,9 +972,14 @@ impl CookieManager {
         "FALSE"
       };
       let secure = if cookie.is_secure { "TRUE" } else { "FALSE" };
+      let host = if cookie.is_http_only {
+        format!("#HttpOnly_{}", cookie.domain)
+      } else {
+        cookie.domain.clone()
+      };
       lines.push(format!(
         "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-        cookie.domain, flag, cookie.path, secure, cookie.expires, cookie.name, cookie.value
+        host, flag, cookie.path, secure, cookie.expires, cookie.name, cookie.value
       ));
     }
     lines.join("\n")
@@ -966,10 +990,16 @@ impl CookieManager {
     let arr: Vec<Value> = cookies
       .iter()
       .map(|c| {
+        // -1 is Chromium's "unspecified", which is what every cookie that never
+        // carried a SameSite attribute stores. Exporting it as
+        // "no_restriction" turned it into an explicit SameSite=None on the way
+        // back in, and Chromium refuses to send those unless they are also
+        // Secure — so a re-imported login simply stopped being sent.
         let same_site_str = match c.same_site {
+          0 => "no_restriction",
           1 => "lax",
           2 => "strict",
-          _ => "no_restriction",
+          _ => "unspecified",
         };
         serde_json::json!({
           "name": c.name,
@@ -988,59 +1018,201 @@ impl CookieManager {
     serde_json::to_string_pretty(&arr).unwrap_or_else(|_| "[]".to_string())
   }
 
-  /// Public API: Import cookies with auto-format detection
+  /// The profile a cookie write targets, or the code saying it does not exist.
+  fn paste_target(profile_id: &str) -> Result<BrowserProfile, String> {
+    ProfileManager::instance()
+      .list_profiles()
+      .map_err(|e| crate::backend_error_with_detail("COOKIE_DB_UNAVAILABLE", e))?
+      .into_iter()
+      .find(|p| p.id.to_string() == profile_id)
+      .ok_or_else(|| crate::backend_error("PROFILE_NOT_FOUND"))
+  }
+
+  /// Why writing cookies into this profile would be refused right now, as the
+  /// `{"code":…}` string the frontend translates. `None` means go ahead.
+  async fn paste_blocker(app_handle: &AppHandle, profile: &BrowserProfile) -> Option<String> {
+    let is_running = ProfileManager::instance()
+      .check_browser_status(app_handle.clone(), profile)
+      .await
+      .unwrap_or(false);
+    if is_running {
+      return Some(crate::backend_error("COOKIE_IMPORT_BROWSER_RUNNING"));
+    }
+    // The profile directory on disk is ciphertext while locked; a plaintext
+    // SQLite write into it is not a cookie, it is corruption.
+    if profile.password_protected {
+      return Some(crate::backend_error("COOKIE_IMPORT_PROFILE_PROTECTED"));
+    }
+    // A remote session owns this profile until its work has been pulled back.
+    // Writing locally makes every local mtime newer, so the next sync uploads
+    // the pre-session copy and deletes the session's cookies. See
+    // `remote_handoff`.
+    if crate::remote_handoff::state_for(&profile.id.to_string()).is_some() {
+      return Some(crate::backend_error("COOKIE_IMPORT_REMOTE_SESSION"));
+    }
+    None
+  }
+
+  /// Whether a successful import into this profile would be wiped on browser
+  /// exit. Mirrors the condition `browser_runner` actually applies, which lets
+  /// ephemeral and password-protected profiles take their own paths first.
+  fn clears_cookies_on_close(profile: &BrowserProfile) -> bool {
+    profile.clear_on_close && !profile.ephemeral && !profile.password_protected
+  }
+
+  /// Public API: describe a pasted blob without writing anything.
+  pub async fn analyze_paste(
+    app_handle: &AppHandle,
+    profile_id: &str,
+    content: &str,
+    site: Option<&str>,
+  ) -> Result<CookiePasteAnalysis, String> {
+    let profile = Self::paste_target(profile_id)?;
+    let parsed = crate::cookie_paste::parse_paste(content, site);
+    let blocked_by = Self::paste_blocker(app_handle, &profile).await;
+
+    // Counted over every accepted cookie, so this is the number of rows the
+    // sites in the paste currently hold — the ceiling on what replace mode
+    // removes, whatever the caller later decides about expired cookies.
+    let replace_delete_count = if parsed.cookies.is_empty() {
+      Some(0)
+    } else {
+      Self::get_cookie_db_path(&profile, &ProfileManager::instance().get_profiles_dir())
+        .ok()
+        .and_then(|db_path| Self::count_replaceable_rows(&db_path, &parsed.cookies).ok())
+    };
+
+    Ok(CookiePasteAnalysis {
+      format: parsed.format,
+      cookies: parsed
+        .cookies
+        .iter()
+        .map(PastedCookiePreview::from)
+        .collect(),
+      issues: parsed.issues,
+      site_required: parsed.site_required,
+      expired_count: parsed.expired_count,
+      replace_delete_count,
+      clears_on_close: Self::clears_cookies_on_close(&profile),
+      blocked_by,
+    })
+  }
+
+  /// Public API: write a pasted blob into a profile's cookie store.
+  pub async fn import_paste(
+    app_handle: &AppHandle,
+    profile_id: &str,
+    content: &str,
+    site: Option<&str>,
+    mode: CookieWriteMode,
+    include_expired: bool,
+  ) -> Result<CookiePasteImportResult, String> {
+    let profile = Self::paste_target(profile_id)?;
+    if let Some(blocker) = Self::paste_blocker(app_handle, &profile).await {
+      return Err(blocker);
+    }
+
+    let parsed = crate::cookie_paste::parse_paste(content, site);
+    if parsed.cookies.is_empty() {
+      return Err(crate::backend_error("COOKIE_IMPORT_NO_COOKIES"));
+    }
+
+    let now = Self::now_secs();
+    let total = parsed.cookies.len();
+    let to_write: Vec<UnifiedCookie> = if include_expired {
+      parsed.cookies
+    } else {
+      parsed
+        .cookies
+        .into_iter()
+        .filter(|c| c.expires == 0 || c.expires > now)
+        .collect()
+    };
+    let skipped = total - to_write.len();
+
+    let counts = Self::write_paste(&profile, &to_write, mode).await?;
+
+    Ok(CookiePasteImportResult {
+      added: counts.added,
+      overwritten: counts.overwritten,
+      deleted: counts.deleted,
+      skipped,
+      issues: parsed.issues,
+    })
+  }
+
+  /// The SQLite half of a paste write, off the async runtime.
+  ///
+  /// `check_browser_status` is async and every caller must await it before
+  /// getting here; only this synchronous tail belongs on a blocking thread.
+  async fn write_paste(
+    profile: &BrowserProfile,
+    cookies: &[UnifiedCookie],
+    mode: CookieWriteMode,
+  ) -> Result<CookieWriteCounts, String> {
+    if !matches!(
+      profile.browser.as_str(),
+      "wayfern" | crate::fingerprint_chromium::BROWSER_ID
+    ) {
+      return Err(crate::backend_error_with_detail(
+        "COOKIE_DB_UNAVAILABLE",
+        format!("unsupported browser: {}", profile.browser),
+      ));
+    }
+
+    // A profile that has never launched has no Cookies file yet.
+    let db_path =
+      Self::ensure_cookie_db_path(profile, &ProfileManager::instance().get_profiles_dir())
+        .map_err(|e| crate::backend_error_with_detail("COOKIE_DB_UNAVAILABLE", e))?;
+    let owned: Vec<UnifiedCookie> = cookies.to_vec();
+
+    tokio::task::spawn_blocking(move || Self::write_chrome_cookies(&db_path, &owned, mode))
+      .await
+      .map_err(|e| crate::backend_error_with_detail("COOKIE_DB_UNAVAILABLE", e))?
+      .map_err(|e| crate::backend_error_with_detail("COOKIE_DB_UNAVAILABLE", e))
+  }
+
+  fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .map(|d| d.as_secs() as i64)
+      .unwrap_or(0)
+  }
+
+  /// Public API: Import cookies from a file's contents, with auto-detection.
+  ///
+  /// The paste parser backs this too, so a `cookies.txt` dragged into the
+  /// dialog and one pasted into the textarea are read by the same code.
   pub async fn import_cookies(
     app_handle: &AppHandle,
     profile_id: &str,
     content: &str,
   ) -> Result<CookieImportResult, String> {
-    let profile_manager = ProfileManager::instance();
-    let profiles_dir = profile_manager.get_profiles_dir();
-    let profiles = profile_manager
-      .list_profiles()
-      .map_err(|e| format!("Failed to list profiles: {e}"))?;
+    let result = Self::import_paste(
+      app_handle,
+      profile_id,
+      content,
+      None,
+      CookieWriteMode::Merge,
+      true,
+    )
+    .await?;
 
-    let profile = profiles
-      .iter()
-      .find(|p| p.id.to_string() == profile_id)
-      .ok_or_else(|| format!("Profile not found: {profile_id}"))?;
-
-    let is_running = profile_manager
-      .check_browser_status(app_handle.clone(), profile)
-      .await
-      .unwrap_or(false);
-
-    if is_running {
-      return Err(format!(
-        "Cannot import cookies while browser is running for profile: {}",
-        profile.name
-      ));
-    }
-
-    let (cookies, parse_errors) = Self::parse_cookies(content);
-
-    if cookies.is_empty() {
-      return Err("No valid cookies found in the file".to_string());
-    }
-
-    // Profile may have never been launched yet — create an empty DB on demand.
-    let db_path = Self::ensure_cookie_db_path(profile, &profiles_dir)?;
-
-    let write_result = match profile.browser.as_str() {
-      "wayfern" | crate::fingerprint_chromium::BROWSER_ID => {
-        Self::write_chrome_cookies(&db_path, &cookies)
-      }
-      _ => return Err(format!("Unsupported browser type: {}", profile.browser)),
-    };
-
-    match write_result {
-      Ok((imported, replaced)) => Ok(CookieImportResult {
-        cookies_imported: imported,
-        cookies_replaced: replaced,
-        errors: parse_errors,
-      }),
-      Err(e) => Err(format!("Failed to write cookies: {e}")),
-    }
+    Ok(CookieImportResult {
+      cookies_imported: result.added,
+      cookies_replaced: result.overwritten,
+      // The file dialog has no room for a per-line report, so it gets the codes
+      // of the things that went wrong and nothing else.
+      errors: result
+        .issues
+        .into_iter()
+        .filter(|i| !matches!(i.severity, crate::cookie_paste::IssueSeverity::Info))
+        .map(|i| match i.source {
+          Some(source) => format!("{source}: {}", i.code),
+          None => i.code,
+        })
+        .collect(),
+    })
   }
 
   /// Public API: Export cookies from a profile in the specified format
@@ -1061,125 +1233,83 @@ impl CookieManager {
 mod tests {
   use super::*;
 
-  #[cfg(target_os = "macos")]
-  const SYNTHETIC_COOKIE_HOST: &str = ".example.test";
-  #[cfg(target_os = "macos")]
-  const SYNTHETIC_COOKIE_VALUE: &str = "synthetic-cookie-value";
-  #[cfg(target_os = "macos")]
-  const SYNTHETIC_OS_CRYPT_PASSWORD: &[u8] = b"donut-synthetic-cookie-key";
-  #[cfg(target_os = "macos")]
-  const SYNTHETIC_ENCRYPTED_COOKIE_HEX: &str = "763130d83b9fd3e6d1b1c793769f55251f5e9d1193be72c0c08ea32e2cf068a85d9d0b97d8b2e6deca93a2b3c290e98e1a851f83d5566f9aa9314befe56dc6bdbd423d";
+  #[test]
+  #[serial_test::serial]
+  fn a_profile_that_never_ran_has_no_cookies_rather_than_an_error() {
+    let data = tempfile::TempDir::new().unwrap();
+    let _guard = crate::app_dirs::set_test_data_dir(data.path().to_path_buf());
+    let profile = BrowserProfile {
+      id: uuid::Uuid::new_v4(),
+      name: "never ran".to_string(),
+      browser: "wayfern".to_string(),
+      ..Default::default()
+    };
+    ProfileManager::instance().save_profile(&profile).unwrap();
 
-  #[cfg(target_os = "macos")]
-  fn synthetic_encrypted_cookie() -> Vec<u8> {
-    (0..SYNTHETIC_ENCRYPTED_COOKIE_HEX.len())
+    let stats = CookieManager::read_stats(&profile.id.to_string()).unwrap();
+    assert_eq!(stats.total_count, 0);
+    assert!(stats.domains.is_empty());
+
+    let sealed = BrowserProfile {
+      id: uuid::Uuid::new_v4(),
+      password_protected: true,
+      ..profile
+    };
+    ProfileManager::instance().save_profile(&sealed).unwrap();
+    assert!(CookieManager::read_stats(&sealed.id.to_string()).is_err());
+  }
+
+  // Known-answer vectors, sealed outside this code base from the plaintext
+  // SHA-256(SYNTHETIC_COOKIE_HOST) || SYNTHETIC_COOKIE_VALUE. They hold for
+  // every host: the key file's format and the record's tag choose the cipher.
+  const SYNTHETIC_COOKIE_HOST: &str = ".example.test";
+  const SYNTHETIC_COOKIE_VALUE: &str = "synthetic-cookie-value";
+  /// A password key file, the format Chromium uses on macOS and Linux.
+  const SYNTHETIC_OS_CRYPT_PASSWORD: &[u8] = b"donut-synthetic-cookie-key";
+  /// A raw 32-byte key file (0x40..0x5f), the format Chromium uses on Windows.
+  const SYNTHETIC_OS_CRYPT_RAW_KEY_HEX: &str =
+    "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f";
+  /// `v10`, password file: AES-128-CBC, PBKDF2(password, "saltysalt", 1003).
+  const SYNTHETIC_ENCRYPTED_COOKIE_HEX: &str = "763130d83b9fd3e6d1b1c793769f55251f5e9d1193be72c0c08ea32e2cf068a85d9d0b97d8b2e6deca93a2b3c290e98e1a851f83d5566f9aa9314befe56dc6bdbd423d";
+  /// `v10`, raw key file: AES-256-GCM, nonce 0xa0..0xab, then ciphertext and tag.
+  const V10_RAW_KEY_GCM_HEX: &str = "763130a0a1a2a3a4a5a6a7a8a9aaab80ca93cabb34c5dd58110a3d46900c1fa9ecd0d2de71d7b20447d42094e312b029ee1c37a83550c88b77cbf131874eaccf3a660a9e9c574aba285fd5136dc8dfcc4f4cf4f000";
+  /// `v10`, raw key file: AES-128-CBC, PBKDF2(the 32 bytes, "saltysalt", 1003).
+  const V10_RAW_KEY_CBC_HEX: &str = "7631301293fcc3514b2f9f809661394660f53164bc85085480268bb96eeff8ec82f45cbf38e0cc19bc44626a36381cd719fc7714a818351bfe922cd2283c9cb5e6a267";
+  /// `v11`, password file: AES-128-CBC, PBKDF2(password, "saltysalt", 1).
+  const V11_PASSWORD_HEX: &str = "76313134ac798d9e3721442b1ff0eeaf137cbaa12cbf87938b967e5f63791f03bd1928007773702a89a8f4a53145d1ea1814815f2ab922cd4e1dbe341cd327af6cd02f";
+  /// `v11`, raw key file: AES-128-CBC, PBKDF2(the 32 bytes, "saltysalt", 1).
+  const V11_RAW_KEY_HEX: &str = "763131d909f5941863272d931e7186ee58d7f87864945cf01dbb4f55b379e6c0fb56e0033d63bbf2bb96bf36168e8a1b7211c6916b205b5b0974d02e93e92444fc9ab7";
+  /// `v10` sealed with PBKDF2("", "saltysalt", 1).
+  const V10_EMPTY_FALLBACK_HEX: &str = "763130e8da432f0721b44064bf87de3cb1eba14d33853aeb85ca13e60bbe64565cc4c776b3bf2bea6268b199fd7038864f0e156a09f00ebb80bb68ed0db71d217ceac3";
+  /// `v10` sealed with PBKDF2("peanuts", "saltysalt", 1).
+  const V10_PEANUTS_FALLBACK_HEX: &str = "76313059f2bdd15dd07447497282fada0e1febf791a1cfea589774156a60a2dc399ec0171af1de360e7f35019c4e9ac34477b265d5eb9758a95daca408325f9e80e2d0";
+  /// `v11` sealed with PBKDF2("peanuts", "saltysalt", 1).
+  const V11_PEANUTS_FALLBACK_HEX: &str = "76313159f2bdd15dd07447497282fada0e1febf791a1cfea589774156a60a2dc399ec0171af1de360e7f35019c4e9ac34477b265d5eb9758a95daca408325f9e80e2d0";
+  /// `v10`, password file, a pre-M100 record without the host hash.
+  const V10_PASSWORD_NO_HOST_HASH_HEX: &str =
+    "763130a90053a1148568ad32692552b4016aeca1e381f70defa7f8ca833dcb9d29ed5b";
+
+  fn unhex(hex: &str) -> Vec<u8> {
+    (0..hex.len())
       .step_by(2)
-      .map(|i| u8::from_str_radix(&SYNTHETIC_ENCRYPTED_COOKIE_HEX[i..i + 2], 16).unwrap())
+      .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
       .collect()
   }
 
-  #[test]
-  fn test_parse_netscape_cookies_valid() {
-    let content = "# Netscape HTTP Cookie File\n\
-      .example.com\tTRUE\t/\tTRUE\t1700000000\tsession_id\tabc123\n\
-      example.com\tFALSE\t/path\tFALSE\t0\ttoken\txyz";
-    let (cookies, errors) = CookieManager::parse_netscape_cookies(content);
-    assert_eq!(cookies.len(), 2);
-    assert!(errors.is_empty());
-
-    assert_eq!(cookies[0].domain, ".example.com");
-    assert_eq!(cookies[0].name, "session_id");
-    assert_eq!(cookies[0].value, "abc123");
-    assert_eq!(cookies[0].path, "/");
-    assert!(cookies[0].is_secure);
-    assert_eq!(cookies[0].expires, 1700000000);
-
-    assert_eq!(cookies[1].domain, "example.com");
-    assert!(!cookies[1].is_secure);
-    assert_eq!(cookies[1].expires, 0);
+  fn synthetic_encrypted_cookie() -> Vec<u8> {
+    unhex(SYNTHETIC_ENCRYPTED_COOKIE_HEX)
   }
 
-  #[test]
-  fn test_parse_netscape_cookies_skips_comments_and_blanks() {
-    let content = "# Comment line\n\n  \n# Another comment\n\
-      .test.com\tTRUE\t/\tFALSE\t0\tname\tvalue\n";
-    let (cookies, errors) = CookieManager::parse_netscape_cookies(content);
-    assert_eq!(cookies.len(), 1);
-    assert!(errors.is_empty());
+  fn password_key() -> chrome_decrypt::EncryptionKey {
+    chrome_decrypt::EncryptionKey::from_contents(SYNTHETIC_OS_CRYPT_PASSWORD.to_vec()).unwrap()
   }
 
-  #[test]
-  fn test_parse_netscape_cookies_malformed_lines() {
-    let content = "not\tenough\tfields\n\
-      .ok.com\tTRUE\t/\tFALSE\t0\tname\tvalue\n";
-    let (cookies, errors) = CookieManager::parse_netscape_cookies(content);
-    assert_eq!(cookies.len(), 1);
-    assert_eq!(errors.len(), 1);
-    assert!(errors[0].contains("expected 7 tab-separated fields"));
+  fn raw_key() -> chrome_decrypt::EncryptionKey {
+    chrome_decrypt::EncryptionKey::from_contents(unhex(SYNTHETIC_OS_CRYPT_RAW_KEY_HEX)).unwrap()
   }
 
-  #[test]
-  fn test_parse_json_cookies_valid() {
-    let content = r#"[
-      {
-        "name": "sid",
-        "value": "abc",
-        "domain": ".example.com",
-        "path": "/",
-        "secure": true,
-        "httpOnly": true,
-        "sameSite": "lax",
-        "expirationDate": 1700000000,
-        "session": false
-      }
-    ]"#;
-    let (cookies, errors) = CookieManager::parse_json_cookies(content);
-    assert_eq!(cookies.len(), 1);
-    assert!(errors.is_empty());
-    assert_eq!(cookies[0].name, "sid");
-    assert_eq!(cookies[0].domain, ".example.com");
-    assert!(cookies[0].is_secure);
-    assert!(cookies[0].is_http_only);
-    assert_eq!(cookies[0].same_site, 1);
-    assert_eq!(cookies[0].expires, 1700000000);
-  }
-
-  #[test]
-  fn test_parse_json_cookies_session() {
-    let content = r#"[{"name": "s", "value": "v", "domain": ".d.com", "session": true, "expirationDate": 9999}]"#;
-    let (cookies, errors) = CookieManager::parse_json_cookies(content);
-    assert_eq!(cookies.len(), 1);
-    assert!(errors.is_empty());
-    assert_eq!(cookies[0].expires, 0);
-  }
-
-  #[test]
-  fn test_parse_json_cookies_same_site_mapping() {
-    let content = r#"[
-      {"name": "a", "value": "", "domain": ".d.com", "sameSite": "no_restriction"},
-      {"name": "b", "value": "", "domain": ".d.com", "sameSite": "lax"},
-      {"name": "c", "value": "", "domain": ".d.com", "sameSite": "strict"}
-    ]"#;
-    let (cookies, _) = CookieManager::parse_json_cookies(content);
-    assert_eq!(cookies[0].same_site, 0);
-    assert_eq!(cookies[1].same_site, 1);
-    assert_eq!(cookies[2].same_site, 2);
-  }
-
-  #[test]
-  fn test_parse_cookies_auto_detect_json() {
-    let content = r#"[{"name": "x", "value": "y", "domain": ".test.com"}]"#;
-    let (cookies, _) = CookieManager::parse_cookies(content);
-    assert_eq!(cookies.len(), 1);
-    assert_eq!(cookies[0].name, "x");
-  }
-
-  #[test]
-  fn test_parse_cookies_auto_detect_netscape() {
-    let content = ".test.com\tTRUE\t/\tFALSE\t0\tname\tvalue";
-    let (cookies, _) = CookieManager::parse_cookies(content);
-    assert_eq!(cookies.len(), 1);
-    assert_eq!(cookies[0].name, "name");
+  fn open(hex: &str, key: &chrome_decrypt::EncryptionKey) -> Option<String> {
+    chrome_decrypt::decrypt(&unhex(hex), SYNTHETIC_COOKIE_HOST, key)
   }
 
   #[test]
@@ -1199,6 +1329,29 @@ mod tests {
     let output = CookieManager::format_netscape_cookies(&cookies);
     assert!(output.contains("# Netscape HTTP Cookie File"));
     assert!(output.contains(".example.com\tTRUE\t/\tTRUE\t1700000000\tsid\tabc"));
+  }
+
+  #[test]
+  fn test_format_netscape_cookies_marks_http_only() {
+    let cookies = vec![UnifiedCookie {
+      name: "sid".to_string(),
+      value: "abc".to_string(),
+      domain: ".example.com".to_string(),
+      path: "/".to_string(),
+      expires: 1700000000,
+      is_secure: true,
+      is_http_only: true,
+      same_site: -1,
+      creation_time: 0,
+      last_accessed: 0,
+    }];
+    let output = CookieManager::format_netscape_cookies(&cookies);
+    assert!(output.contains("#HttpOnly_.example.com\tTRUE\t/\tTRUE\t1700000000\tsid\tabc"));
+
+    let parsed = crate::cookie_paste::parse_paste(&output, None);
+    assert_eq!(parsed.cookies.len(), 1);
+    assert_eq!(parsed.cookies[0].domain, ".example.com");
+    assert!(parsed.cookies[0].is_http_only);
   }
 
   #[test]
@@ -1253,8 +1406,7 @@ mod tests {
       },
     ];
     let formatted = CookieManager::format_netscape_cookies(&cookies);
-    let (parsed, errors) = CookieManager::parse_netscape_cookies(&formatted);
-    assert!(errors.is_empty());
+    let parsed = crate::cookie_paste::parse_paste(&formatted, None).cookies;
     assert_eq!(parsed.len(), 2);
     assert_eq!(parsed[0].name, "a");
     assert_eq!(parsed[0].domain, ".d.com");
@@ -1278,8 +1430,7 @@ mod tests {
       last_accessed: 0,
     }];
     let formatted = CookieManager::format_json_cookies(&cookies);
-    let (parsed, errors) = CookieManager::parse_json_cookies(&formatted);
-    assert!(errors.is_empty());
+    let parsed = crate::cookie_paste::parse_paste(&formatted, None).cookies;
     assert_eq!(parsed.len(), 1);
     assert_eq!(parsed[0].name, "tok");
     assert_eq!(parsed[0].domain, ".site.org");
@@ -1288,6 +1439,34 @@ mod tests {
     assert!(parsed[0].is_http_only);
     assert_eq!(parsed[0].same_site, 2);
     assert_eq!(parsed[0].expires, 1700000000);
+  }
+
+  /// Every Netscape import now lands as -1 (unspecified), which used to export
+  /// as "no_restriction" and come back as an explicit SameSite=None — a cookie
+  /// Chromium then refuses to send unless it is also Secure.
+  #[test]
+  fn test_json_roundtrip_preserves_unspecified_same_site() {
+    let cookies = vec![UnifiedCookie {
+      name: "sid".to_string(),
+      value: "v".to_string(),
+      domain: ".site.org".to_string(),
+      path: "/".to_string(),
+      expires: 1900000000,
+      is_secure: false,
+      is_http_only: false,
+      same_site: -1,
+      creation_time: 0,
+      last_accessed: 0,
+    }];
+    let formatted = CookieManager::format_json_cookies(&cookies);
+    assert_eq!(
+      serde_json::from_str::<Vec<Value>>(&formatted).unwrap()[0]["sameSite"],
+      "unspecified"
+    );
+
+    let parsed = crate::cookie_paste::parse_paste(&formatted, None).cookies;
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].same_site, -1);
   }
 
   #[test]
@@ -1360,9 +1539,10 @@ mod tests {
       last_accessed: 1700000000,
     }];
 
-    let (inserted, replaced) = CookieManager::write_chrome_cookies(&tmp, &cookies).unwrap();
-    assert_eq!(inserted, 1);
-    assert_eq!(replaced, 0);
+    let counts =
+      CookieManager::write_chrome_cookies(&tmp, &cookies, CookieWriteMode::Merge).unwrap();
+    assert_eq!(counts.added, 1);
+    assert_eq!(counts.overwritten, 0);
 
     let conn = Connection::open(&tmp).unwrap();
     let (value, encrypted, has_expires, is_persistent, source_scheme, source_port): (
@@ -1421,7 +1601,7 @@ mod tests {
       last_accessed: 1700000000,
     }];
 
-    CookieManager::write_chrome_cookies(&tmp, &cookies).unwrap();
+    CookieManager::write_chrome_cookies(&tmp, &cookies, CookieWriteMode::Merge).unwrap();
 
     let conn = Connection::open(&tmp).unwrap();
     let (has_expires, is_persistent, expires_utc, source_scheme, source_port): (
@@ -1478,16 +1658,24 @@ mod tests {
       last_accessed: 1700000000,
     };
 
-    let (inserted, _) =
-      CookieManager::write_chrome_cookies(&tmp, std::slice::from_ref(&cookie)).unwrap();
-    assert_eq!(inserted, 1);
+    let counts = CookieManager::write_chrome_cookies(
+      &tmp,
+      std::slice::from_ref(&cookie),
+      CookieWriteMode::Merge,
+    )
+    .unwrap();
+    assert_eq!(counts.added, 1);
 
     let mut updated = cookie.clone();
     updated.value = "v2".to_string();
-    let (inserted, replaced) =
-      CookieManager::write_chrome_cookies(&tmp, std::slice::from_ref(&updated)).unwrap();
-    assert_eq!(inserted, 0);
-    assert_eq!(replaced, 1);
+    let counts = CookieManager::write_chrome_cookies(
+      &tmp,
+      std::slice::from_ref(&updated),
+      CookieWriteMode::Merge,
+    )
+    .unwrap();
+    assert_eq!(counts.added, 0);
+    assert_eq!(counts.overwritten, 1);
 
     let conn = Connection::open(&tmp).unwrap();
     let (value, encrypted): (String, Vec<u8>) = conn
@@ -1503,50 +1691,382 @@ mod tests {
     let _ = std::fs::remove_file(&tmp);
   }
 
+  fn cookie(domain: &str, name: &str, value: &str) -> UnifiedCookie {
+    UnifiedCookie {
+      name: name.to_string(),
+      value: value.to_string(),
+      domain: domain.to_string(),
+      path: "/".to_string(),
+      expires: 1900000000,
+      is_secure: true,
+      is_http_only: false,
+      same_site: -1,
+      creation_time: 1700000000,
+      last_accessed: 1700000000,
+    }
+  }
+
+  fn host_keys(db_path: &Path) -> Vec<String> {
+    let conn = Connection::open(db_path).unwrap();
+    let mut stmt = conn
+      .prepare("SELECT host_key || '|' || name FROM cookies ORDER BY host_key, name")
+      .unwrap();
+    let rows: Vec<String> = stmt
+      .query_map([], |row| row.get(0))
+      .unwrap()
+      .collect::<Result<_, _>>()
+      .unwrap();
+    rows
+  }
+
+  /// Replace mode clears both spellings of the pasted site and nothing else:
+  /// not a subdomain, not another site.
   #[test]
-  #[cfg(target_os = "macos")]
+  fn test_write_chrome_cookies_replace_matching_sites_scope() {
+    let tmp = std::env::temp_dir().join(format!("donut_cookie_test_{}.db", uuid::Uuid::new_v4()));
+    create_chrome_cookies_db(&tmp);
+
+    let seeded = vec![
+      cookie(".example.com", "dotted", "old"),
+      cookie("example.com", "undotted", "old"),
+      cookie("app.example.com", "subdomain", "keep"),
+      cookie(".other.com", "elsewhere", "keep"),
+    ];
+    CookieManager::write_chrome_cookies(&tmp, &seeded, CookieWriteMode::Merge).unwrap();
+
+    // A paste that names only the undotted form must still clear the dotted one.
+    let counts = CookieManager::write_chrome_cookies(
+      &tmp,
+      &[cookie("example.com", "fresh", "new")],
+      CookieWriteMode::ReplaceMatchingSites,
+    )
+    .unwrap();
+    assert_eq!(counts.deleted, 2);
+    assert_eq!(counts.added, 1);
+    assert_eq!(counts.overwritten, 0);
+
+    assert_eq!(
+      host_keys(&tmp),
+      vec![
+        ".other.com|elsewhere".to_string(),
+        "app.example.com|subdomain".to_string(),
+        "example.com|fresh".to_string(),
+      ]
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+  }
+
+  #[test]
+  fn test_write_chrome_cookies_merge_deletes_nothing() {
+    let tmp = std::env::temp_dir().join(format!("donut_cookie_test_{}.db", uuid::Uuid::new_v4()));
+    create_chrome_cookies_db(&tmp);
+
+    CookieManager::write_chrome_cookies(
+      &tmp,
+      &[cookie(".example.com", "existing", "old")],
+      CookieWriteMode::Merge,
+    )
+    .unwrap();
+    let counts = CookieManager::write_chrome_cookies(
+      &tmp,
+      &[cookie("example.com", "fresh", "new")],
+      CookieWriteMode::Merge,
+    )
+    .unwrap();
+
+    assert_eq!(counts.deleted, 0);
+    assert_eq!(counts.added, 1);
+    assert_eq!(host_keys(&tmp).len(), 2);
+
+    let _ = std::fs::remove_file(&tmp);
+  }
+
+  /// The store's unique index is four columns wide. A three-column probe made
+  /// one partitioned cookie stand in for all of them, so the others silently
+  /// kept their stale values.
+  #[test]
+  fn test_write_chrome_cookies_probe_is_partition_aware() {
+    let tmp = std::env::temp_dir().join(format!("donut_cookie_test_{}.db", uuid::Uuid::new_v4()));
+    create_chrome_cookies_db(&tmp);
+
+    let conn = Connection::open(&tmp).unwrap();
+    conn
+      .execute(
+        "INSERT INTO cookies
+           (creation_utc, host_key, top_frame_site_key, name, value, encrypted_value, path,
+            expires_utc, is_secure, is_httponly, last_access_utc)
+         VALUES (1, '.example.com', 'https://partner.example', 'sid', 'partitioned', x'', '/',
+                 0, 1, 0, 0)",
+        [],
+      )
+      .unwrap();
+    drop(conn);
+
+    let counts = CookieManager::write_chrome_cookies(
+      &tmp,
+      &[cookie(".example.com", "sid", "unpartitioned")],
+      CookieWriteMode::Merge,
+    )
+    .unwrap();
+    assert_eq!(counts.added, 1, "the partitioned row is a different cookie");
+    assert_eq!(counts.overwritten, 0);
+
+    let conn = Connection::open(&tmp).unwrap();
+    let partitioned: String = conn
+      .query_row(
+        "SELECT value FROM cookies WHERE top_frame_site_key = 'https://partner.example'",
+        [],
+        |row| row.get(0),
+      )
+      .unwrap();
+    assert_eq!(partitioned, "partitioned");
+
+    let _ = std::fs::remove_file(&tmp);
+  }
+
+  /// Chromium evicts by creation_utc, so refreshing a cookie must not reset it.
+  #[test]
+  fn test_write_chrome_cookies_preserves_creation_time() {
+    let tmp = std::env::temp_dir().join(format!("donut_cookie_test_{}.db", uuid::Uuid::new_v4()));
+    create_chrome_cookies_db(&tmp);
+
+    CookieManager::write_chrome_cookies(
+      &tmp,
+      &[cookie(".example.com", "sid", "v1")],
+      CookieWriteMode::Merge,
+    )
+    .unwrap();
+    let original = CookieManager::unix_to_chrome_time(1700000000);
+
+    let mut refreshed = cookie(".example.com", "sid", "v2");
+    refreshed.creation_time = 1800000000;
+    CookieManager::write_chrome_cookies(&tmp, &[refreshed], CookieWriteMode::Merge).unwrap();
+
+    let conn = Connection::open(&tmp).unwrap();
+    let (creation, value): (i64, String) = conn
+      .query_row(
+        "SELECT creation_utc, value FROM cookies WHERE name = 'sid'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+      )
+      .unwrap();
+    assert_eq!(creation, original);
+    assert_eq!(value, "v2");
+
+    let _ = std::fs::remove_file(&tmp);
+  }
+
+  /// A write that fails partway must leave the store exactly as it was, and in
+  /// replace mode that includes the deletes it had already issued.
+  #[test]
+  fn test_write_chrome_cookies_rolls_back_on_failure() {
+    let tmp = std::env::temp_dir().join(format!("donut_cookie_test_{}.db", uuid::Uuid::new_v4()));
+    create_chrome_cookies_db(&tmp);
+    CookieManager::write_chrome_cookies(
+      &tmp,
+      &[cookie(".example.com", "existing", "keep")],
+      CookieWriteMode::Merge,
+    )
+    .unwrap();
+
+    // NOT NULL on `path` is what makes the second insert fail; the first one
+    // and the replace-mode deletes have to unwind with it.
+    let mut broken = cookie(".example.com", "second", "v");
+    broken.path = String::new();
+    let conn = Connection::open(&tmp).unwrap();
+    conn
+      .execute(
+        "CREATE UNIQUE INDEX no_empty_path ON cookies(path) WHERE path = ''",
+        [],
+      )
+      .unwrap();
+    conn
+      .execute(
+        "INSERT INTO cookies
+           (creation_utc, host_key, top_frame_site_key, name, value, encrypted_value, path,
+            expires_utc, is_secure, is_httponly, last_access_utc)
+         VALUES (1, '.blocker.com', '', 'blocker', 'v', x'', '', 0, 0, 0, 0)",
+        [],
+      )
+      .unwrap();
+    drop(conn);
+
+    let result = CookieManager::write_chrome_cookies(
+      &tmp,
+      &[cookie(".example.com", "first", "v"), broken],
+      CookieWriteMode::ReplaceMatchingSites,
+    );
+    assert!(result.is_err());
+
+    assert_eq!(
+      host_keys(&tmp),
+      vec![
+        ".blocker.com|blocker".to_string(),
+        ".example.com|existing".to_string(),
+      ],
+      "neither the delete nor the first insert may survive a failed write"
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+  }
+
+  #[test]
   fn test_decrypt_v10_cookie_with_synthetic_vector() {
-    let profile_dir =
-      std::env::temp_dir().join(format!("donut_decrypt_vector_{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&profile_dir).unwrap();
+    let profile_dir = tempfile::TempDir::new().unwrap();
     std::fs::write(
-      profile_dir.join("os_crypt_key"),
+      profile_dir.path().join("os_crypt_key"),
       SYNTHETIC_OS_CRYPT_PASSWORD,
     )
     .unwrap();
 
-    let key = chrome_decrypt::get_encryption_key(&profile_dir)
-      .expect("should derive key from os_crypt_key file");
+    let key = chrome_decrypt::get_encryption_key(profile_dir.path())
+      .expect("should read the os_crypt_key file");
 
     let decrypted =
       chrome_decrypt::decrypt(&synthetic_encrypted_cookie(), SYNTHETIC_COOKIE_HOST, &key)
         .expect("decryption must succeed with correct key and host");
     assert_eq!(decrypted, SYNTHETIC_COOKIE_VALUE);
-
-    let _ = std::fs::remove_dir_all(&profile_dir);
   }
 
   #[test]
-  #[cfg(target_os = "macos")]
   fn test_decrypt_with_wrong_host_returns_none_or_raw() {
-    let profile_dir =
-      std::env::temp_dir().join(format!("donut_decrypt_wrong_host_{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&profile_dir).unwrap();
-    std::fs::write(
-      profile_dir.join("os_crypt_key"),
-      SYNTHETIC_OS_CRYPT_PASSWORD,
-    )
-    .unwrap();
-
-    let key = chrome_decrypt::get_encryption_key(&profile_dir).unwrap();
-    let result =
-      chrome_decrypt::decrypt(&synthetic_encrypted_cookie(), ".wrong.example.test", &key);
+    let result = chrome_decrypt::decrypt(
+      &synthetic_encrypted_cookie(),
+      ".wrong.example.test",
+      &password_key(),
+    );
     assert!(
       result.as_deref() != Some(SYNTHETIC_COOKIE_VALUE),
       "decrypt must not return the cookie value when host_key is wrong"
     );
+  }
 
-    let _ = std::fs::remove_dir_all(&profile_dir);
+  #[test]
+  fn a_raw_key_file_opens_v10_as_aes_256_gcm() {
+    let profile_dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+      profile_dir.path().join("os_crypt_key"),
+      unhex(SYNTHETIC_OS_CRYPT_RAW_KEY_HEX),
+    )
+    .unwrap();
+    let key = chrome_decrypt::get_encryption_key(profile_dir.path()).unwrap();
+    assert_eq!(
+      open(V10_RAW_KEY_GCM_HEX, &key).as_deref(),
+      Some(SYNTHETIC_COOKIE_VALUE)
+    );
+    // The same record under a password file is not GCM, so it does not open.
+    assert_eq!(open(V10_RAW_KEY_GCM_HEX, &password_key()), None);
+  }
+
+  #[test]
+  fn a_raw_key_file_opens_a_cbc_v10_record_with_1003_iterations() {
+    assert_eq!(
+      open(V10_RAW_KEY_CBC_HEX, &raw_key()).as_deref(),
+      Some(SYNTHETIC_COOKIE_VALUE)
+    );
+    assert_eq!(
+      open(V10_PEANUTS_FALLBACK_HEX, &raw_key()).as_deref(),
+      Some(SYNTHETIC_COOKIE_VALUE)
+    );
+  }
+
+  #[test]
+  fn a_password_key_file_opens_v10_with_1003_iterations() {
+    assert_eq!(
+      open(SYNTHETIC_ENCRYPTED_COOKIE_HEX, &password_key()).as_deref(),
+      Some(SYNTHETIC_COOKIE_VALUE)
+    );
+    // A record keyed by another file's password does not open under a raw key.
+    assert_eq!(open(SYNTHETIC_ENCRYPTED_COOKIE_HEX, &raw_key()), None);
+  }
+
+  #[test]
+  fn every_key_file_opens_v11_with_one_iteration() {
+    assert_eq!(
+      open(V11_PASSWORD_HEX, &password_key()).as_deref(),
+      Some(SYNTHETIC_COOKIE_VALUE)
+    );
+    assert_eq!(
+      open(V11_RAW_KEY_HEX, &raw_key()).as_deref(),
+      Some(SYNTHETIC_COOKIE_VALUE)
+    );
+  }
+
+  #[test]
+  fn cbc_records_fall_back_to_chromiums_fixed_keys() {
+    for key in [password_key(), raw_key()] {
+      assert_eq!(
+        open(V11_PEANUTS_FALLBACK_HEX, &key).as_deref(),
+        Some(SYNTHETIC_COOKIE_VALUE),
+        "a v11 record sealed with the peanuts key must open"
+      );
+    }
+    let key = password_key();
+    assert_eq!(
+      open(V10_EMPTY_FALLBACK_HEX, &key).as_deref(),
+      Some(SYNTHETIC_COOKIE_VALUE),
+      "a v10 record sealed with the empty password must open"
+    );
+    assert_eq!(
+      open(V10_PEANUTS_FALLBACK_HEX, &key).as_deref(),
+      Some(SYNTHETIC_COOKIE_VALUE),
+      "a v10 record sealed with the peanuts key must open"
+    );
+  }
+
+  #[test]
+  fn a_record_without_the_host_hash_reads_as_is() {
+    assert_eq!(
+      open(V10_PASSWORD_NO_HOST_HASH_HEX, &password_key()).as_deref(),
+      Some(SYNTHETIC_COOKIE_VALUE)
+    );
+  }
+
+  #[test]
+  fn unknown_tags_and_empty_key_files_decrypt_nothing() {
+    let mut v20 = unhex(V10_RAW_KEY_GCM_HEX);
+    v20[..3].copy_from_slice(b"v20");
+    assert_eq!(
+      chrome_decrypt::decrypt(&v20, SYNTHETIC_COOKIE_HOST, &raw_key()),
+      None
+    );
+    assert!(chrome_decrypt::EncryptionKey::from_contents(Vec::new()).is_none());
+    let empty_dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(empty_dir.path().join("os_crypt_key"), b"").unwrap();
+    assert!(chrome_decrypt::get_encryption_key(empty_dir.path()).is_none());
+  }
+
+  #[test]
+  fn the_cookie_database_follows_chromiums_network_checkpoint() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let default_dir = dir.path().join("Default");
+    let network_dir = default_dir.join("Network");
+
+    // Nothing on disk: the host's own location.
+    let fresh = CookieManager::wayfern_cookie_path(dir.path());
+    if cfg!(target_os = "windows") {
+      assert_eq!(fresh, network_dir.join("Cookies"));
+    } else {
+      assert_eq!(fresh, default_dir.join("Cookies"));
+    }
+
+    // A profile Chromium has not migrated keeps its database in Default/.
+    std::fs::create_dir_all(&default_dir).unwrap();
+    std::fs::write(default_dir.join("Cookies"), b"db").unwrap();
+    assert_eq!(
+      CookieManager::wayfern_cookie_path(dir.path()),
+      default_dir.join("Cookies")
+    );
+
+    // Once migrated, every OS reads Network/, whatever Default/ still holds.
+    std::fs::create_dir_all(&network_dir).unwrap();
+    std::fs::write(network_dir.join("Cookies"), b"db").unwrap();
+    std::fs::write(network_dir.join("NetworkDataMigrated"), b"").unwrap();
+    assert_eq!(
+      CookieManager::wayfern_cookie_path(dir.path()),
+      network_dir.join("Cookies")
+    );
   }
 
   /// Regression: a brand-new Wayfern profile has no `Default/Cookies` file
@@ -1574,9 +2094,10 @@ mod tests {
       creation_time: 1700000000,
       last_accessed: 1700000000,
     }];
-    let (inserted, replaced) = CookieManager::write_chrome_cookies(&db_path, &cookies).unwrap();
-    assert_eq!(inserted, 1);
-    assert_eq!(replaced, 0);
+    let counts =
+      CookieManager::write_chrome_cookies(&db_path, &cookies, CookieWriteMode::Merge).unwrap();
+    assert_eq!(counts.added, 1);
+    assert_eq!(counts.overwritten, 0);
 
     let read = CookieManager::read_chrome_cookies(&db_path, None).unwrap();
     assert_eq!(read.len(), 1);

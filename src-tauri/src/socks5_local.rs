@@ -19,8 +19,10 @@
 //! datagram via [`UdpRelayContext`]. Without that, QUIC and WebRTC would be an
 //! unfiltered, unmetered side channel around the TCP filter.
 
+use crate::profile_dns::ProfileResolver;
 use crate::proxy_server::{
-  connect_to_target_via_upstream, tunnel_streams, BlocklistMatcher, BypassMatcher,
+  connect_to_target_via_upstream, redacted_upstream, tunnel_streams, BlocklistMatcher,
+  BypassMatcher,
 };
 use crate::traffic_stats::{get_traffic_tracker, LiveTrafficTracker};
 use async_socks5::{AddrKind, Auth, SocksDatagram};
@@ -36,6 +38,7 @@ use url::Url;
 const REP_SUCCEEDED: u8 = 0x00;
 const REP_GENERAL_FAILURE: u8 = 0x01;
 const REP_NOT_ALLOWED: u8 = 0x02;
+const REP_HOST_UNREACHABLE: u8 = 0x04;
 const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 
 // SOCKS5 commands (RFC 1928 §4).
@@ -188,7 +191,8 @@ fn udp_mode(upstream_url: Option<&str>) -> UdpMode {
     Some("DIRECT") => UdpMode::Direct,
     Some(url) => match Url::parse(url).ok().map(|u| u.scheme().to_lowercase()) {
       Some(scheme) if scheme == "socks5" => UdpMode::Socks5Upstream,
-      // http / https / socks4 / ss / shadowsocks / anything else: TCP-only.
+      // http / https / httpstls / socks4 / ss / shadowsocks / anything else:
+      // TCP-only. An HTTP CONNECT upstream carries no UDP, TLS-wrapped or not.
       _ => UdpMode::Refuse,
     },
   }
@@ -207,18 +211,19 @@ pub async fn handle_socks5_connection(
   upstream_url: Option<String>,
   bypass_matcher: BypassMatcher,
   blocklist_matcher: BlocklistMatcher,
+  resolver: Option<ProfileResolver>,
 ) {
   let _ = stream.set_nodelay(true);
 
   if let Err(e) = negotiate_method(&mut stream).await {
-    log::debug!("SOCKS5 method negotiation failed: {e}");
+    log::debug!("SOCKS5 method negotiation failed err=\"{e}\"");
     return;
   }
 
   let request = match read_request(&mut stream).await {
     Ok(r) => r,
     Err(e) => {
-      log::debug!("SOCKS5 request parse failed: {e}");
+      log::debug!("SOCKS5 request parse failed err=\"{e}\"");
       let _ = send_reply(&mut stream, REP_GENERAL_FAILURE, unspecified()).await;
       return;
     }
@@ -233,14 +238,15 @@ pub async fn handle_socks5_connection(
         upstream_url,
         bypass_matcher,
         blocklist_matcher,
+        resolver,
       )
       .await;
     }
     CMD_UDP_ASSOCIATE => {
-      handle_udp_associate(stream, upstream_url, blocklist_matcher).await;
+      handle_udp_associate(stream, upstream_url, blocklist_matcher, resolver).await;
     }
     other => {
-      log::debug!("SOCKS5 unsupported command {other:#04x}");
+      log::debug!("SOCKS5 unsupported command cmd={other:#04x}");
       let _ = send_reply(&mut stream, REP_COMMAND_NOT_SUPPORTED, unspecified()).await;
     }
   }
@@ -302,6 +308,27 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<Socks5Request> 
   })
 }
 
+static UDP_REFUSED_LOGGED: std::sync::atomic::AtomicBool =
+  std::sync::atomic::AtomicBool::new(false);
+static UDP_UPSTREAM_REFUSED_LOGGED: std::sync::atomic::AtomicBool =
+  std::sync::atomic::AtomicBool::new(false);
+
+/// Info the first time per worker, debug after: the browser asks again for
+/// every new UDP flow, and the answer does not change.
+fn first_time(flag: &std::sync::atomic::AtomicBool) -> log::Level {
+  if flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    log::Level::Debug
+  } else {
+    log::Level::Info
+  }
+}
+
+/// The upstream as a log line may show it: the URL carries the proxy's
+/// username and password, and the worker log is a plain file in the temp dir.
+fn upstream_label(upstream_url: Option<&str>) -> String {
+  upstream_url.map_or_else(|| "DIRECT".to_string(), redacted_upstream)
+}
+
 /// Read a SOCKS5 address of the given type into a host string (an IP literal or
 /// a domain name; `connect_to_target_via_upstream` handles both).
 async fn read_addr(stream: &mut TcpStream, atyp: u8) -> std::io::Result<String> {
@@ -361,9 +388,10 @@ async fn handle_connect(
   upstream_url: Option<String>,
   bypass_matcher: BypassMatcher,
   blocklist_matcher: BlocklistMatcher,
+  resolver: Option<ProfileResolver>,
 ) {
   if blocklist_matcher.is_blocked(&host) {
-    log::debug!("[blocklist] Blocked SOCKS5 CONNECT to {host}");
+    log::debug!("Blocklist blocked SOCKS5 CONNECT host={host}");
     let _ = send_reply(&mut stream, REP_NOT_ALLOWED, unspecified()).await;
     return;
   }
@@ -376,7 +404,7 @@ async fn handle_connect(
     "SOCKS5 CONNECT {}:{} (upstream={})",
     host,
     port,
-    upstream_url.as_deref().unwrap_or("DIRECT")
+    upstream_label(upstream_url.as_deref())
   );
 
   // Resolve to the target stream, logging and dropping the (non-Send) dial
@@ -386,28 +414,31 @@ async fn handle_connect(
     port,
     upstream_url.as_deref(),
     &bypass_matcher,
+    resolver.as_ref(),
   )
   .await
   {
-    Ok(t) => Some(t),
+    Ok(t) => Ok(t),
+    Err(e) if crate::profile_dns::is_missing_name(e.as_ref()) => {
+      log::debug!("SOCKS5 CONNECT to a name the profile DNS server does not know host={host}");
+      Err(REP_HOST_UNREACHABLE)
+    }
     Err(e) => {
-      let key = format!("socks5-connect:{host}:{port}");
-      if let Some(suppressed) = crate::proxy_server::log_throttle(&key) {
-        if suppressed > 0 {
-          log::warn!(
-              "SOCKS5 CONNECT to {host}:{port} failed: {e} ({suppressed} more suppressed in last 30s)"
-            );
-        } else {
-          log::warn!("SOCKS5 CONNECT to {host}:{port} failed: {e}");
-        }
-      }
-      None
+      crate::proxy_server::warn_upstream_failure(
+        "SOCKS5 CONNECT failed",
+        &e.to_string(),
+        Some(&host),
+      );
+      Err(REP_GENERAL_FAILURE)
     }
   };
 
-  let Some(target) = target else {
-    let _ = send_reply(&mut stream, REP_GENERAL_FAILURE, unspecified()).await;
-    return;
+  let target = match target {
+    Ok(target) => target,
+    Err(reply) => {
+      let _ = send_reply(&mut stream, reply, unspecified()).await;
+      return;
+    }
   };
 
   if send_reply(&mut stream, REP_SUCCEEDED, unspecified())
@@ -429,13 +460,15 @@ async fn handle_udp_associate(
   mut control: TcpStream,
   upstream_url: Option<String>,
   blocklist_matcher: BlocklistMatcher,
+  resolver: Option<ProfileResolver>,
 ) {
   let mode = udp_mode(upstream_url.as_deref());
 
   if mode == UdpMode::Refuse {
-    log::info!(
-      "SOCKS5 UDP ASSOCIATE refused: upstream ({}) cannot carry UDP without leaking; Chromium will use proxied TCP",
-      upstream_url.as_deref().unwrap_or("DIRECT")
+    log::log!(
+      first_time(&UDP_REFUSED_LOGGED),
+      "SOCKS5 UDP ASSOCIATE refused: upstream cannot carry UDP without leaking; browser uses proxied TCP upstream={}",
+      upstream_label(upstream_url.as_deref())
     );
     let _ = send_reply(&mut control, REP_COMMAND_NOT_SUPPORTED, unspecified()).await;
     return;
@@ -445,7 +478,7 @@ async fn handle_udp_associate(
   let relay = match UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await {
     Ok(s) => s,
     Err(e) => {
-      log::warn!("Failed to bind UDP relay socket: {e}");
+      crate::proxy_server::warn_throttled(&format!("UDP relay socket bind failed err=\"{e}\""));
       let _ = send_reply(&mut control, REP_GENERAL_FAILURE, unspecified()).await;
       return;
     }
@@ -453,7 +486,7 @@ async fn handle_udp_associate(
   let relay_addr = match relay.local_addr() {
     Ok(a) => a,
     Err(e) => {
-      log::warn!("Failed to read UDP relay addr: {e}");
+      crate::proxy_server::warn_throttled(&format!("UDP relay address read failed err=\"{e}\""));
       let _ = send_reply(&mut control, REP_GENERAL_FAILURE, unspecified()).await;
       return;
     }
@@ -466,7 +499,9 @@ async fn handle_udp_associate(
       let out = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await {
         Ok(s) => s,
         Err(e) => {
-          log::warn!("Failed to bind UDP egress socket: {e}");
+          crate::proxy_server::warn_throttled(&format!(
+            "UDP egress socket bind failed err=\"{e}\""
+          ));
           let _ = send_reply(&mut control, REP_GENERAL_FAILURE, unspecified()).await;
           return;
         }
@@ -477,8 +512,15 @@ async fn handle_udp_associate(
       {
         return;
       }
-      log::info!("SOCKS5 UDP ASSOCIATE (direct) relaying on {relay_addr}");
-      run_udp_relay_direct(control, relay, out, UdpRelayContext::new(blocklist_matcher)).await;
+      log::debug!("SOCKS5 UDP ASSOCIATE relaying mode=direct relay={relay_addr}");
+      run_udp_relay_direct(
+        control,
+        relay,
+        out,
+        UdpRelayContext::new(blocklist_matcher),
+        resolver,
+      )
+      .await;
     }
     UdpMode::Socks5Upstream => {
       // Establish the upstream association FIRST; if the upstream refuses UDP,
@@ -487,8 +529,9 @@ async fn handle_udp_associate(
       let datagram = match associate_upstream(upstream).await {
         Ok(d) => d,
         Err(e) => {
-          log::info!(
-            "SOCKS5 upstream did not grant UDP ASSOCIATE ({e}); refusing so Chromium uses proxied TCP"
+          log::log!(
+            first_time(&UDP_UPSTREAM_REFUSED_LOGGED),
+            "SOCKS5 UDP ASSOCIATE refused: upstream did not grant UDP; browser uses proxied TCP err=\"{e}\""
           );
           let _ = send_reply(&mut control, REP_COMMAND_NOT_SUPPORTED, unspecified()).await;
           return;
@@ -500,12 +543,13 @@ async fn handle_udp_associate(
       {
         return;
       }
-      log::info!("SOCKS5 UDP ASSOCIATE (via SOCKS5 upstream) relaying on {relay_addr}");
+      log::debug!("SOCKS5 UDP ASSOCIATE relaying mode=socks5_upstream relay={relay_addr}");
       run_udp_relay_socks5(
         control,
         relay,
         datagram,
         UdpRelayContext::new(blocklist_matcher),
+        resolver,
       )
       .await;
     }
@@ -518,7 +562,7 @@ async fn associate_upstream(
   upstream_url: &str,
 ) -> Result<SocksDatagram<TcpStream>, Box<dyn std::error::Error + Send + Sync>> {
   let upstream = Url::parse(upstream_url)?;
-  let host = upstream.host_str().unwrap_or("127.0.0.1");
+  let host = crate::proxy_storage::bare_host(upstream.host_str().unwrap_or("127.0.0.1"));
   let port = upstream.port().unwrap_or(1080);
   let auth = if !upstream.username().is_empty() {
     Some(Auth {
@@ -529,12 +573,13 @@ async fn associate_upstream(
     None
   };
 
-  let proxy_stream = tokio::time::timeout(
+  let proxy_stream = crate::dialer::connect_host(
+    "upstream SOCKS5",
+    host,
+    port,
     crate::proxy_server::UPSTREAM_DIAL_TIMEOUT,
-    TcpStream::connect((host, port)),
   )
-  .await
-  .map_err(|_| format!("upstream SOCKS5 connect to {host}:{port} timed out"))??;
+  .await?;
   let bind_sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
   // association_addr None => 0.0.0.0:0 (we accept replies from any peer).
   let datagram = tokio::time::timeout(
@@ -622,6 +667,7 @@ async fn run_udp_relay_direct(
   relay: UdpSocket,
   out: UdpSocket,
   mut ctx: UdpRelayContext,
+  resolver: Option<ProfileResolver>,
 ) {
   let mut client_addr: Option<SocketAddr> = None;
   let mut from_client = vec![0u8; UDP_BUF];
@@ -647,14 +693,14 @@ async fn run_udp_relay_direct(
         }
         let host = addrkind_host(&header.dst);
         if ctx.is_blocked(&host) {
-          log::debug!("[blocklist] Blocked SOCKS5 UDP datagram to {host}");
+          log::debug!("Blocklist blocked SOCKS5 UDP datagram host={host}");
           continue;
         }
         let payload = &from_client[header.data_offset..n];
         // Resolve after the blocklist check so a blocked host is never even
         // looked up, and count bytes against the resolved peer so replies from
         // it are attributed back to this host.
-        let dst = match resolve_addr(&header.dst).await {
+        let dst = match resolve_addr(&header.dst, resolver.as_ref()).await {
           Some(d) => d,
           None => continue,
         };
@@ -684,6 +730,7 @@ async fn run_udp_relay_socks5(
   relay: UdpSocket,
   datagram: SocksDatagram<TcpStream>,
   mut ctx: UdpRelayContext,
+  resolver: Option<ProfileResolver>,
 ) {
   let mut client_addr: Option<SocketAddr> = None;
   let mut from_client = vec![0u8; UDP_BUF];
@@ -708,12 +755,22 @@ async fn run_udp_relay_socks5(
         }
         let host = addrkind_host(&header.dst);
         if ctx.is_blocked(&host) {
-          log::debug!("[blocklist] Blocked SOCKS5 UDP datagram to {host}");
+          log::debug!("Blocklist blocked SOCKS5 UDP datagram host={host}");
           continue;
         }
-        let peer_key = addrkind_key(&header.dst);
+        // With a profile DNS server the upstream gets the address, as on TCP.
+        let dst = match (header.dst, resolver.as_ref()) {
+          (AddrKind::Domain(domain, port), Some(resolver)) => {
+            match resolve_addr(&AddrKind::Domain(domain, port), Some(resolver)).await {
+              Some(address) => AddrKind::Ip(address),
+              None => continue,
+            }
+          }
+          (dst, _) => dst,
+        };
+        let peer_key = addrkind_key(&dst);
         let payload = from_client[header.data_offset..n].to_vec();
-        if datagram.send_to(&payload, header.dst).await.is_ok() {
+        if datagram.send_to(&payload, dst).await.is_ok() {
           ctx.record_sent(&host, peer_key, payload.len() as u64);
         }
       }
@@ -735,14 +792,30 @@ async fn run_udp_relay_socks5(
   ctx.flush();
 }
 
-/// Resolve a UDP destination to a concrete socket address for direct relay.
-async fn resolve_addr(addr: &AddrKind) -> Option<SocketAddr> {
-  match addr {
-    AddrKind::Ip(s) => Some(*s),
-    AddrKind::Domain(domain, port) => tokio::net::lookup_host(format!("{domain}:{port}"))
+/// Resolve a UDP destination to a concrete socket address, with the profile
+/// DNS server when there is one and the system resolver otherwise. The direct
+/// egress socket is IPv4, so an IPv4 answer goes first.
+async fn resolve_addr(addr: &AddrKind, resolver: Option<&ProfileResolver>) -> Option<SocketAddr> {
+  match (addr, resolver) {
+    (AddrKind::Ip(s), _) => Some(*s),
+    (AddrKind::Domain(domain, port), Some(resolver)) => resolver
+      .resolve(domain)
       .await
-      .ok()
-      .and_then(|mut it| it.next()),
+      .ok()?
+      .first()
+      .map(|ip| SocketAddr::new(*ip, *port)),
+    (AddrKind::Domain(domain, port), None) => {
+      let found = crate::dialer::HostResolver::system()
+        .resolve(domain, crate::dialer::LOOKUP_TIMEOUT)
+        .await
+        .ok()?;
+      let ip = found
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or_else(|| found.first())?
+        .ip();
+      Some(SocketAddr::new(ip, *port))
+    }
   }
 }
 

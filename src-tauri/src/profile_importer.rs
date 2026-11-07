@@ -64,7 +64,7 @@ pub struct ProfileImportItemResult {
   /// Final profile name (after any duplicate-rename).
   pub name: String,
   pub source_path: String,
-  /// "imported" | "skipped" | "failed"
+  /// "imported" | "skipped" | "failed" | "cancelled"
   pub status: String,
   pub profile_id: Option<String>,
   /// Structured `{"code": …}` error string when status is "failed".
@@ -78,6 +78,12 @@ pub struct ProfileImportBatchResult {
   pub imported_count: usize,
   pub skipped_count: usize,
   pub failed_count: usize,
+  /// Items not started because the import was cancelled.
+  #[serde(default)]
+  pub cancelled_count: usize,
+  /// The import was cancelled. The profiles it imported before are kept.
+  #[serde(default)]
+  pub cancelled: bool,
   pub results: Vec<ProfileImportItemResult>,
 }
 
@@ -128,6 +134,173 @@ fn resolve_duplicate_name(requested: &str, taken: &mut HashSet<String>) -> Strin
       return candidate;
     }
     n += 1;
+  }
+}
+
+/// Imports by the id their caller gave them; `true` once a cancel is asked.
+/// A cancel that arrives before its import starts is kept and honoured.
+static IMPORT_CANCELS: std::sync::LazyLock<
+  std::sync::Mutex<std::collections::HashMap<String, bool>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn import_cancels() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, bool>> {
+  IMPORT_CANCELS
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Ask a running import to stop before its next profile.
+pub fn request_import_cancel(import_id: &str) {
+  import_cancels().insert(import_id.to_string(), true);
+}
+
+fn register_import(import_id: &str) {
+  import_cancels()
+    .entry(import_id.to_string())
+    .or_insert(false);
+}
+
+fn finish_import(import_id: &str) {
+  import_cancels().remove(import_id);
+}
+
+fn import_cancel_requested(import_id: Option<&str>) -> bool {
+  import_id.is_some_and(|id| import_cancels().get(id).copied().unwrap_or(false))
+}
+
+/// The batch loop, apart from the copy itself so it can be tested without an
+/// app. Items are isolated: one failure does not stop the rest. A cancel stops
+/// it between items; the item being copied finishes and is kept, the rest are
+/// reported as `cancelled`. `import_one` returns the new profile's id.
+async fn run_import_batch<F, Fut>(
+  items: Vec<ImportProfileItem>,
+  mut taken_names: HashSet<String>,
+  duplicate_strategy: DuplicateStrategy,
+  import_id: Option<&str>,
+  mut import_one: F,
+) -> ProfileImportBatchResult
+where
+  F: FnMut(ImportProfileItem, String) -> Fut,
+  Fut: std::future::Future<Output = Result<(String, ProfileImportReport), String>>,
+{
+  let started = std::time::Instant::now();
+  let total = items.len();
+  let mut results = Vec::new();
+  let mut imported_count = 0usize;
+  let mut skipped_count = 0usize;
+  let mut failed_count = 0usize;
+  let mut cancelled_count = 0usize;
+  let mut completed = 0usize;
+  let mut cancelled = false;
+
+  for (index, item) in items.into_iter().enumerate() {
+    if cancelled || import_cancel_requested(import_id) {
+      cancelled = true;
+      cancelled_count += 1;
+      results.push(ProfileImportItemResult {
+        name: item.new_profile_name.trim().to_string(),
+        source_path: item.source_path,
+        status: "cancelled".to_string(),
+        profile_id: None,
+        error: None,
+        report: None,
+      });
+      continue;
+    }
+
+    let requested = item.new_profile_name.trim().to_string();
+    if requested.is_empty() {
+      failed_count += 1;
+      completed += 1;
+      emit_import_progress(total, completed, index, &item.source_path, "failed");
+      results.push(ProfileImportItemResult {
+        name: requested,
+        source_path: item.source_path,
+        status: "failed".to_string(),
+        profile_id: None,
+        error: Some(serde_json::json!({ "code": "NAME_CANNOT_BE_EMPTY" }).to_string()),
+        report: None,
+      });
+      continue;
+    }
+
+    let final_name = if taken_names.contains(&requested.to_lowercase()) {
+      match duplicate_strategy {
+        DuplicateStrategy::Skip => {
+          skipped_count += 1;
+          completed += 1;
+          emit_import_progress(total, completed, index, &requested, "skipped");
+          results.push(ProfileImportItemResult {
+            name: requested,
+            source_path: item.source_path,
+            status: "skipped".to_string(),
+            profile_id: None,
+            error: None,
+            report: None,
+          });
+          continue;
+        }
+        DuplicateStrategy::Rename => resolve_duplicate_name(&requested, &mut taken_names),
+      }
+    } else {
+      taken_names.insert(requested.to_lowercase());
+      requested
+    };
+
+    emit_import_progress(total, completed, index, &final_name, "importing");
+
+    let source_path = item.source_path.clone();
+    let browser_type = item.browser_type.clone();
+    match import_one(item, final_name.clone()).await {
+      Ok((profile_id, report)) => {
+        imported_count += 1;
+        completed += 1;
+        emit_import_progress(total, completed, index, &final_name, "imported");
+        let _ = events::emit_empty("profiles-changed");
+        results.push(ProfileImportItemResult {
+          name: final_name,
+          source_path,
+          status: "imported".to_string(),
+          profile_id: Some(profile_id),
+          error: None,
+          report: Some(report),
+        });
+      }
+      Err(error) => {
+        failed_count += 1;
+        completed += 1;
+        emit_import_progress(total, completed, index, &final_name, "failed");
+        // The name was reserved but the import failed — free it again.
+        taken_names.remove(&final_name.to_lowercase());
+        // The text can quote the profile name and the source paths.
+        let logged =
+          crate::log_redaction::text(&error.replace(&format!("'{final_name}'"), "'<name>'"));
+        log::warn!(
+          "Profile import item failed index={index} source_browser={browser_type} err=\"{logged}\""
+        );
+        results.push(ProfileImportItemResult {
+          name: final_name,
+          source_path,
+          status: "failed".to_string(),
+          profile_id: None,
+          error: Some(error),
+          report: None,
+        });
+      }
+    }
+  }
+
+  log::info!(
+    "Profile import finished items={total} imported={imported_count} skipped={skipped_count} failed={failed_count} cancelled={cancelled_count} elapsed_ms={}",
+    started.elapsed().as_millis()
+  );
+  ProfileImportBatchResult {
+    imported_count,
+    skipped_count,
+    failed_count,
+    cancelled_count,
+    cancelled,
+    results,
   }
 }
 
@@ -526,9 +699,12 @@ impl ProfileImporter {
         .map_err(|e| format!("Failed to read ZIP entry at index {i}: {e}"))?;
 
       // enclosed_name prevents path traversal via ../ entries.
-      let enclosed = entry
-        .enclosed_name()
-        .ok_or_else(|| format!("ZIP contains an invalid entry path: {}", entry.name()))?;
+      let enclosed = entry.enclosed_name().ok_or_else(|| {
+        format!(
+          "ZIP contains an invalid entry path: {}",
+          String::from_utf8_lossy(entry.name_raw())
+        )
+      })?;
       let outpath = dest.join(enclosed);
 
       if entry.is_dir() {
@@ -653,6 +829,29 @@ impl ProfileImporter {
     duplicate_strategy: DuplicateStrategy,
     wayfern_config: Option<WayfernConfig>,
   ) -> Result<ProfileImportBatchResult, Box<dyn std::error::Error>> {
+    self
+      .import_profiles_cancellable(
+        app_handle,
+        items,
+        group_id,
+        duplicate_strategy,
+        wayfern_config,
+        None,
+      )
+      .await
+  }
+
+  /// `import_profiles` that `request_import_cancel(import_id)` can stop
+  /// between profiles.
+  pub async fn import_profiles_cancellable(
+    &self,
+    app_handle: &tauri::AppHandle,
+    items: Vec<ImportProfileItem>,
+    group_id: Option<String>,
+    duplicate_strategy: DuplicateStrategy,
+    wayfern_config: Option<WayfernConfig>,
+    import_id: Option<String>,
+  ) -> Result<ProfileImportBatchResult, Box<dyn std::error::Error>> {
     if items.is_empty() {
       return Err(
         serde_json::json!({ "code": "IMPORT_NO_ITEMS" })
@@ -703,114 +902,48 @@ impl ProfileImporter {
       );
     }
 
-    let mut taken_names: HashSet<String> = self
+    let taken_names: HashSet<String> = self
       .profile_manager
       .list_profiles()?
       .iter()
       .map(|p| p.name.to_lowercase())
       .collect();
 
-    let total = items.len();
-    let mut results = Vec::with_capacity(total);
-    let mut imported_count = 0usize;
-    let mut skipped_count = 0usize;
-    let mut failed_count = 0usize;
-    let mut completed = 0usize;
-
-    for (index, item) in items.into_iter().enumerate() {
-      let requested = item.new_profile_name.trim().to_string();
-      if requested.is_empty() {
-        failed_count += 1;
-        completed += 1;
-        emit_import_progress(total, completed, index, &item.source_path, "failed");
-        results.push(ProfileImportItemResult {
-          name: requested,
-          source_path: item.source_path,
-          status: "failed".to_string(),
-          profile_id: None,
-          error: Some(serde_json::json!({ "code": "NAME_CANNOT_BE_EMPTY" }).to_string()),
-          report: None,
-        });
-        continue;
-      }
-
-      let final_name = if taken_names.contains(&requested.to_lowercase()) {
-        match duplicate_strategy {
-          DuplicateStrategy::Skip => {
-            skipped_count += 1;
-            completed += 1;
-            emit_import_progress(total, completed, index, &requested, "skipped");
-            results.push(ProfileImportItemResult {
-              name: requested,
-              source_path: item.source_path,
-              status: "skipped".to_string(),
-              profile_id: None,
-              error: None,
-              report: None,
-            });
-            continue;
-          }
-          DuplicateStrategy::Rename => resolve_duplicate_name(&requested, &mut taken_names),
-        }
-      } else {
-        taken_names.insert(requested.to_lowercase());
-        requested
-      };
-
-      emit_import_progress(total, completed, index, &final_name, "importing");
-
-      match self
-        .import_profile(
-          app_handle,
-          &item.source_path,
-          &item.browser_type,
-          &final_name,
-          item.proxy_id.clone(),
-          item.vpn_id.clone(),
-          group_id.clone(),
-          wayfern_config.clone(),
-          item.allow_running.unwrap_or(false),
-        )
-        .await
-      {
-        Ok((profile, report)) => {
-          imported_count += 1;
-          completed += 1;
-          emit_import_progress(total, completed, index, &final_name, "imported");
-          let _ = events::emit_empty("profiles-changed");
-          results.push(ProfileImportItemResult {
-            name: final_name,
-            source_path: item.source_path,
-            status: "imported".to_string(),
-            profile_id: Some(profile.id.to_string()),
-            error: None,
-            report: Some(report),
-          });
-        }
-        Err(e) => {
-          failed_count += 1;
-          completed += 1;
-          emit_import_progress(total, completed, index, &final_name, "failed");
-          // The name was reserved but the import failed — free it again.
-          taken_names.remove(&final_name.to_lowercase());
-          results.push(ProfileImportItemResult {
-            name: final_name,
-            source_path: item.source_path,
-            status: "failed".to_string(),
-            profile_id: None,
-            error: Some(error_to_code_string(e)),
-            report: None,
-          });
-        }
-      }
+    if let Some(id) = import_id.as_deref() {
+      register_import(id);
     }
-
-    Ok(ProfileImportBatchResult {
-      imported_count,
-      skipped_count,
-      failed_count,
-      results,
-    })
+    let result = run_import_batch(
+      items,
+      taken_names,
+      duplicate_strategy,
+      import_id.as_deref(),
+      |item, final_name| {
+        let group_id = group_id.clone();
+        let wayfern_config = wayfern_config.clone();
+        async move {
+          self
+            .import_profile(
+              app_handle,
+              &item.source_path,
+              &item.browser_type,
+              &final_name,
+              item.proxy_id.clone(),
+              item.vpn_id.clone(),
+              group_id,
+              wayfern_config,
+              item.allow_running.unwrap_or(false),
+            )
+            .await
+            .map(|(profile, report)| (profile.id.to_string(), report))
+            .map_err(error_to_code_string)
+        }
+      },
+    )
+    .await;
+    if let Some(id) = import_id.as_deref() {
+      finish_import(id);
+    }
+    Ok(result)
   }
 
   #[allow(clippy::too_many_arguments)]
@@ -857,10 +990,10 @@ impl ProfileImporter {
 
     let profile_id = uuid::Uuid::new_v4();
     let profiles_dir = self.profile_manager.get_profiles_dir();
-    let new_profile_uuid_dir = profiles_dir.join(profile_id.to_string());
-    let new_profile_data_dir = new_profile_uuid_dir.join("profile");
+    let new_profile_dir = profiles_dir.join(profile_id.to_string());
+    let new_profile_data_dir = new_profile_dir.join("profile");
 
-    create_dir_all(&new_profile_uuid_dir)?;
+    create_dir_all(&new_profile_dir)?;
     create_dir_all(&new_profile_data_dir)?;
 
     // Profile dirs can be multiple GB and the migration hits SQLite and the
@@ -884,7 +1017,7 @@ impl ProfileImporter {
         // every other error path here, or the half-copied — possibly multi-GB
         // — directory is orphaned with no metadata pointing at it, so nothing
         // ever reclaims it.
-        let _ = fs::remove_dir_all(&new_profile_uuid_dir);
+        let _ = fs::remove_dir_all(&new_profile_dir);
         return Err(
           serde_json::json!({
             "code": "INTERNAL_ERROR",
@@ -898,7 +1031,7 @@ impl ProfileImporter {
     let report = match migrate_result {
       Ok(report) => report,
       Err(e) => {
-        let _ = fs::remove_dir_all(&new_profile_uuid_dir);
+        let _ = fs::remove_dir_all(&new_profile_dir);
         // Structured codes (an unimportable source, a running browser) pass
         // through so the frontend can translate them; anything else is
         // internal.
@@ -915,42 +1048,36 @@ impl ProfileImporter {
     let version = match self.get_default_version_for_browser(mapped) {
       Ok(version) => version,
       Err(e) => {
-        let _ = fs::remove_dir_all(&new_profile_uuid_dir);
+        let _ = fs::remove_dir_all(&new_profile_dir);
         return Err(e);
       }
     };
 
     let final_wayfern_config = if mapped == "wayfern" {
       let mut config = wayfern_config.unwrap_or_default();
+      config.sanitize_launch_args().await;
+
+      // A caller-supplied device is a set of explicit field choices, not a
+      let supplied_device = if crate::wayfern_manager::supports_wayfern_152(&version) {
+        config
+          .fingerprint
+          .take()
+          .and_then(|json| crate::wayfern_manager::WayfernManager::fingerprint_object(&json))
+      } else {
+        None
+      };
 
       if let Some(ref proxy_id_val) = proxy_id {
         if let Some(proxy_settings) = PROXY_MANAGER.get_proxy_settings_by_id(proxy_id_val) {
-          let proxy_url = if let (Some(username), Some(password)) =
-            (&proxy_settings.username, &proxy_settings.password)
-          {
-            format!(
-              "{}://{}:{}@{}:{}",
-              proxy_settings.proxy_type.to_lowercase(),
-              username,
-              password,
-              proxy_settings.host,
-              proxy_settings.port
-            )
-          } else {
-            format!(
-              "{}://{}:{}",
-              proxy_settings.proxy_type.to_lowercase(),
-              proxy_settings.host,
-              proxy_settings.port
-            )
-          };
-          config.proxy = Some(proxy_url);
+          config.proxy = Some(crate::proxy_manager::ProxyManager::build_proxy_url(
+            &proxy_settings,
+          ));
         }
       }
 
-      if config.fingerprint.is_none() {
+      if config.fingerprint.is_none() && config.identity_id.is_none() {
         let temp_profile = BrowserProfile {
-          id: uuid::Uuid::new_v4(),
+          id: profile_id,
           name: new_profile_name.to_string(),
           browser: mapped.to_string(),
           version: version.clone(),
@@ -971,11 +1098,15 @@ impl ProfileImporter {
           last_sync: None,
           host_os: None,
           ephemeral: false,
+          temporary: false,
           extension_group_id: None,
           proxy_bypass_rules: Vec::new(),
           created_by_id: None,
           created_by_email: None,
           dns_blocklist: None,
+          dns_server: None,
+          status_id: None,
+          start_urls: Vec::new(),
           password_protected: false,
           clear_on_close: false,
           created_at: None,
@@ -989,9 +1120,18 @@ impl ProfileImporter {
         {
           // geo_proxy_signature is intentionally left unset here: the first
           // launch's signature-mismatch refresh verifies the location either way.
-          Ok((fp, _geolocation_applied)) => config.fingerprint = Some(fp),
+          Ok(generated) => {
+            config.identity_id = generated.identity_id;
+            config.location = generated.location;
+            config.identity_baseline = None;
+            config.fingerprint = if config.identity_id.is_some() {
+              None
+            } else {
+              Some(generated.fingerprint)
+            };
+          }
           Err(e) => {
-            let _ = fs::remove_dir_all(&new_profile_uuid_dir);
+            let _ = fs::remove_dir_all(&new_profile_dir);
             return Err(
               serde_json::json!({
                 "code": "INTERNAL_ERROR",
@@ -1001,6 +1141,17 @@ impl ProfileImporter {
               .into(),
             );
           }
+        }
+      }
+
+      if let Some(object) = supplied_device {
+        let overrides =
+          crate::wayfern_manager::WayfernManager::overrides_from_explicit_fingerprint(&object);
+        if !overrides.is_empty() {
+          config.identity_overrides = serde_json::to_string(&overrides).ok();
+        }
+        if let Some(location) = crate::wayfern_manager::WayfernManager::location_of(&object) {
+          config.location = Some(location);
         }
       }
 
@@ -1032,11 +1183,15 @@ impl ProfileImporter {
       last_sync: None,
       host_os: Some(get_host_os()),
       ephemeral: false,
+      temporary: false,
       extension_group_id: None,
       proxy_bypass_rules: Vec::new(),
       created_by_id: None,
       created_by_email: None,
       dns_blocklist: None,
+      dns_server: None,
+      status_id: None,
+      start_urls: Vec::new(),
       password_protected: false,
       clear_on_close: false,
       created_at: Some(
@@ -1049,26 +1204,23 @@ impl ProfileImporter {
     };
 
     self.profile_manager.save_profile(&profile)?;
+    crate::profile::origin::record(&profile.id, crate::profile::origin::Origin::Imported);
 
     if report.is_empty_import() {
       // Not an error — an empty source profile imports legitimately — but it is
       // the exact symptom the old layout bug produced, so it is worth a loud
       // line in the log rather than a silent success.
       log::warn!(
-        "Imported profile '{}' from '{}' carried no readable data (warnings: {:?})",
-        new_profile_name,
-        source_path.display(),
+        "Profile imported with no readable data profile={profile_id} source_browser={browser_type} warnings={:?}",
         report.warnings
       );
     } else {
       log::info!(
-        "Imported profile '{}' from '{}': {} cookies, {} passwords, {} history entries ({} unrecoverable secrets, warnings: {:?})",
-        new_profile_name,
-        source_path.display(),
+        "Profile imported profile={profile_id} source_browser={browser_type} cookies={} passwords={} history={} unrecoverable={} warnings={:?}",
         report.cookies_migrated,
-        report.passwords_migrated,
+        report.logins_migrated,
         report.history_entries,
-        report.cookies_unrecoverable + report.passwords_unrecoverable,
+        report.cookies_unrecoverable + report.logins_unrecoverable,
         report.warnings
       );
     }
@@ -1083,6 +1235,8 @@ impl ProfileImporter {
     let downloaded_versions = self
       .downloaded_browsers_registry
       .get_downloaded_versions(browser_type);
+    let mut downloaded_versions = downloaded_versions;
+    downloaded_versions.sort_by(|a, b| crate::api_client::compare_versions(b, a));
 
     if let Some(version) = downloaded_versions.first() {
       return Ok(version.clone());
@@ -1111,7 +1265,15 @@ impl ProfileImporter {
       let source_path = entry.path();
       let dest_path = destination.join(entry.file_name());
 
-      if source_path.is_dir() {
+      // Symlinks are not followed, as in `profile_import::copy`: Chromium
+      // leaves `SingletonLock` pointing at nothing after a crash, which made
+      // every clone fail, and a link to a folder would copy content from
+      // outside the profile.
+      let file_type = entry.file_type()?;
+      if file_type.is_symlink() {
+        continue;
+      }
+      if file_type.is_dir() {
         Self::copy_directory_recursive(&source_path, &dest_path)?;
       } else {
         fs::copy(&source_path, &dest_path)?;
@@ -1159,24 +1321,33 @@ pub async fn import_browser_profiles(
   group_id: Option<String>,
   duplicate_strategy: Option<DuplicateStrategy>,
   wayfern_config: Option<WayfernConfig>,
+  import_id: Option<String>,
 ) -> Result<ProfileImportBatchResult, String> {
   // The Pro gate for fingerprint OS spoofing lives inside import_profiles.
   let importer = ProfileImporter::instance();
   importer
-    .import_profiles(
+    .import_profiles_cancellable(
       &app_handle,
       items,
       group_id,
       duplicate_strategy.unwrap_or_default(),
       wayfern_config,
+      import_id,
     )
     .await
     .map_err(error_to_code_string)
 }
 
-lazy_static::lazy_static! {
-  static ref PROFILE_IMPORTER: ProfileImporter = ProfileImporter::new();
+/// Stop the import started with this id before its next profile.
+#[tauri::command]
+pub async fn cancel_profile_import(import_id: String) -> Result<(), String> {
+  request_import_cancel(&import_id);
+  log::debug!("Profile import cancel requested import={import_id}");
+  Ok(())
 }
+
+static PROFILE_IMPORTER: std::sync::LazyLock<ProfileImporter> =
+  std::sync::LazyLock::new(ProfileImporter::new);
 
 #[cfg(test)]
 mod tests {
@@ -1277,6 +1448,29 @@ mod tests {
 
     assert_eq!(content1, "content1", "file1 content should match");
     assert_eq!(content2, "content2", "file2 content should match");
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn a_copy_skips_symlinks_such_as_a_stale_singleton_lock() {
+    let temp_dir = TempDir::new().expect("Failed to create temp directory");
+    let source_dir = temp_dir.path().join("source");
+    let outside = temp_dir.path().join("outside");
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(source_dir.join("Preferences"), "{}").unwrap();
+    fs::write(outside.join("secret.txt"), "not part of the profile").unwrap();
+    // What Chromium leaves after a crash, and a link out of the profile.
+    std::os::unix::fs::symlink("host-12345", source_dir.join("SingletonLock")).unwrap();
+    std::os::unix::fs::symlink(&outside, source_dir.join("linked")).unwrap();
+
+    let dest_dir = temp_dir.path().join("dest");
+    ProfileImporter::copy_directory_recursive(&source_dir, &dest_dir)
+      .expect("a dangling lock link must not stop the copy");
+
+    assert!(dest_dir.join("Preferences").exists());
+    assert!(fs::symlink_metadata(dest_dir.join("SingletonLock")).is_err());
+    assert!(!dest_dir.join("linked").exists());
   }
 
   #[test]
@@ -1386,5 +1580,120 @@ mod tests {
     fs::create_dir_all(&scratch).unwrap();
     ProfileImporter::cleanup_scratch_dir(&scratch.to_string_lossy()).unwrap();
     assert!(!scratch.exists(), "scratch dir should be removed");
+  }
+  fn batch_item(name: &str) -> ImportProfileItem {
+    ImportProfileItem {
+      source_path: format!("/source/{name}"),
+      browser_type: "chromium".to_string(),
+      new_profile_name: name.to_string(),
+      proxy_id: None,
+      vpn_id: None,
+      allow_running: None,
+    }
+  }
+
+  #[test]
+  fn test_import_cancel_registry_set_and_clear() {
+    let id = "test-registry-set-clear";
+    assert!(!import_cancel_requested(Some(id)));
+    assert!(!import_cancel_requested(None));
+
+    register_import(id);
+    assert!(!import_cancel_requested(Some(id)));
+    request_import_cancel(id);
+    assert!(import_cancel_requested(Some(id)));
+    // Registering again must not drop a cancel that is already asked.
+    register_import(id);
+    assert!(import_cancel_requested(Some(id)));
+
+    finish_import(id);
+    assert!(!import_cancel_requested(Some(id)));
+  }
+
+  #[tokio::test]
+  async fn test_import_cancel_after_first_item_keeps_it() {
+    let id = "test-cancel-after-first";
+    register_import(id);
+    let items = vec![batch_item("One"), batch_item("Two"), batch_item("Three")];
+    let mut copied = Vec::new();
+    let result = run_import_batch(
+      items,
+      HashSet::new(),
+      DuplicateStrategy::Rename,
+      Some(id),
+      |item, final_name| {
+        copied.push(final_name.clone());
+        // The person cancels while the first profile is being copied.
+        request_import_cancel(id);
+        async move {
+          Ok((
+            format!("id-{}", item.new_profile_name),
+            ProfileImportReport::default(),
+          ))
+        }
+      },
+    )
+    .await;
+    finish_import(id);
+
+    assert_eq!(copied, vec!["One".to_string()]);
+    assert!(result.cancelled);
+    assert_eq!(result.imported_count, 1);
+    assert_eq!(result.cancelled_count, 2);
+    assert_eq!(result.failed_count, 0);
+    let statuses: Vec<&str> = result.results.iter().map(|r| r.status.as_str()).collect();
+    assert_eq!(statuses, vec!["imported", "cancelled", "cancelled"]);
+    assert_eq!(result.results[0].profile_id.as_deref(), Some("id-One"));
+    assert_eq!(result.results[1].name, "Two");
+    assert!(result.results[1].profile_id.is_none());
+  }
+
+  #[tokio::test]
+  async fn test_import_cancel_for_another_id_does_not_stop_this_one() {
+    let mine = "test-cancel-mine";
+    let other = "test-cancel-other";
+    register_import(mine);
+    request_import_cancel(other);
+    let items = vec![batch_item("A"), batch_item("B")];
+    let result = run_import_batch(
+      items,
+      HashSet::new(),
+      DuplicateStrategy::Rename,
+      Some(mine),
+      |_item, final_name| async move { Ok((final_name, ProfileImportReport::default())) },
+    )
+    .await;
+    finish_import(mine);
+    finish_import(other);
+
+    assert!(!result.cancelled);
+    assert_eq!(result.imported_count, 2);
+    assert_eq!(result.cancelled_count, 0);
+  }
+
+  #[tokio::test]
+  async fn test_import_batch_without_id_runs_every_item() {
+    let items = vec![batch_item("Taken"), batch_item("Fresh"), batch_item("Bad")];
+    let taken: HashSet<String> = ["taken".to_string()].into_iter().collect();
+    let result = run_import_batch(
+      items,
+      taken,
+      DuplicateStrategy::Skip,
+      None,
+      |item, final_name| async move {
+        if item.new_profile_name == "Bad" {
+          Err(serde_json::json!({ "code": "IMPORT_SOURCE_NOT_FOUND" }).to_string())
+        } else {
+          Ok((final_name, ProfileImportReport::default()))
+        }
+      },
+    )
+    .await;
+
+    assert!(!result.cancelled);
+    assert_eq!(result.skipped_count, 1);
+    assert_eq!(result.imported_count, 1);
+    assert_eq!(result.failed_count, 1);
+    assert_eq!(result.cancelled_count, 0);
   }
 }

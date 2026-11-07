@@ -4,11 +4,16 @@ use std::fs;
 use std::sync::Mutex;
 
 use crate::events;
+use crate::group_bookmarks::GroupBookmark;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileGroup {
   pub id: String,
   pub name: String,
+  /// Bookmarks every profile in this group carries. Written into the profile's
+  /// Chromium `Bookmarks` file before each launch; see `group_bookmarks`.
+  #[serde(default)]
+  pub bookmarks: Vec<GroupBookmark>,
   #[serde(default)]
   pub sync_enabled: bool,
   #[serde(default)]
@@ -24,6 +29,8 @@ pub struct GroupWithCount {
   pub id: String,
   pub name: String,
   pub count: usize,
+  #[serde(default)]
+  pub bookmark_count: usize,
   #[serde(default)]
   pub sync_enabled: bool,
   #[serde(default)]
@@ -104,6 +111,7 @@ impl GroupManager {
     let group = ProfileGroup {
       id: uuid::Uuid::new_v4().to_string(),
       name,
+      bookmarks: Vec::new(),
       sync_enabled,
       last_sync: None,
       updated_at: Some(crate::proxy_manager::now_secs()),
@@ -114,10 +122,11 @@ impl GroupManager {
 
     // Emit event for reactive UI updates
     if let Err(e) = events::emit_empty("groups-changed") {
-      log::error!("Failed to emit groups-changed event: {e}");
+      log::warn!("Event emit failed event=groups-changed err=\"{e}\"");
     }
 
     if group.sync_enabled {
+      crate::team_activity::record("group.create", &group.id, Some(&group.name), None);
       if let Some(scheduler) = crate::sync::get_global_scheduler() {
         let id = group.id.clone();
         tauri::async_runtime::spawn(async move {
@@ -172,10 +181,16 @@ impl GroupManager {
 
     // Emit event for reactive UI updates
     if let Err(e) = events::emit_empty("groups-changed") {
-      log::error!("Failed to emit groups-changed event: {e}");
+      log::warn!("Event emit failed event=groups-changed err=\"{e}\"");
     }
 
     if updated_group.sync_enabled {
+      crate::team_activity::record(
+        "group.update",
+        &updated_group.id,
+        Some(&updated_group.name),
+        None,
+      );
       if let Some(scheduler) = crate::sync::get_global_scheduler() {
         let id = updated_group.id.clone();
         tauri::async_runtime::spawn(async move {
@@ -195,6 +210,7 @@ impl GroupManager {
 
     if let Some(existing) = groups_data.groups.iter_mut().find(|g| g.id == group.id) {
       existing.name = group.name.clone();
+      existing.bookmarks = group.bookmarks.clone();
       existing.sync_enabled = group.sync_enabled;
       existing.last_sync = group.last_sync;
       existing.updated_at = group.updated_at;
@@ -212,6 +228,7 @@ impl GroupManager {
 
     if let Some(existing) = groups_data.groups.iter_mut().find(|g| g.id == group.id) {
       existing.name = group.name.clone();
+      existing.bookmarks = group.bookmarks.clone();
       existing.sync_enabled = group.sync_enabled;
       existing.last_sync = group.last_sync;
       existing.updated_at = group.updated_at;
@@ -268,19 +285,22 @@ impl GroupManager {
 
     // If sync was enabled, also delete from S3
     if was_sync_enabled {
+      crate::team_activity::record("group.delete", &id, None, None);
       let group_id_owned = id.clone();
       let app_handle_clone = app_handle.clone();
       tauri::async_runtime::spawn(async move {
         match crate::sync::SyncEngine::create_from_settings(&app_handle_clone).await {
           Ok(engine) => {
             if let Err(e) = engine.delete_group(&group_id_owned).await {
-              log::warn!("Failed to delete group {} from sync: {}", group_id_owned, e);
+              log::warn!("Remote group delete failed group={group_id_owned} err=\"{e}\"");
             } else {
-              log::info!("Group {} deleted from S3 sync storage", group_id_owned);
+              log::info!("Remote group deleted group={group_id_owned}");
             }
           }
           Err(e) => {
-            log::debug!("Sync not configured, skipping remote deletion: {}", e);
+            log::debug!(
+              "Remote group delete skipped: sync not configured group={group_id_owned} err=\"{e}\""
+            );
           }
         }
       });
@@ -288,10 +308,57 @@ impl GroupManager {
 
     // Emit event for reactive UI updates
     if let Err(e) = events::emit_empty("groups-changed") {
-      log::error!("Failed to emit groups-changed event: {e}");
+      log::warn!("Event emit failed event=groups-changed err=\"{e}\"");
     }
 
     Ok(())
+  }
+
+  /// Replace a group's shared bookmark list.
+  ///
+  /// Bumps `updated_at` because this is a real user edit, which is what sync's
+  /// last-write-wins reconcile reads; `last_sync` is bookkeeping and must not
+  /// decide direction.
+  pub fn set_group_bookmarks(
+    &self,
+    _app_handle: &tauri::AppHandle,
+    id: &str,
+    bookmarks: Vec<GroupBookmark>,
+  ) -> Result<ProfileGroup, Box<dyn std::error::Error>> {
+    let mut groups_data = self.load_groups_data()?;
+
+    let group = groups_data
+      .groups
+      .iter_mut()
+      .find(|g| g.id == id)
+      .ok_or_else(|| serde_json::json!({ "code": "GROUP_NOT_FOUND" }).to_string())?;
+
+    group.bookmarks = bookmarks;
+    group.updated_at = Some(crate::proxy_manager::now_secs());
+    let updated_group = group.clone();
+
+    self.save_groups_data(&groups_data)?;
+
+    if let Err(e) = events::emit_empty("groups-changed") {
+      log::warn!("Event emit failed event=groups-changed err=\"{e}\"");
+    }
+
+    if updated_group.sync_enabled {
+      crate::team_activity::record(
+        "group.update",
+        &updated_group.id,
+        Some(&updated_group.name),
+        crate::team_activity::fields(&["bookmarks"]),
+      );
+      if let Some(scheduler) = crate::sync::get_global_scheduler() {
+        let id = updated_group.id.clone();
+        tauri::async_runtime::spawn(async move {
+          scheduler.queue_group_sync(id).await;
+        });
+      }
+    }
+
+    Ok(updated_group)
   }
 
   pub fn get_groups_with_profile_counts(
@@ -318,6 +385,7 @@ impl GroupManager {
         id: group.id,
         name: group.name,
         count,
+        bookmark_count: group.bookmarks.len(),
         sync_enabled: group.sync_enabled,
         last_sync: group.last_sync,
       });
@@ -328,9 +396,8 @@ impl GroupManager {
 }
 
 // Global instance
-lazy_static::lazy_static! {
-  pub static ref GROUP_MANAGER: Mutex<GroupManager> = Mutex::new(GroupManager::new());
-}
+pub static GROUP_MANAGER: std::sync::LazyLock<Mutex<GroupManager>> =
+  std::sync::LazyLock::new(|| Mutex::new(GroupManager::new()));
 
 // Helper function to get groups with counts
 pub fn get_groups_with_counts(profiles: &[crate::profile::BrowserProfile]) -> Vec<GroupWithCount> {
@@ -409,8 +476,12 @@ pub async fn delete_selected_profiles(
   app_handle: tauri::AppHandle,
   profile_ids: Vec<String>,
 ) -> Result<(), String> {
-  let profile_manager = crate::profile::ProfileManager::instance();
-  profile_manager
-    .delete_multiple_profiles(&app_handle, profile_ids)
-    .map_err(|e| format!("Failed to delete profiles: {e}"))
+  // Off the async runtime: a delete can erase every file of every profile.
+  tauri::async_runtime::spawn_blocking(move || {
+    crate::profile::ProfileManager::instance()
+      .delete_multiple_profiles(&app_handle, profile_ids)
+      .map_err(|e| format!("Failed to delete profiles: {e}"))
+  })
+  .await
+  .map_err(|e| format!("Failed to delete profiles: {e}"))?
 }

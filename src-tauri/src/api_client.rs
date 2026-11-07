@@ -1,8 +1,23 @@
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::log_streak::Streak;
+
+static WAYFERN_VERSION_FETCH: Streak = Streak::new(module_path!(), "Wayfern version fetch");
+static LAST_WAYFERN_VERSION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn wayfern_version_changed(version: &str) -> bool {
+  let mut last = LAST_WAYFERN_VERSION
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner);
+  if last.as_deref() == Some(version) {
+    return false;
+  }
+  *last = Some(version.to_string());
+  true
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionComponent {
@@ -10,6 +25,8 @@ pub struct VersionComponent {
   pub minor: u32,
   pub patch: u32,
   pub build: u32,
+  /// The rebuild of one Chromium version: "155.0.8059.79-2" is revision 2, a plain version is 1.
+  pub revision: u32,
 }
 
 impl VersionComponent {
@@ -21,6 +38,7 @@ impl VersionComponent {
       version
     };
 
+    let (version, revision) = Self::split_revision(version);
     let numeric_part = Self::numeric_prefix(version);
 
     let parts: Vec<u32> = numeric_part
@@ -33,7 +51,21 @@ impl VersionComponent {
       minor: parts.get(1).copied().unwrap_or(0),
       patch: parts.get(2).copied().unwrap_or(0),
       build: parts.get(3).copied().unwrap_or(0),
+      revision,
     }
+  }
+
+  /// Splits a trailing "-<digits>" rebuild revision off a version; a version without one is
+  /// revision 1.
+  fn split_revision(version: &str) -> (&str, u32) {
+    if let Some((base, tail)) = version.rsplit_once('-') {
+      if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(revision) = tail.parse() {
+          return (base, revision);
+        }
+      }
+    }
+    (version, 1)
   }
 
   fn numeric_prefix(version: &str) -> String {
@@ -55,12 +87,20 @@ impl PartialOrd for VersionComponent {
 
 impl Ord for VersionComponent {
   fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-    (self.major, self.minor, self.patch, self.build).cmp(&(
-      other.major,
-      other.minor,
-      other.patch,
-      other.build,
-    ))
+    (
+      self.major,
+      self.minor,
+      self.patch,
+      self.build,
+      self.revision,
+    )
+      .cmp(&(
+        other.major,
+        other.minor,
+        other.patch,
+        other.build,
+        other.revision,
+      ))
   }
 }
 
@@ -95,6 +135,24 @@ pub struct BrowserRelease {
 pub struct WayfernVersionInfo {
   pub version: String,
   pub downloads: std::collections::HashMap<String, Option<String>>,
+  /// The rebuild of `version`, when it is not the first. It is folded into `version` as
+  /// "<version>-<revision>" when the manifest is read, so a rebuild of the same Chromium version
+  /// gets its own install directory and counts as an update.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub revision: Option<u32>,
+}
+
+impl WayfernVersionInfo {
+  /// Folds `revision` into `version`. Revision 1, or none, keeps the plain Chromium version, so a
+  /// manifest without the field reads as before. Folding twice changes nothing.
+  fn with_revision_folded(mut self) -> Self {
+    if let Some(revision) = self.revision.take() {
+      if revision >= 2 {
+        self.version = format!("{}-{revision}", self.version);
+      }
+    }
+    self
+  }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -110,15 +168,14 @@ struct CachedWayfernData {
 }
 
 pub struct ApiClient {
-  client: Client,
+  client: crate::app_proxy::SharedClient,
 }
 
 impl ApiClient {
   pub fn new() -> Self {
-    let client = Client::builder()
-      .timeout(std::time::Duration::from_secs(30))
-      .build()
-      .unwrap_or_else(|_| Client::new());
+    let client = crate::app_proxy::SharedClient::new(|builder| {
+      builder.timeout(std::time::Duration::from_secs(30))
+    });
 
     Self { client }
   }
@@ -156,12 +213,12 @@ impl ApiClient {
 
     let content = fs::read_to_string(&cache_file).ok()?;
     if let Ok(cached) = serde_json::from_str::<CachedVersionData>(&content) {
-      log::info!("Using cached versions for {browser}");
+      log::debug!("Browser versions from cache browser={browser}");
       return Some(cached.releases);
     }
 
     if let Ok(legacy_versions) = serde_json::from_str::<Vec<String>>(&content) {
-      log::info!("Using legacy cached versions for {browser}; upgrading in-memory");
+      log::debug!("Browser versions from legacy cache browser={browser}");
       let releases: Vec<BrowserRelease> = legacy_versions
         .into_iter()
         .map(|version| BrowserRelease {
@@ -214,7 +271,10 @@ impl ApiClient {
 
     let content = serde_json::to_string_pretty(&cached_data)?;
     fs::write(&cache_file, content)?;
-    log::info!("Cached {} versions for {}", releases.len(), browser);
+    log::debug!(
+      "Browser versions cached browser={browser} count={}",
+      releases.len()
+    );
     Ok(())
   }
 
@@ -246,7 +306,7 @@ impl ApiClient {
 
     let content = serde_json::to_string_pretty(&cached_data)?;
     fs::write(&cache_file, content)?;
-    log::info!("Cached Wayfern version: {}", version_info.version);
+    log::debug!("Wayfern version cached version={}", version_info.version);
     Ok(())
   }
 
@@ -257,20 +317,24 @@ impl ApiClient {
   ) -> Result<WayfernVersionInfo, Box<dyn std::error::Error + Send + Sync>> {
     if !no_caching {
       if let Some(cached_version) = self.load_cached_wayfern_version() {
-        log::info!("Using cached Wayfern version: {}", cached_version.version);
+        log::debug!(
+          "Wayfern version from cache version={}",
+          cached_version.version
+        );
         return Ok(cached_version);
       }
     }
 
-    log::info!("Fetching Wayfern version from https://donutbrowser.com/wayfern.json");
     let url = "https://donutbrowser.com/wayfern.json";
 
     let mut last_err = None;
+    let mut proxy_err = None;
     let mut version_info: Option<WayfernVersionInfo> = None;
 
     for attempt in 1..=3 {
       match self
         .client
+        .get()
         .get(url)
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
         .send()
@@ -290,7 +354,8 @@ impl ApiClient {
           }
         }
         Err(e) => {
-          log::warn!("Wayfern fetch attempt {attempt}/3 failed: {e}");
+          log::debug!("Wayfern version fetch attempt failed attempt={attempt} err=\"{e}\"");
+          proxy_err = crate::system_proxy::explain(&e);
           last_err = Some(e.to_string());
         }
       }
@@ -300,17 +365,31 @@ impl ApiClient {
       }
     }
 
-    let version_info = version_info.ok_or_else(|| {
-      format!(
-        "Failed to fetch Wayfern version after 3 attempts: {}",
-        last_err.unwrap_or_default()
-      )
-    })?;
-    log::info!("Fetched Wayfern version: {}", version_info.version);
+    let version_info = match version_info {
+      Some(info) => {
+        WAYFERN_VERSION_FETCH.succeeded();
+        info.with_revision_folded()
+      }
+      None => {
+        let err = proxy_err.unwrap_or_else(|| {
+          format!(
+            "Failed to fetch Wayfern version after 3 attempts: {}",
+            last_err.unwrap_or_default()
+          )
+        });
+        WAYFERN_VERSION_FETCH.failed(&err);
+        return Err(err.into());
+      }
+    };
+    if wayfern_version_changed(&version_info.version) {
+      log::info!("Wayfern version fetched version={}", version_info.version);
+    } else {
+      log::debug!("Wayfern version fetched version={}", version_info.version);
+    }
 
     if !no_caching {
       if let Err(e) = self.save_cached_wayfern_version(&version_info) {
-        log::error!("Failed to cache Wayfern version: {e}");
+        log::warn!("Wayfern version not cached err=\"{e}\"");
       }
     }
 
@@ -320,12 +399,16 @@ impl ApiClient {
   /// Get the download URL for Wayfern based on current platform
   pub fn get_wayfern_download_url(&self, version_info: &WayfernVersionInfo) -> Option<String> {
     let (os, arch) = Self::get_platform_info();
-    let platform_key = format!("{os}-{arch}");
+    let slot = wayfern_slot_for(&version_info.downloads, &os, &arch)?;
+    version_info.downloads.get(&slot).cloned().flatten()
+  }
 
-    version_info
-      .downloads
-      .get(&platform_key)
-      .and_then(|url| url.clone())
+  /// The downloads key that this host takes from the last fetched Wayfern manifest, or None when
+  /// no manifest is cached or nothing in it runs here.
+  pub fn cached_wayfern_slot(&self) -> Option<String> {
+    let (os, arch) = Self::get_platform_info();
+    let version_info = self.load_cached_wayfern_version()?;
+    wayfern_slot_for(&version_info.downloads, &os, &arch)
   }
 
   /// Check if Wayfern has a compatible download for current platform
@@ -334,25 +417,7 @@ impl ApiClient {
   }
 
   fn get_platform_info() -> (String, String) {
-    let os = if cfg!(target_os = "windows") {
-      "windows"
-    } else if cfg!(target_os = "linux") {
-      "linux"
-    } else if cfg!(target_os = "macos") {
-      "macos"
-    } else {
-      "unknown"
-    };
-
-    let arch = if cfg!(target_arch = "x86_64") {
-      "x64"
-    } else if cfg!(target_arch = "aarch64") {
-      "arm64"
-    } else {
-      "unknown"
-    };
-
-    (os.to_string(), arch.to_string())
+    crate::browser_version_manager::host_platform()
   }
 
   pub fn clear_all_cache(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -364,23 +429,153 @@ impl ApiClient {
         let path = entry.path();
         if path.is_file() {
           fs::remove_file(&path)?;
-          log::info!("Removed cache file: {path:?}");
+          log::debug!("Version cache file removed path={path:?}");
         }
       }
-      log::info!("All version cache cleared successfully");
+      log::info!("Version cache cleared");
     }
 
     Ok(())
   }
 }
 
-lazy_static::lazy_static! {
-  static ref API_CLIENT: ApiClient = ApiClient::new();
+static API_CLIENT: std::sync::LazyLock<ApiClient> = std::sync::LazyLock::new(ApiClient::new);
+
+/// The downloads key of the Wayfern build for one platform: its own key, or windows-x64 on Windows
+/// on Arm, which runs the x64 build through emulation, while no windows-arm64 build is published.
+/// Other platforms have no fallback: an x64 build cannot run on Linux on Arm, and an absent entry
+/// means "not available".
+pub(crate) fn wayfern_slot_for(
+  downloads: &std::collections::HashMap<String, Option<String>>,
+  os: &str,
+  arch: &str,
+) -> Option<String> {
+  let published = |key: &str| downloads.get(key).is_some_and(Option::is_some);
+  let own = format!("{os}-{arch}");
+  if published(&own) {
+    return Some(own);
+  }
+  if os == "windows" && arch == "arm64" && published("windows-x64") {
+    return Some("windows-x64".to_string());
+  }
+  None
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn a_rebuild_revision_orders_after_the_same_chromium_version() {
+    let rebuilt = VersionComponent::parse("155.0.8059.79-2");
+    assert_eq!((rebuilt.build, rebuilt.revision), (79, 2));
+    assert_eq!(VersionComponent::parse("155.0.8059.79").revision, 1);
+    assert_eq!(VersionComponent::parse("155").revision, 1);
+    assert!(is_version_newer("155.0.8059.79-2", "155.0.8059.79"));
+    assert!(!is_version_newer("155.0.8059.79", "155.0.8059.79-2"));
+    assert!(is_version_newer("155.0.8059.79-3", "155.0.8059.79-2"));
+    assert!(is_version_newer("156.0.7000.1", "155.0.8059.79-3"));
+    assert_eq!(
+      compare_versions("155.0.8059.79-1", "155.0.8059.79"),
+      std::cmp::Ordering::Equal
+    );
+    // The version gates of Wayfern features still see the Chromium version.
+    assert_ne!(
+      compare_versions("155.0.8059.79-2", "155"),
+      std::cmp::Ordering::Less
+    );
+  }
+
+  #[test]
+  fn a_client_without_the_revision_field_reads_the_new_manifest_as_before() {
+    // The struct as released before the revision field: the field must be ignored.
+    #[derive(serde::Deserialize)]
+    struct OldWayfernVersionInfo {
+      version: String,
+      downloads: std::collections::HashMap<String, Option<String>>,
+    }
+    let manifest = r#"{"version":"155.0.8059.79","revision":2,
+      "downloads":{"linux-x64":"https://d/wayfern-155.0.8059.79-linux-x64-portable.tar.xz"}}"#;
+    let old: OldWayfernVersionInfo = serde_json::from_str(manifest).unwrap();
+    assert_eq!(old.version, "155.0.8059.79");
+    assert_eq!(old.downloads.len(), 1);
+    // A new client installs the rebuild in its own directory, beside the first build.
+    let new: WayfernVersionInfo = serde_json::from_str(manifest).unwrap();
+    let new = new.with_revision_folded();
+    assert_eq!(new.version, "155.0.8059.79-2");
+    let dir = std::path::Path::new("binaries")
+      .join("wayfern")
+      .join(&new.version);
+    assert!(dir.ends_with("wayfern/155.0.8059.79-2"));
+  }
+
+  #[test]
+  fn the_manifest_revision_folds_into_the_version_once() {
+    let read = |json: &str| -> WayfernVersionInfo { serde_json::from_str(json).unwrap() };
+    let plain = read(r#"{"version":"155.0.8059.79","downloads":{}}"#).with_revision_folded();
+    assert_eq!(plain.version, "155.0.8059.79");
+    let first =
+      read(r#"{"version":"155.0.8059.79","downloads":{},"revision":1}"#).with_revision_folded();
+    assert_eq!(first.version, "155.0.8059.79");
+    let rebuilt =
+      read(r#"{"version":"155.0.8059.79","downloads":{},"revision":2}"#).with_revision_folded();
+    assert_eq!(rebuilt.version, "155.0.8059.79-2");
+    assert_eq!(rebuilt.revision, None);
+    let cached: WayfernVersionInfo =
+      serde_json::from_str(&serde_json::to_string(&rebuilt).unwrap()).unwrap();
+    assert_eq!(cached.with_revision_folded().version, "155.0.8059.79-2");
+  }
+
+  #[test]
+  fn wayfern_slot_for_takes_the_host_build_and_falls_back_only_on_windows_arm() {
+    let downloads = |pairs: &[(&str, Option<&str>)]| {
+      pairs
+        .iter()
+        .map(|(key, url)| (key.to_string(), url.map(str::to_string)))
+        .collect::<std::collections::HashMap<_, _>>()
+    };
+    let both = downloads(&[
+      ("windows-x64", Some("https://d/x64.zip")),
+      ("windows-arm64", Some("https://d/arm64.zip")),
+    ]);
+    assert_eq!(
+      wayfern_slot_for(&both, "windows", "arm64").as_deref(),
+      Some("windows-arm64")
+    );
+    let x64_only = downloads(&[
+      ("windows-x64", Some("https://d/x64.zip")),
+      ("windows-arm64", None),
+      ("linux-x64", Some("https://d/linux-x64.tar.xz")),
+      ("linux-arm64", None),
+    ]);
+    assert_eq!(
+      wayfern_slot_for(&x64_only, "windows", "arm64").as_deref(),
+      Some("windows-x64")
+    );
+    assert_eq!(
+      wayfern_slot_for(&x64_only, "windows", "x64").as_deref(),
+      Some("windows-x64")
+    );
+    assert_eq!(wayfern_slot_for(&x64_only, "linux", "arm64"), None);
+    let with_linux_arm = downloads(&[
+      ("linux-x64", Some("https://d/linux-x64.tar.xz")),
+      ("linux-arm64", Some("https://d/linux-arm64.tar.xz")),
+    ]);
+    assert_eq!(
+      wayfern_slot_for(&with_linux_arm, "linux", "arm64").as_deref(),
+      Some("linux-arm64")
+    );
+    assert_eq!(
+      wayfern_slot_for(&with_linux_arm, "linux", "x64").as_deref(),
+      Some("linux-x64")
+    );
+    let missing = downloads(&[("windows-x64", Some("https://d/x64.zip"))]);
+    assert_eq!(
+      wayfern_slot_for(&missing, "windows", "arm64").as_deref(),
+      Some("windows-x64")
+    );
+    assert_eq!(wayfern_slot_for(&downloads(&[]), "windows", "arm64"), None);
+  }
 
   #[test]
   fn test_version_parsing() {

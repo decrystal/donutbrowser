@@ -3,12 +3,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrent } from "@tauri-apps/plugin-deep-link";
-import { motion } from "motion/react";
-import { useOnborda } from "onborda";
+import { useReducedMotion } from "motion/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AboutDialog } from "@/components/about-dialog";
 import { AccountPage } from "@/components/account-page";
+import type { ChatSeed } from "@/components/agent-chat/workspace";
+import { AgentPage, type AgentView } from "@/components/agent-page";
 import { CloneProfileDialog } from "@/components/clone-profile-dialog";
 import { CloseConfirmDialog } from "@/components/close-confirm-dialog";
 import { CommandPalette } from "@/components/command-palette";
@@ -21,12 +22,17 @@ import { DeleteConfirmationDialog } from "@/components/delete-confirmation-dialo
 import { DeviceCodeVerifyDialog } from "@/components/device-code-verify-dialog";
 import { ExtensionGroupAssignmentDialog } from "@/components/extension-group-assignment-dialog";
 import { ExtensionManagementDialog } from "@/components/extension-management-dialog";
+import { FeedbackDialog } from "@/components/feedback-dialog";
 import { GroupAssignmentDialog } from "@/components/group-assignment-dialog";
 import { GroupManagementDialog } from "@/components/group-management-dialog";
 import HomeHeader from "@/components/home-header";
 import { ImportProfileDialog } from "@/components/import-profile-dialog";
 import { IntegrationsDialog } from "@/components/integrations-dialog";
-import { ONBOARDING_TOUR } from "@/components/onboarding-provider";
+import { LeavePromptDialog } from "@/components/leave-prompt-dialog";
+import { MoveProfilesDialog } from "@/components/move-profiles-dialog";
+import { OnboardingTour, type TourStep } from "@/components/onboarding-tour";
+import { PageTransition } from "@/components/page-transition";
+import { PaidWelcomeDialog } from "@/components/paid-welcome-dialog";
 import { PermissionDialog } from "@/components/permission-dialog";
 import {
   type GateDecision,
@@ -34,63 +40,100 @@ import {
   PreLaunchGateDialog,
 } from "@/components/pre-launch-gate-dialog";
 import { ProfilesDataTable } from "@/components/profile-data-table";
+import { ProfileGroupDragProvider } from "@/components/profile-group-drag";
 import {
   type PasswordDialogMode,
   ProfilePasswordDialog,
 } from "@/components/profile-password-dialog";
+import { ProfilePreviewsPage } from "@/components/profile-previews-page";
 import { ProfileSelectorDialog } from "@/components/profile-selector-dialog";
 import { ProfileSyncDialog } from "@/components/profile-sync-dialog";
 import { ProxyAssignmentDialog } from "@/components/proxy-assignment-dialog";
+import { ProxyDistributionDialog } from "@/components/proxy-distribution-dialog";
 import { ProxyManagementDialog } from "@/components/proxy-management-dialog";
-import { type AppPage, RailNav } from "@/components/rail-nav";
+import { type AppPage, pageDirection, RailNav } from "@/components/rail-nav";
 import { SettingsDialog } from "@/components/settings-dialog";
 import { ShortcutsPage } from "@/components/shortcuts-page";
 import { SyncAllDialog } from "@/components/sync-all-dialog";
 import { SyncConfigDialog } from "@/components/sync-config-dialog";
 import { SyncFollowerDialog } from "@/components/sync-follower-dialog";
+import { SynchronizerPanel } from "@/components/synchronizer-panel";
+import { TableFilterControls } from "@/components/table-controls";
 import { ThankYouDialog } from "@/components/thank-you-dialog";
+import { TipCoachMark } from "@/components/tips/tip-coach-mark";
+import { TipsDialog } from "@/components/tips-dialog";
+import { TotpToolDialog } from "@/components/totp-code";
+import { TrashPage } from "@/components/trash-page";
+import { AutoHeight } from "@/components/ui/auto-height";
 import { WayfernConfigDialog } from "@/components/wayfern-config-dialog";
 import { WayfernTermsDialog } from "@/components/wayfern-terms-dialog";
 import { WelcomeDialog } from "@/components/welcome-dialog";
+import { type WhatsNew, WhatsNewDialog } from "@/components/whats-new-dialog";
 import { WindowResizeWarningDialog } from "@/components/window-resize-warning-dialog";
+import { useAgentConsole } from "@/hooks/use-agent-console";
+import { useAgentAvailability } from "@/hooks/use-agent-tasks";
 import { useAppUpdateNotifications } from "@/hooks/use-app-update-notifications";
 import { useCloudAuth } from "@/hooks/use-cloud-auth";
 import { useCommercialTrial } from "@/hooks/use-commercial-trial";
 import { cookieBotScopeFor, useCookieBot } from "@/hooks/use-cookie-bot";
 import { useGroupEvents } from "@/hooks/use-group-events";
+import { useInterfaceZoom } from "@/hooks/use-interface-zoom";
+import { useKonamiCode } from "@/hooks/use-konami-code";
+import { useDocumentLanguage } from "@/hooks/use-language";
+import { useLaunchNotices } from "@/hooks/use-launch-notices";
 import type { PermissionType } from "@/hooks/use-permissions";
 import { usePermissions } from "@/hooks/use-permissions";
 import { useProfileEvents } from "@/hooks/use-profile-events";
+import { useProfileStatuses } from "@/hooks/use-profile-statuses";
+import { useProfileTableFilters } from "@/hooks/use-profile-table-filters";
 import { useProxyEvents } from "@/hooks/use-proxy-events";
+import { useSiteStorageNotices } from "@/hooks/use-site-storage-notices";
 import { useSyncSessions } from "@/hooks/use-sync-session";
+import { useTips } from "@/hooks/use-tips";
+import { confirmLeave, hasUnsavedChanges } from "@/hooks/use-unsaved-changes";
 import { useUpdateNotifications } from "@/hooks/use-update-notifications";
 import { useVersionUpdater } from "@/hooks/use-version-updater";
 import { useVpnEvents } from "@/hooks/use-vpn-events";
 import { useWayfernTerms } from "@/hooks/use-wayfern-terms";
-import { parseBackendError, translateBackendError } from "@/lib/backend-errors";
-import { canUseCookieBot, getEntitlements } from "@/lib/entitlements";
-import { MOTION_EASE_OUT } from "@/lib/motion";
+import { showProfileWindow } from "@/lib/agent-console";
 import {
-  ONBOARDING_TOUR_CLOSED_EVENT,
-  ONBOARDING_TOUR_FINISHED_EVENT,
-  setOnboardingActive,
-} from "@/lib/onboarding-signal";
+  leaseExpiryTime,
+  parseBackendError,
+  translateBackendError,
+} from "@/lib/backend-errors";
+import { fireSprinkleConfetti } from "@/lib/confetti";
+import {
+  canUseCookieBot,
+  canUseRemoteControl,
+  getEntitlements,
+  isTeamLauncher,
+} from "@/lib/entitlements";
+import { stepInterfaceZoom } from "@/lib/interface-zoom";
+import { setOnboardingActive } from "@/lib/onboarding-signal";
+import { type ProfileSearchContext } from "@/lib/profile-search";
+import { useProxyCountries } from "@/lib/proxy-check-store";
+import { startRemoteSession } from "@/lib/remote-sessions";
 import {
   matchesGroupDigit,
   matchesShortcut,
   SHORTCUTS,
   type ShortcutId,
 } from "@/lib/shortcuts";
+import { notifySystem } from "@/lib/system-notify";
+import type { TipAction } from "@/lib/tips";
 import {
   dismissToast,
   showErrorToast,
   showSuccessToast,
   showSyncProgressToast,
   showToast,
+  showUndoToast,
 } from "@/lib/toast-utils";
+import { playUiSound } from "@/lib/ui-sounds";
 import type {
   BrowserProfile,
   ConsistencyResult,
+  ExtensionGroup,
   PreLaunchChecks,
   SyncSettings,
   WayfernConfig,
@@ -122,6 +165,9 @@ function consistencyFromErrorParams(
     fingerprint_timezone: params?.fingerprintTimezone || null,
     fingerprint_language: params?.fingerprintLanguage || null,
     mismatches: (params?.mismatches ?? "").split(",").filter(Boolean),
+    // Carried through rather than defaulted to empty: a dimension nothing
+    // compared must not be rebuilt here as a dimension that passed.
+    unverified: (params?.unverified ?? "").split(",").filter(Boolean),
   };
 }
 
@@ -132,10 +178,31 @@ interface PendingUrl {
   url: string;
 }
 
+/** The title of each page above its content; the profiles page has none. */
+const PAGE_TITLE_KEYS = {
+  proxies: "pageTitle.proxies",
+  extensions: "pageTitle.extensions",
+  groups: "pageTitle.groups",
+  cookieBot: "pageTitle.cookieBot",
+  agent: "pageTitle.agent",
+  vpns: "pageTitle.vpns",
+  settings: "pageTitle.settings",
+  integrations: "pageTitle.integrations",
+  account: "pageTitle.account",
+  import: "pageTitle.import",
+  shortcuts: "pageTitle.shortcuts",
+  previews: "pageTitle.previews",
+  trash: "pageTitle.trash",
+} as const satisfies Record<Exclude<AppPage, "profiles">, string>;
+
 export default function Home() {
   const { t } = useTranslation();
+  const { zoom: interfaceZoom, setZoom: setInterfaceZoom } = useInterfaceZoom();
+  const [whatsNew, setWhatsNew] = useState<WhatsNew | null>(null);
+  const reducedMotion = useReducedMotion();
   // Mount global version update listener/toasts
   useVersionUpdater();
+  useDocumentLanguage();
 
   // Use the new profile events hook for centralized profile management
   const {
@@ -143,11 +210,16 @@ export default function Home() {
     runningProfiles,
     isLoading: profilesLoading,
     error: profilesError,
+    loadProfiles,
   } = useProfileEvents();
+  useLaunchNotices(profiles);
+  useSiteStorageNotices(profiles);
 
-  // First-run onboarding tour (Onborda).
-  const { startOnborda, setCurrentStep, isOnbordaVisible, currentStep } =
-    useOnborda();
+  // First-run product tour: coach marks on the real controls.
+  const [tour, setTour] = useState<{ open: boolean; step: TourStep }>({
+    open: false,
+    step: 0,
+  });
   const onboardingHandledRef = useRef(false);
   const [welcomeOpen, setWelcomeOpen] = useState(false);
   const [thankYouOpen, setThankYouOpen] = useState(false);
@@ -170,50 +242,29 @@ export default function Home() {
   const handleWelcomeComplete = useCallback(() => {
     setWelcomeOpen(false);
     if (profiles.length === 0) {
-      startOnborda(ONBOARDING_TOUR);
+      setTour({ open: true, step: 0 });
     } else {
       persistOnboardingComplete();
     }
-  }, [persistOnboardingComplete, profiles.length, startOnborda]);
+  }, [persistOnboardingComplete, profiles.length]);
 
-  // Finishing or explicitly skipping the product tour completes the one-shot
-  // onboarding. Only reaching the end triggers the celebration.
-  useEffect(() => {
-    const handleClosed = () => persistOnboardingComplete();
-    const handleFinished = () => setThankYouOpen(true);
-    window.addEventListener(ONBOARDING_TOUR_CLOSED_EVENT, handleClosed);
-    window.addEventListener(ONBOARDING_TOUR_FINISHED_EVENT, handleFinished);
-    return () => {
-      window.removeEventListener(ONBOARDING_TOUR_CLOSED_EVENT, handleClosed);
-      window.removeEventListener(
-        ONBOARDING_TOUR_FINISHED_EVENT,
-        handleFinished,
-      );
-    };
+  // Finishing or skipping the product tour completes the one-shot
+  // onboarding. Only reaching the end earns the celebration.
+  const skipTour = useCallback(() => {
+    setTour((current) => ({ ...current, open: false }));
+    persistOnboardingComplete();
+  }, [persistOnboardingComplete]);
+  const finishTour = useCallback(() => {
+    setTour((current) => ({ ...current, open: false }));
+    persistOnboardingComplete();
+    setThankYouOpen(true);
   }, [persistOnboardingComplete]);
 
   // Suppress the global browser-download toasts while onboarding (welcome or
   // tour) is active — the welcome dialog shows setup progress itself.
   useEffect(() => {
-    setOnboardingActive(welcomeOpen || isOnbordaVisible);
-  }, [welcomeOpen, isOnbordaVisible]);
-
-  // While the tour is visible, keep the body pinned to the left. Onborda calls
-  // scrollIntoView({ inline: "center" }) on the highlighted element; because the
-  // body is overflow-hidden it can still be scrolled programmatically, which
-  // would shove the whole app (rail and all) sideways with no way to scroll
-  // back. The profile table keeps its own scroll container, untouched here.
-  useEffect(() => {
-    if (!isOnbordaVisible) return;
-    const pin = () => {
-      if (document.body.scrollLeft !== 0) document.body.scrollLeft = 0;
-      if (document.documentElement.scrollLeft !== 0)
-        document.documentElement.scrollLeft = 0;
-    };
-    pin();
-    window.addEventListener("scroll", pin, true);
-    return () => window.removeEventListener("scroll", pin, true);
-  }, [isOnbordaVisible]);
+    setOnboardingActive(welcomeOpen || tour.open);
+  }, [welcomeOpen, tour.open]);
 
   // On the very first launch, always show the welcome + commercial-use steps.
   // The completion flag is only persisted after the user finishes or skips the
@@ -239,24 +290,22 @@ export default function Home() {
     })();
   }, [profilesLoading]);
 
-  // Advance from the "create a profile" step to the "DNS blocking" step as soon
-  // as the user's first profile exists (its DNS dropdown is now in the DOM).
+  // The "create a profile" step moves on to "DNS blocking" as soon as the
+  // first profile exists. The coach mark finds the new row's DNS control by
+  // itself once the row renders.
   useEffect(() => {
-    if (isOnbordaVisible && currentStep === 0 && profiles.length > 0) {
-      // Small delay so the new profile row (and its DNS dropdown target) has
-      // mounted before Onborda re-points at it. Owning the timeout here lets
-      // cleanup cancel it if the tour closes, instead of reopening a dismissed
-      // tour when Onborda's delayed setter eventually fires.
-      const timeout = window.setTimeout(() => setCurrentStep(1), 300);
-      return () => window.clearTimeout(timeout);
+    if (tour.open && tour.step === 0 && profiles.length > 0) {
+      setTour({ open: true, step: 1 });
     }
-  }, [isOnbordaVisible, currentStep, profiles.length, setCurrentStep]);
+  }, [tour.open, tour.step, profiles.length]);
 
   const {
     groups: groupsData,
     isLoading: groupsLoading,
     error: groupsError,
+    loadGroups,
   } = useGroupEvents();
+  const profileStatuses = useProfileStatuses();
 
   const {
     storedProxies,
@@ -266,8 +315,42 @@ export default function Home() {
 
   const { vpnConfigs } = useVpnEvents();
 
+  // Extension groups feed both the table's Ext column and the search filter's
+  // `ext:` lookup, so the list is loaded here and handed down rather than
+  // fetched twice. Refreshed when the backend emits 'extensions-changed'
+  // (group rename/create/delete).
+  const [extensionGroups, setExtensionGroups] = useState<ExtensionGroup[]>([]);
+
+  useEffect(() => {
+    let mounted = true;
+    let unlisten: (() => void) | undefined;
+    const load = async () => {
+      try {
+        const data = await invoke<ExtensionGroup[]>("list_extension_groups");
+        if (mounted) setExtensionGroups(data);
+      } catch (e) {
+        console.error("Failed to load extension groups:", e);
+      }
+    };
+    void load();
+    void listen("extensions-changed", () => {
+      void load();
+    }).then((u) => {
+      if (mounted) unlisten = u;
+      else u();
+    });
+    return () => {
+      mounted = false;
+      unlisten?.();
+    };
+  }, []);
+
   // Synchronizer sessions
-  const { getProfileSyncInfo } = useSyncSessions();
+  const {
+    sessions: syncSessions,
+    getProfileSyncInfo,
+    applySession,
+  } = useSyncSessions();
   const [syncLeaderProfile, setSyncLeaderProfile] =
     useState<BrowserProfile | null>(null);
 
@@ -284,8 +367,19 @@ export default function Home() {
   } = useCommercialTrial();
 
   // Cloud auth for cross-OS unlock
-  const { user: cloudUser } = useCloudAuth();
+  const {
+    user: cloudUser,
+    loggedInAt: cloudLoggedInAt,
+    isLoading: cloudAuthLoading,
+  } = useCloudAuth();
   const crossOsUnlocked = getEntitlements(cloudUser).crossOsFingerprints;
+  // Shown once when the commercial trial runs out; modal, so it goes first.
+  const commercialTrialModalOpen =
+    !termsLoading &&
+    termsAccepted === true &&
+    trialStatus?.type === "Expired" &&
+    !trialAcknowledged &&
+    !crossOsUnlocked;
   // Bulk run/stop is a paid (browser automation) feature, matching the
   // /v1/profiles/batch/run API gate. Free/solo users see the bulk Run/Stop
   // actions disabled with a Pro badge.
@@ -294,10 +388,11 @@ export default function Home() {
   // to the shared cookie-bot store too. It is a module singleton, so this costs
   // one more listener and no extra request. This is also what starts the event
   // stream for a user who signs in without restarting the app.
-  const { liveSessions: cookieBotLiveSessions } = useCookieBot(
-    canUseCookieBot(cloudUser),
-    cookieBotScopeFor(cloudUser),
-  );
+  const {
+    liveSessions: cookieBotLiveSessions,
+    schedules: cookieBotSchedules,
+    isLoading: cookieBotLoading,
+  } = useCookieBot(canUseCookieBot(cloudUser), cookieBotScopeFor(cloudUser));
 
   const [selfHostedSyncConfigured, setSelfHostedSyncConfigured] =
     useState(false);
@@ -308,7 +403,9 @@ export default function Home() {
       const hasConfig = Boolean(
         settings.sync_server_url && settings.sync_token,
       );
-      setSelfHostedSyncConfigured(hasConfig && !cloudUser);
+      setSelfHostedSyncConfigured(
+        hasConfig && (settings.source === "self_hosted" || !cloudUser),
+      );
     } catch {
       setSelfHostedSyncConfigured(false);
     }
@@ -321,7 +418,60 @@ export default function Home() {
   const cloudBackupUnlocked = getEntitlements(cloudUser).cloudBackup;
   const syncUnlocked = cloudBackupUnlocked || selfHostedSyncConfigured;
 
+  // Feature tips and the paid-plan welcome wait for a settled app: not the
+  // first-run session, terms accepted, nothing modal in the way. The usage
+  // lists let the inline tip skip a feature the user already has in use.
+  const tipUsage = useMemo(
+    () => ({
+      loaded: !groupsLoading && !proxiesLoading && !cookieBotLoading,
+      profiles,
+      groupCount: groupsData.length,
+      extensionGroupCount: extensionGroups.length,
+      vpnCount: vpnConfigs.length,
+      cookieBotEnrolled:
+        Object.keys(cookieBotSchedules).length > 0 ||
+        Object.keys(cookieBotLiveSessions).length > 0,
+      syncServerConfigured: selfHostedSyncConfigured,
+      proxyIds: storedProxies.map((proxy) => proxy.id),
+    }),
+    [
+      groupsLoading,
+      proxiesLoading,
+      cookieBotLoading,
+      profiles,
+      groupsData.length,
+      extensionGroups.length,
+      vpnConfigs.length,
+      cookieBotSchedules,
+      cookieBotLiveSessions,
+      selfHostedSyncConfigured,
+      storedProxies,
+    ],
+  );
+  const settledLaunch =
+    firstRunOnboarding === false &&
+    !profilesLoading &&
+    !welcomeOpen &&
+    !thankYouOpen &&
+    !tour.open &&
+    !termsLoading &&
+    termsAccepted === true &&
+    !commercialTrialModalOpen;
+
   const [currentPage, setCurrentPage] = useState<AppPage>("profiles");
+  const currentPageRef = useRef(currentPage);
+  currentPageRef.current = currentPage;
+  // Which way the page transition moves: down the rail or back up it.
+  const [pageMove, setPageMove] = useState<{ page: AppPage; dir: 1 | -1 }>({
+    page: currentPage,
+    dir: 1,
+  });
+  if (pageMove.page !== currentPage) {
+    setPageMove({
+      page: currentPage,
+      dir: pageDirection(pageMove.page, currentPage),
+    });
+  }
   const [accountDialogOpen, setAccountDialogOpen] = useState(false);
   // Tracks which tab inside the shared proxy-management page should be active.
   // The VPN rail item routes to the same page but pre-selects the VPN tab.
@@ -331,13 +481,36 @@ export default function Home() {
   const [extensionManagementInitialTab, setExtensionManagementInitialTab] =
     useState<"extensions" | "groups">("extensions");
   const [integrationsInitialTab, setIntegrationsInitialTab] = useState<
-    "api" | "mcp"
+    "api" | "remote"
   >("api");
   const [cookieBotDialogOpen, setCookieBotDialogOpen] = useState(false);
+  const [totpToolOpen, setTotpToolOpen] = useState(false);
   const [cookieBotInitialTab, setCookieBotInitialTab] =
     useState<CookieBotTab>("overview");
+  const [agentDialogOpen, setAgentDialogOpen] = useState(false);
+  // Null until a view is asked for: chats lead when the agent is on.
+  const [agentView, setAgentView] = useState<AgentView | null>(null);
+  const agent = useAgentAvailability(cloudUser);
+  const [chatSeed, setChatSeed] = useState<ChatSeed | null>(null);
   const [createProfileDialogOpen, setCreateProfileDialogOpen] = useState(false);
+  const teamReadOnly = isTeamLauncher(cloudUser);
+  const teamReadOnlyRef = useRef(teamReadOnly);
+  teamReadOnlyRef.current = teamReadOnly;
+  // A launcher's new profile would be refused; say so before the form is
+  // filled in, not after.
+  const openCreateProfile = useCallback(() => {
+    if (teamReadOnlyRef.current) {
+      showErrorToast(t("backendErrors.teamRoleReadOnly"));
+      return;
+    }
+    setCreateProfileDialogOpen(true);
+  }, [t]);
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false);
+  // A settings section to land on, set by a tip's action for one opening.
+  const [settingsInitialSection, setSettingsInitialSection] = useState<
+    string | null
+  >(null);
+  const [trashPageOpen, setTrashPageOpen] = useState(false);
   const [integrationsDialogOpen, setIntegrationsDialogOpen] = useState(false);
   const [importProfileDialogOpen, setImportProfileDialogOpen] = useState(false);
   const [proxyManagementDialogOpen, setProxyManagementDialogOpen] =
@@ -376,6 +549,10 @@ export default function Home() {
   const [selectedProfilesForProxy, setSelectedProfilesForProxy] = useState<
     string[]
   >([]);
+  const [proxyDistributionDialogOpen, setProxyDistributionDialogOpen] =
+    useState(false);
+  const [selectedProfilesForDistribution, setSelectedProfilesForDistribution] =
+    useState<string[]>([]);
   const [selectedProfiles, setSelectedProfiles] = useState<string[]>([]);
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [pendingUrls, setPendingUrls] = useState<PendingUrl[]>([]);
@@ -397,6 +574,14 @@ export default function Home() {
   const [showBulkDeleteConfirmation, setShowBulkDeleteConfirmation] =
     useState(false);
   const [isBulkDeleting, setIsBulkDeleting] = useState(false);
+  // A synced profile another device of this account runs: the take-over
+  // confirmation.
+  const [leaseConflict, setLeaseConflict] = useState<{
+    profile: BrowserProfile;
+    device: string;
+    expiresAt: string;
+  } | null>(null);
+  const [isTakingOver, setIsTakingOver] = useState(false);
   const [syncConfigDialogOpen, setSyncConfigDialogOpen] = useState(false);
   const [deviceCodeDialogOpen, setDeviceCodeDialogOpen] = useState(false);
   const [syncAllDialogOpen, setSyncAllDialogOpen] = useState(false);
@@ -405,6 +590,7 @@ export default function Home() {
     useState<BrowserProfile | null>(null);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [aboutDialogOpen, setAboutDialogOpen] = useState(false);
+  const [feedbackDialogOpen, setFeedbackDialogOpen] = useState(false);
   // Pre-launch gate. Requests queue instead of overwriting a single resolver:
   // a bulk run enqueues one per profile, and every waiter must settle or the
   // Promise.allSettled below it never resolves and the bulk spinner sticks.
@@ -443,6 +629,9 @@ export default function Home() {
   // info dialog. ProfilesDataTable consumes it through controlled props.
   const [profileInfoDialog, setProfileInfoDialog] =
     useState<BrowserProfile | null>(null);
+  const [profileInfoOpenMethod, setProfileInfoOpenMethod] = useState<
+    "pointer" | "keyboard"
+  >("pointer");
   const { isMicrophoneAccessGranted, isCameraAccessGranted, isInitialized } =
     usePermissions();
 
@@ -451,7 +640,20 @@ export default function Home() {
     setSelectedProfiles([]);
   }, []);
 
-  const handleRailNavigate = useCallback((page: AppPage) => {
+  // Run a navigation that unmounts the current page, after the person chose
+  // what happens to unsaved edits on it. With nothing unsaved it runs at
+  // once, in the caller's batch.
+  const guardLeave = useCallback((go: () => void) => {
+    if (!hasUnsavedChanges()) {
+      go();
+      return;
+    }
+    void confirmLeave().then((ok) => {
+      if (ok) go();
+    });
+  }, []);
+
+  const navigateNow = useCallback((page: AppPage) => {
     // Always reset every sub-page-able dialog before opening the next one,
     // so navigating from one rail item to another doesn't stack two
     // sub-pages on top of each other.
@@ -463,6 +665,9 @@ export default function Home() {
     setImportProfileDialogOpen(false);
     setAccountDialogOpen(false);
     setCookieBotDialogOpen(false);
+    setAgentDialogOpen(false);
+    setTrashPageOpen(false);
+    setSettingsInitialSection(null);
 
     setCurrentPage(page);
     switch (page) {
@@ -484,6 +689,9 @@ export default function Home() {
       case "cookieBot":
         setCookieBotDialogOpen(true);
         break;
+      case "agent":
+        setAgentDialogOpen(true);
+        break;
       case "integrations":
         setIntegrationsDialogOpen(true);
         break;
@@ -499,17 +707,176 @@ export default function Home() {
       case "account":
         setAccountDialogOpen(true);
         break;
+      case "trash":
+        setTrashPageOpen(true);
+        break;
       case "shortcuts":
+      case "previews":
         // Plain page render — nothing else to open.
         break;
     }
   }, []);
 
+  const handleRailNavigate = useCallback(
+    (page: AppPage) => {
+      const from = currentPageRef.current;
+      const network = (p: AppPage) => p === "proxies" || p === "vpns";
+      // Same page (or Proxies <-> VPNs, one page with two tabs): nothing
+      // unmounts, so nothing can be lost.
+      if (page === from || (network(page) && network(from))) {
+        navigateNow(page);
+        return;
+      }
+      guardLeave(() => navigateNow(page));
+    },
+    [guardLeave, navigateNow],
+  );
+
+  /** Go to Profiles, then run `then` there; asks first like any navigation. */
+  const goToProfilesThen = useCallback(
+    (then: () => void) => {
+      if (currentPageRef.current === "profiles") {
+        then();
+        return;
+      }
+      guardLeave(() => {
+        navigateNow("profiles");
+        then();
+      });
+    },
+    [guardLeave, navigateNow],
+  );
+
+  /** A sub-page's own back or close: leave it for Profiles. */
+  const closeSubPage = useCallback(
+    (close: () => void) => {
+      guardLeave(() => {
+        close();
+        setCurrentPage("profiles");
+      });
+    },
+    [guardLeave],
+  );
+
+  const openAgentConversation = useCallback(() => {
+    setAgentView("conversation");
+    handleRailNavigate("agent");
+  }, [handleRailNavigate]);
+  const agentConsole = useAgentConsole({
+    onOpenPage: openAgentConversation,
+    pageVisible: currentPage === "agent",
+  });
+
+  const tipsFlow = useTips({
+    cloudUser,
+    accountLoading: cloudAuthLoading,
+    loggedInAt: cloudLoggedInAt,
+    ready: settledLaunch,
+    usage: tipUsage,
+    activity: {
+      page: currentPage,
+      paletteOpen: commandPaletteOpen,
+      searchQuery,
+      totpOpen: totpToolOpen,
+      synchronizing: syncSessions.length > 0,
+    },
+  });
+  const { openTips, closeTips } = tipsFlow;
+
+  const runTipAction = useCallback(
+    (action: TipAction) => {
+      closeTips();
+      switch (action.kind) {
+        case "page":
+          handleRailNavigate(action.page);
+          break;
+        case "settings": {
+          // The navigation clears the section; setting it afterwards in the
+          // same batch is what makes it win.
+          const section = action.section;
+          const open = () => {
+            navigateNow("settings");
+            setSettingsInitialSection(section);
+          };
+          if (currentPageRef.current === "settings") open();
+          else guardLeave(open);
+          break;
+        }
+        case "palette":
+          setCommandPaletteOpen(true);
+          break;
+        case "feedback":
+          setFeedbackDialogOpen(true);
+          break;
+        case "search": {
+          const query = action.query;
+          goToProfilesThen(() => {
+            setSelectedProfiles([]);
+            setSearchQuery(query);
+          });
+          break;
+        }
+        case "createProfile":
+          goToProfilesThen(openCreateProfile);
+          break;
+        case "totp":
+          setTotpToolOpen(true);
+          break;
+      }
+    },
+    [
+      closeTips,
+      handleRailNavigate,
+      navigateNow,
+      guardLeave,
+      goToProfilesThen,
+      openCreateProfile,
+    ],
+  );
+
+  // Set once the launch and stop handlers below exist.
+  const stopAllRunningRef = useRef<() => void>(() => {});
+
+  const focusProfileSearch = useCallback(() => {
+    const focus = () => {
+      const input = document.getElementById("profile-search-input");
+      if (!(input instanceof HTMLInputElement)) return;
+      if (document.activeElement === input) return;
+      input.focus();
+      input.select();
+    };
+    goToProfilesThen(() => {
+      // The page may mount this frame, and a closing palette hands focus
+      // back to its trigger a moment later: keep it on the search box.
+      for (let delay = 0; delay <= 360; delay += 60) {
+        window.setTimeout(focus, delay);
+      }
+    });
+  }, [goToProfilesThen]);
+
   const runShortcut = useCallback(
     (id: ShortcutId) => {
       switch (id) {
+        case "newProfile":
+          openCreateProfile();
+          break;
+        case "stopAllRunning":
+          stopAllRunningRef.current();
+          break;
+        case "focusSearch":
+          focusProfileSearch();
+          break;
+        case "goBack":
+          handleRailNavigate("profiles");
+          break;
         case "openPalette":
           setCommandPaletteOpen(true);
+          break;
+        case "openTips":
+          openTips();
+          break;
+        case "sendFeedback":
+          setFeedbackDialogOpen(true);
           break;
         case "openShortcuts":
           handleRailNavigate("shortcuts");
@@ -521,7 +888,7 @@ export default function Home() {
           handleRailNavigate("profiles");
           break;
         case "goProxies": {
-          // Mod+N: navigate first time; flip proxies↔vpns on subsequent presses.
+          // Mod+Shift+N: navigate first time; flip proxies↔vpns on subsequent presses.
           // handleRailNavigate("proxies"|"vpns") already updates the dialog's
           // initialTab, so we just pick the right destination.
           if (currentPage === "proxies") {
@@ -562,10 +929,38 @@ export default function Home() {
           }
           break;
         }
+        case "goAgent": {
+          // Mod+J: navigate first time; flip chats↔connected agents (or,
+          // without the agent, conversation↔activity) while already there,
+          // matching how Mod+B flips the Cookie Bot tabs.
+          if (currentPage === "agent") {
+            setAgentView((cur) =>
+              agent.entitled
+                ? (cur ?? "chat") === "chat"
+                  ? "conversation"
+                  : "chat"
+                : cur === "conversation" || cur === null
+                  ? "activity"
+                  : "conversation",
+            );
+          } else if (agent.entitled) {
+            setAgentView("chat");
+            handleRailNavigate("agent");
+          } else {
+            openAgentConversation();
+          }
+          break;
+        }
         case "goIntegrations": {
-          // Mod+I: flip api↔mcp tab when already on integrations.
+          // Mod+I: flip the tabs when already on integrations. The Remote MCP
+          // tab only exists for a user entitled to remote control, so everyone
+          // else stays on the API tab.
           if (currentPage === "integrations") {
-            setIntegrationsInitialTab((cur) => (cur === "api" ? "mcp" : "api"));
+            setIntegrationsInitialTab((cur) =>
+              cur === "api" && canUseRemoteControl(cloudUser)
+                ? "remote"
+                : "api",
+            );
           } else {
             handleRailNavigate("integrations");
           }
@@ -577,9 +972,40 @@ export default function Home() {
         case "goSettings":
           handleRailNavigate("settings");
           break;
+        case "goTrash":
+          handleRailNavigate("trash");
+          break;
+        case "openTotp":
+          setTotpToolOpen(true);
+          break;
+        case "zoomIn":
+        case "zoomOut":
+        case "zoomReset":
+          void setInterfaceZoom(
+            stepInterfaceZoom(
+              interfaceZoom,
+              id === "zoomIn" ? 1 : id === "zoomOut" ? -1 : 0,
+            ),
+          ).catch((error: unknown) => {
+            showErrorToast(translateBackendError(t, error));
+          });
+          break;
       }
     },
-    [handleRailNavigate, currentPage, proxyManagementInitialTab],
+    [
+      interfaceZoom,
+      setInterfaceZoom,
+      t,
+      handleRailNavigate,
+      currentPage,
+      proxyManagementInitialTab,
+      cloudUser,
+      openTips,
+      openAgentConversation,
+      agent.entitled,
+      openCreateProfile,
+      focusProfileSearch,
+    ],
   );
 
   // Ordered list the digit shortcuts and palette consume. "__all__" is index 1
@@ -596,10 +1022,9 @@ export default function Home() {
     (digit: number) => {
       const target = orderedGroupTargets[digit - 1];
       if (!target) return;
-      handleRailNavigate("profiles");
-      handleSelectGroup(target.id);
+      goToProfilesThen(() => handleSelectGroup(target.id));
     },
-    [orderedGroupTargets, handleRailNavigate, handleSelectGroup],
+    [orderedGroupTargets, goToProfilesThen, handleSelectGroup],
   );
 
   useEffect(() => {
@@ -629,7 +1054,26 @@ export default function Home() {
         if (isTyping && s.id !== "openPalette" && s.id !== "openShortcuts") {
           return;
         }
+        if (s.id === "goBack") {
+          // Escape leaves a sub-page only when nothing on it took the key:
+          // an open dialog, popover, menu or table selection goes first.
+          if (
+            e.defaultPrevented ||
+            e.repeat ||
+            currentPageRef.current === "profiles" ||
+            document.querySelector(
+              '[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"], [data-radix-popper-content-wrapper], [data-slot="table-action-bar"]',
+            )
+          ) {
+            return;
+          }
+          e.preventDefault();
+          playUiSound("close");
+          runShortcut(s.id);
+          return;
+        }
         e.preventDefault();
+        playUiSound("open");
         runShortcut(s.id);
         return;
       }
@@ -639,6 +1083,19 @@ export default function Home() {
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [runShortcut, selectGroupByDigit, orderedGroupTargets.length]);
+
+  // The classic cheat code pays out in sprinkles. Nothing else changes: it
+  // touches no profile, setting, or file, so it is safe anywhere in the app.
+  useKonamiCode(
+    useCallback(() => {
+      showSuccessToast(t("easterEgg.konami.title"), {
+        id: "cheat-code",
+        description: t("easterEgg.konami.description"),
+      });
+      window.dispatchEvent(new CustomEvent("donut-cheat-code"));
+      if (!reducedMotion) fireSprinkleConfetti();
+    }, [reducedMotion, t]),
+  );
 
   // Check for missing binaries and offer to download them
   const checkMissingBinaries = useCallback(async () => {
@@ -746,7 +1203,7 @@ export default function Home() {
   const updateNotifications = useUpdateNotifications();
   const { checkForUpdates, isUpdating } = updateNotifications;
 
-  useAppUpdateNotifications();
+  const appUpdate = useAppUpdateNotifications();
 
   // Check for startup URLs but only process them once
   const [hasCheckedStartupUrl, setHasCheckedStartupUrl] = useState(false);
@@ -810,10 +1267,9 @@ export default function Home() {
   const checkNextPermission = useCallback(
     (justGranted?: PermissionType) => {
       try {
-        // Treat the just-granted permission as already granted even if our
-        // own usePermissions instance hasn't observed it yet — it polls on a
-        // 5 s cadence and would otherwise leave the dialog stuck on the
-        // permission the user just successfully granted.
+        // Treat the just-granted permission as granted even when this
+        // callback's state does not show it yet, so the dialog never stays
+        // on the permission the user just granted.
         const micGranted =
           isMicrophoneAccessGranted || justGranted === "microphone";
         const camGranted = isCameraAccessGranted || justGranted === "camera";
@@ -877,7 +1333,7 @@ export default function Home() {
             event.payload,
           );
           showErrorToast(t("errors.noProfilesForUrl"));
-          setCreateProfileDialogOpen(true);
+          if (!teamReadOnlyRef.current) setCreateProfileDialogOpen(true);
         }),
       );
 
@@ -915,13 +1371,10 @@ export default function Home() {
         setWayfernConfigDialogOpen(false);
       } catch (err: unknown) {
         console.error("Failed to update wayfern config:", err);
-        showErrorToast(
-          t("errors.updateWayfernConfigFailed", { error: JSON.stringify(err) }),
-        );
         throw err;
       }
     },
-    [t],
+    [],
   );
 
   const handleCreateProfile = useCallback(
@@ -933,10 +1386,13 @@ export default function Home() {
       proxyId?: string;
       vpnId?: string;
       wayfernConfig?: WayfernConfig;
-      groupId?: string;
+      /** `null`: the person picked "No group" in the create dialog. */
+      groupId?: string | null;
       extensionGroupId?: string;
       ephemeral?: boolean;
       dnsBlocklist?: string;
+      dnsServer?: string;
+      startUrls?: string[];
       launchHook?: string;
       password?: string;
     }) => {
@@ -952,13 +1408,17 @@ export default function Home() {
             vpnId: profileData.vpnId,
             wayfernConfig: profileData.wayfernConfig,
             groupId:
-              profileData.groupId ??
-              (selectedGroupId && selectedGroupId !== "__all__"
-                ? selectedGroupId
-                : undefined),
+              profileData.groupId === null
+                ? undefined
+                : (profileData.groupId ??
+                  (selectedGroupId && selectedGroupId !== "__all__"
+                    ? selectedGroupId
+                    : undefined)),
             ephemeral: profileData.ephemeral,
             dnsBlocklist: profileData.dnsBlocklist,
+            dnsServer: profileData.dnsServer,
             launchHook: profileData.launchHook,
+            startUrls: profileData.startUrls,
           },
         );
 
@@ -1030,6 +1490,57 @@ export default function Home() {
     };
   }, [t]);
 
+  useEffect(() => {
+    const unlisten = listen<{ profile_name: string; error: string }>(
+      "profile-launch-args-skipped",
+      (event) => {
+        showErrorToast(
+          t("fingerprint.launchArgsSkipped", {
+            profile: event.payload.profile_name,
+            reason: translateBackendError(t, event.payload.error),
+          }),
+          { id: `launch-args-skipped-${event.payload.profile_name}` },
+        );
+      },
+    );
+    return () => {
+      void unlisten.then((fn) => {
+        fn();
+      });
+    };
+  }, [t]);
+
+  // The third state. The gate reached the exit but the fingerprint declares no
+  // value to compare it against, so nothing was verified, which is not a
+  // mismatch and never blocks, but is not the clean bill of health that
+  // reporting nothing would imply.
+  useEffect(() => {
+    const unlisten = listen<ConsistencyResult>(
+      "fingerprint-consistency-unverified",
+      (event) => {
+        const { unverified, exit_timezone, exit_country_code } = event.payload;
+        if (unverified.length === 0) {
+          return;
+        }
+        showErrorToast(t("consistencyWarning.unverifiedTitle"), {
+          description: unverified.includes("timezone")
+            ? t("consistencyWarning.unverifiedTimezoneDetail", {
+                exit: exit_timezone ?? exit_country_code ?? "?",
+              })
+            : t("consistencyWarning.unverifiedLanguageDetail", {
+                country: exit_country_code ?? "?",
+              }),
+          id: `fingerprint-unverified-${unverified.join("-")}`,
+        });
+      },
+    );
+    return () => {
+      void unlisten.then((fn) => {
+        fn();
+      });
+    };
+  }, [t]);
+
   // Show the queue's head, and how many are waiting behind it.
   const syncGateUi = useCallback(() => {
     const queue = gateQueueRef.current;
@@ -1059,6 +1570,7 @@ export default function Home() {
           ackExtensionKeys: [],
         });
       }
+      playUiSound("warning");
       return new Promise<GateDecision>((resolve) => {
         gateRequestSeqRef.current += 1;
         gateQueueRef.current.push({
@@ -1145,10 +1657,29 @@ export default function Home() {
     [],
   );
 
+  // The raw error of each profile's last failed launch, shown by the table.
+  // An entry goes when that profile launches.
+  const [launchErrors, setLaunchErrors] = useState<Record<string, string>>({});
+  const noteLaunchError = useCallback((profileId: string, err: unknown) => {
+    setLaunchErrors((current) => {
+      if (err === null) {
+        if (!(profileId in current)) return current;
+        const next = { ...current };
+        delete next[profileId];
+        return next;
+      }
+      return {
+        ...current,
+        [profileId]: err instanceof Error ? err.message : String(err),
+      };
+    });
+  }, []);
+
   const launchProfile = useCallback(
     async (
       profile: BrowserProfile,
-      opts?: { bulkRunId?: number },
+      // `quiet`: a bulk run reports failures in one summary instead.
+      opts?: { bulkRunId?: number; quiet?: boolean },
     ): Promise<LaunchResult> => {
       console.log("Starting launch for profile:", profile.name);
 
@@ -1226,7 +1757,12 @@ export default function Home() {
         localChecks = checks;
         const blocked =
           checks.consistency.checked && !checks.consistency.consistent;
-        if (blocked || checks.vpn_extensions.length > 0) {
+        if (
+          blocked ||
+          checks.vpn_extensions.length > 0 ||
+          checks.route_unreachable ||
+          checks.route_missing
+        ) {
           const decision = await requestGateDecision(
             {
               profile,
@@ -1236,6 +1772,9 @@ export default function Home() {
                 fingerprint: blocked ? checks.consistency : null,
                 measurementUnreliable: checks.exit_measurement_unreliable,
                 probePending: checks.exit_probe_pending,
+                unverified: checks.exit_unverified,
+                routeUnreachable: checks.route_unreachable ?? null,
+                routeMissing: checks.route_missing ?? false,
               },
             },
             opts?.bulkRunId,
@@ -1253,12 +1792,15 @@ export default function Home() {
         console.warn("Pre-launch checks failed, launching anyway:", err);
       }
 
+      const causedAt = performance.now();
       try {
         const result = await invoke<BrowserProfile>("launch_browser_profile", {
           profile,
           consentToken,
         });
         console.log("Successfully launched profile:", result.name);
+        playUiSound("launch", { causedAt, batch: opts?.bulkRunId });
+        noteLaunchError(profile.id, null);
         return { status: "launched" };
       } catch (err: unknown) {
         // Tier 2: the enforcing gate measured the exit mid-launch and stopped
@@ -1266,6 +1808,10 @@ export default function Home() {
         // exactly once with the token it minted — bounded, so a gate loop is
         // structurally impossible.
         const parsed = parseBackendError(err);
+        if (parsed?.code === "LAUNCH_CANCELLED") {
+          noteLaunchError(profile.id, null);
+          return { status: "cancelled" };
+        }
         if (parsed?.code === "FINGERPRINT_EXIT_MISMATCH") {
           const decision = await requestGateDecision(
             {
@@ -1279,6 +1825,7 @@ export default function Home() {
                 measurementUnreliable:
                   localChecks?.exit_measurement_unreliable ?? false,
                 probePending: false,
+                unverified: localChecks?.exit_unverified ?? [],
               },
             },
             opts?.bulkRunId,
@@ -1288,31 +1835,103 @@ export default function Home() {
             return { status: "cancelled" };
           }
           try {
+            const retriedAt = performance.now();
             await invoke<BrowserProfile>("launch_browser_profile", {
               profile,
               consentToken: parsed.params?.token ?? null,
             });
+            playUiSound("launch", {
+              causedAt: retriedAt,
+              batch: opts?.bulkRunId,
+            });
+            noteLaunchError(profile.id, null);
             return { status: "launched" };
           } catch (retryErr: unknown) {
-            showErrorToast(
-              t("errors.launchBrowserFailed", {
-                error: translateBackendError(t, retryErr),
-              }),
-            );
+            noteLaunchError(profile.id, retryErr);
+            if (!opts?.quiet) {
+              showErrorToast(
+                t("errors.launchBrowserFailed", {
+                  name: profile.name,
+                  error: translateBackendError(t, retryErr),
+                }),
+              );
+            }
             return { status: "blocked" };
           }
         }
 
+        if (
+          parsed?.code === "PROFILE_LEASE_HELD" &&
+          parsed.params?.canTakeOver === "true" &&
+          !opts?.quiet
+        ) {
+          noteLaunchError(profile.id, err);
+          setLeaseConflict({
+            profile,
+            device: parsed.params.device ?? "",
+            expiresAt: parsed.params.expiresAt ?? "",
+          });
+          return { status: "blocked" };
+        }
+
         console.error("Failed to launch browser:", err);
-        const errorMessage = translateBackendError(t, err);
-        showErrorToast(
-          t("errors.launchBrowserFailed", { error: errorMessage }),
-        );
+        noteLaunchError(profile.id, err);
+        if (!opts?.quiet) {
+          showErrorToast(
+            t("errors.launchBrowserFailed", {
+              name: profile.name,
+              error: translateBackendError(t, err),
+            }),
+          );
+        }
         throw err;
       }
     },
-    [persistGateAcks, requestGateDecision, t],
+    [persistGateAcks, requestGateDecision, noteLaunchError, t],
   );
+
+  const confirmLeaseTakeOver = useCallback(async () => {
+    if (!leaseConflict) return;
+    const { profile } = leaseConflict;
+    setIsTakingOver(true);
+    try {
+      await invoke("take_over_profile_lease", { profileId: profile.id });
+      setLeaseConflict(null);
+      // launchProfile reports its own failure.
+      await launchProfile(profile).catch(() => undefined);
+    } catch (err: unknown) {
+      setLeaseConflict(null);
+      showErrorToast(
+        t("errors.launchBrowserFailed", {
+          name: profile.name,
+          error: translateBackendError(t, err),
+        }),
+      );
+    } finally {
+      setIsTakingOver(false);
+    }
+  }, [leaseConflict, launchProfile, t]);
+
+  useEffect(() => {
+    const unlisten = listen<{
+      profile_id: string;
+      profile_name: string;
+      device: string;
+    }>("profile-sync-lease-lost", (event) => {
+      showErrorToast(
+        t("leaseTakeOver.lost", {
+          device: event.payload.device,
+          profile: event.payload.profile_name,
+        }),
+        { id: `lease-lost-${event.payload.profile_id}` },
+      );
+    });
+    return () => {
+      void unlisten.then((fn) => {
+        fn();
+      });
+    };
+  }, [t]);
 
   const handleCloneProfile = useCallback((profile: BrowserProfile) => {
     setCloneProfile(profile);
@@ -1336,10 +1955,52 @@ export default function Home() {
     setPasswordDialogProfile(profile);
   }, []);
 
+  // The Undo of a move to the trash.
+  const restoreFromTrash = useCallback(
+    async (profileIds: string[]) => {
+      const results = await Promise.allSettled(
+        profileIds.map((profileId) =>
+          invoke("restore_trashed_profile", { profileId }),
+        ),
+      );
+      const failure = results.find(
+        (result): result is PromiseRejectedResult =>
+          result.status === "rejected",
+      );
+      if (failure) {
+        showErrorToast(
+          t("trash.restoreFailed", {
+            error: translateBackendError(t, failure.reason),
+          }),
+        );
+      }
+    },
+    [t],
+  );
+
+  /**
+   * A move to the trash needs no question: it is done, and the toast offers
+   * Undo. Ephemeral profiles have no trash; the table confirms those first.
+   */
+  const announceTrashed = useCallback(
+    (trashed: BrowserProfile[]) => {
+      const recoverable = trashed.filter((profile) => !profile.ephemeral);
+      if (recoverable.length === 0) {
+        playUiSound("trash");
+        return;
+      }
+      showUndoToast(
+        recoverable.length === 1
+          ? t("profiles.trash.moved", { name: recoverable[0].name })
+          : t("profiles.trash.movedMany", { count: recoverable.length }),
+        () => restoreFromTrash(recoverable.map((profile) => profile.id)),
+      );
+    },
+    [restoreFromTrash, t],
+  );
+
   const handleDeleteProfile = useCallback(
     async (profile: BrowserProfile) => {
-      console.log("Attempting to delete profile:", profile.name);
-
       try {
         // First check if the browser is running for this profile
         const isRunning = await invoke<boolean>("check_browser_status", {
@@ -1351,21 +2012,19 @@ export default function Home() {
           return;
         }
 
-        // Attempt to delete the profile
         await invoke("delete_profile", { profileId: profile.id });
-        console.log("Profile deletion command completed successfully");
-
-        // No need to manually reload - useProfileEvents will handle the update
-        console.log("Profile deleted successfully");
+        // useProfileEvents refreshes the list.
+        announceTrashed([profile]);
       } catch (err: unknown) {
         console.error("Failed to delete profile:", err);
-        const errorMessage = err instanceof Error ? err.message : String(err);
         showErrorToast(
-          t("errors.deleteProfileFailed", { error: errorMessage }),
+          t("errors.deleteProfileFailed", {
+            error: translateBackendError(t, err),
+          }),
         );
       }
     },
-    [t],
+    [announceTrashed, t],
   );
 
   const handleRenameProfile = useCallback(
@@ -1376,7 +2035,9 @@ export default function Home() {
       } catch (err: unknown) {
         console.error("Failed to rename profile:", err);
         showErrorToast(
-          t("errors.renameProfileFailed", { error: JSON.stringify(err) }),
+          t("errors.renameProfileFailed", {
+            error: translateBackendError(t, err),
+          }),
         );
         throw err;
       }
@@ -1385,17 +2046,21 @@ export default function Home() {
   );
 
   const handleKillProfile = useCallback(
-    async (profile: BrowserProfile) => {
+    async (profile: BrowserProfile, opts?: { batch?: number }) => {
       console.log("Starting kill for profile:", profile.name);
 
       try {
         await invoke("kill_browser_profile", { profile });
+        playUiSound("stop", { batch: opts?.batch });
         console.log("Successfully killed profile:", profile.name);
         // No need to manually reload - useProfileEvents will handle the update
       } catch (err: unknown) {
         console.error("Failed to kill browser:", err);
-        const errorMessage = err instanceof Error ? err.message : String(err);
-        showErrorToast(t("errors.killBrowserFailed", { error: errorMessage }));
+        showErrorToast(
+          t("errors.killBrowserFailed", {
+            error: translateBackendError(t, err),
+          }),
+        );
         // Re-throw the error so the table component can handle loading state cleanup
         throw err;
       }
@@ -1405,19 +2070,23 @@ export default function Home() {
 
   const handleDeleteSelectedProfiles = useCallback(
     async (profileIds: string[]) => {
+      const targets = profiles.filter((profile) =>
+        profileIds.includes(profile.id),
+      );
       try {
         await invoke("delete_selected_profiles", { profileIds });
-        // No need to manually reload - useProfileEvents will handle the update
+        // useProfileEvents refreshes the list.
+        announceTrashed(targets);
       } catch (err: unknown) {
         console.error("Failed to delete selected profiles:", err);
         showErrorToast(
           t("errors.deleteSelectedProfilesFailed", {
-            error: JSON.stringify(err),
+            error: translateBackendError(t, err),
           }),
         );
       }
     },
-    [t],
+    [profiles, announceTrashed, t],
   );
 
   const handleAssignProfilesToGroup = useCallback((profileIds: string[]) => {
@@ -1425,33 +2094,89 @@ export default function Home() {
     setGroupAssignmentDialogOpen(true);
   }, []);
 
-  const handleBulkDelete = useCallback(() => {
-    if (selectedProfiles.length === 0) return;
-    setShowBulkDeleteConfirmation(true);
-  }, [selectedProfiles]);
+  const handleDropProfilesToGroup = useCallback(
+    async (profileIds: string[], groupId: string | null) => {
+      const targets = profiles.filter((profile) =>
+        profileIds.includes(profile.id),
+      );
+      if (
+        targets.length !== profileIds.length ||
+        targets.some(
+          (profile) =>
+            profile.process_id != null || runningProfiles.has(profile.id),
+        ) ||
+        (groupId !== null && !groupsData.some((group) => group.id === groupId))
+      ) {
+        showErrorToast(t("profileMotion.dragUnavailable"));
+        return false;
+      }
+      try {
+        await invoke("assign_profiles_to_group", { profileIds, groupId });
+        setSelectedProfiles((selected) =>
+          selected.filter((id) => !profileIds.includes(id)),
+        );
+        showSuccessToast(
+          t("groups.assignSuccess", {
+            count: profileIds.length,
+            group:
+              groupsData.find((group) => group.id === groupId)?.name ??
+              t("groups.noGroup"),
+          }),
+          { sound: "drop" },
+        );
+        return true;
+      } catch (error) {
+        showErrorToast(translateBackendError(t, error));
+        return false;
+      } finally {
+        // The backend can reject after writing an earlier member of the batch.
+        // Refresh both views even on failure so counts and placement stay true.
+        await Promise.allSettled([loadProfiles(), loadGroups()]);
+      }
+    },
+    [profiles, runningProfiles, groupsData, loadProfiles, loadGroups, t],
+  );
 
   const confirmBulkDelete = useCallback(async () => {
     if (selectedProfiles.length === 0) return;
+    const targets = profiles.filter((profile) =>
+      selectedProfiles.includes(profile.id),
+    );
 
     setIsBulkDeleting(true);
     try {
       await invoke("delete_selected_profiles", {
         profileIds: selectedProfiles,
       });
-      // No need to manually reload - useProfileEvents will handle the update
+      // useProfileEvents refreshes the list.
       setSelectedProfiles([]);
       setShowBulkDeleteConfirmation(false);
+      announceTrashed(targets);
     } catch (error) {
       console.error("Failed to delete selected profiles:", error);
       showErrorToast(
         t("errors.deleteSelectedProfilesFailed", {
-          error: JSON.stringify(error),
+          error: translateBackendError(t, error),
         }),
       );
     } finally {
       setIsBulkDeleting(false);
     }
-  }, [selectedProfiles, t]);
+  }, [selectedProfiles, profiles, announceTrashed, t]);
+
+  // To the trash at once, with Undo. Only an ephemeral profile, which is
+  // destroyed for good, still asks first.
+  const handleBulkDelete = useCallback(() => {
+    if (selectedProfiles.length === 0) return;
+    const permanent = profiles.some(
+      (profile) => selectedProfiles.includes(profile.id) && profile.ephemeral,
+    );
+    if (permanent) {
+      setShowBulkDeleteConfirmation(true);
+      return;
+    }
+    void confirmBulkDelete();
+  }, [selectedProfiles, profiles, confirmBulkDelete]);
 
   const handleBulkGroupAssignment = useCallback(() => {
     if (selectedProfiles.length === 0) return;
@@ -1486,6 +2211,12 @@ export default function Home() {
     setSelectedProfiles([]);
   }, [selectedProfiles, handleAssignProfilesToProxy]);
 
+  const handleBulkProxyDistribution = useCallback(() => {
+    if (selectedProfiles.length === 0) return;
+    setSelectedProfilesForDistribution(selectedProfiles);
+    setProxyDistributionDialogOpen(true);
+  }, [selectedProfiles]);
+
   const handleBulkCopyCookies = useCallback(() => {
     if (selectedProfiles.length === 0) return;
     const eligibleProfiles = profiles.filter(
@@ -1507,34 +2238,148 @@ export default function Home() {
   } | null>(null);
   const [isBulkActing, setIsBulkActing] = useState(false);
 
+  // Set once the table filters exist: shows and selects the given profiles.
+  const showProfilesRef = useRef<(profileIds: string[]) => void>(() => {});
+
+  /**
+   * Launch many profiles: at most `bulk_launch_concurrency` at a time, with
+   * `bulk_launch_delay_ms` between starts, behind a progress toast whose
+   * Cancel drops the launches not started yet. Failures are reported once,
+   * in a summary that can show the failed profiles.
+   */
   const executeBulkRun = useCallback(
     async (targets: BrowserProfile[]) => {
       setIsBulkActing(true);
       blanketGateDecisionRef.current = null;
       bulkRunIdRef.current += 1;
       const runId = bulkRunIdRef.current;
+      const total = targets.length;
+      const toastId = `bulk-launch-${runId}`;
+      const startedAt = Date.now();
+      let cancelled = false;
+      let delayMs = 800;
+      let concurrency = 3;
       try {
-        const results = await Promise.allSettled(
-          targets.map((p) => launchProfile(p, { bulkRunId: runId })),
+        const settings = await invoke<{
+          bulk_launch_delay_ms?: number;
+          bulk_launch_concurrency?: number;
+        }>("get_app_settings");
+        delayMs = Math.min(
+          Math.max(settings.bulk_launch_delay_ms ?? delayMs, 0),
+          60000,
         );
-        const stopped = results.filter(
-          (r) => r.status === "fulfilled" && r.value.status !== "launched",
-        ).length;
-        if (stopped > 0) {
-          // Previously a declined launch resolved to undefined, so allSettled
-          // reported success and the user was told nothing.
-          showErrorToast(
-            t("prelaunchGate.cancelledSummary", {
-              cancelled: stopped,
-              total: targets.length,
-            }),
-          );
+        concurrency = Math.min(
+          Math.max(settings.bulk_launch_concurrency ?? concurrency, 1),
+          20,
+        );
+      } catch (err) {
+        console.warn("Bulk launch settings unavailable, using defaults:", err);
+      }
+
+      let started = 0;
+      let done = 0;
+      let declined = 0;
+      const failed: BrowserProfile[] = [];
+      const showProgress = () => {
+        if (total < 2 || cancelled) return;
+        showToast({
+          id: toastId,
+          type: "loading",
+          title: t("profiles.bulkRun.progress", { done, total }),
+          duration: Number.POSITIVE_INFINITY,
+          onCancel: () => {
+            cancelled = true;
+            dismissToast(toastId);
+          },
+        });
+      };
+
+      let next = 0;
+      let nextStartAt = 0;
+      const worker = async () => {
+        while (next < total && !cancelled) {
+          const profile = targets[next];
+          next += 1;
+          // Starts are spaced across all workers, not per worker.
+          const startAt = Math.max(Date.now(), nextStartAt);
+          nextStartAt = startAt + delayMs;
+          const wait = startAt - Date.now();
+          if (wait > 0) {
+            await new Promise((resolve) => window.setTimeout(resolve, wait));
+          }
+          if (cancelled) return;
+          started += 1;
+          try {
+            const result = await launchProfile(profile, {
+              bulkRunId: runId,
+              quiet: true,
+            });
+            if (result.status === "blocked") failed.push(profile);
+            else if (result.status === "cancelled") declined += 1;
+          } catch {
+            failed.push(profile);
+          }
+          done += 1;
+          showProgress();
         }
-        setSelectedProfiles([]);
+      };
+
+      try {
+        showProgress();
+        await Promise.all(
+          Array.from({ length: Math.min(concurrency, total) }, worker),
+        );
       } finally {
+        dismissToast(toastId);
         blanketGateDecisionRef.current = null;
         setIsBulkActing(false);
         setPendingBulkAction(null);
+      }
+
+      if (failed.length > 0) {
+        const failedIds = failed.map((profile) => profile.id);
+        const names = failed.slice(0, 3).map((profile) => profile.name);
+        showErrorToast(
+          t("profiles.bulkRun.failedSummary", {
+            failed: failed.length,
+            total,
+          }),
+          {
+            id: `bulk-launch-failed-${runId}`,
+            description:
+              failed.length > names.length
+                ? `${names.join(", ")}, …`
+                : names.join(", "),
+            action: {
+              label: t("profiles.bulkRun.showFailed"),
+              onClick: () => showProfilesRef.current(failedIds),
+            },
+          },
+        );
+      }
+      if (declined > 0) {
+        // A declined launch is no failure, but the person is told about it.
+        showErrorToast(
+          t("prelaunchGate.cancelledSummary", { cancelled: declined, total }),
+        );
+      }
+      if (cancelled && started < total) {
+        showToast({
+          type: "info",
+          title: t("profiles.bulkRun.notStarted", {
+            count: total - started,
+            total,
+          }),
+        });
+      }
+      if (Date.now() - startedAt >= 10_000) {
+        void notifySystem({
+          title: t("profiles.bulkRun.finishedTitle"),
+          body: t("profiles.bulkRun.finishedBody", {
+            launched: started - failed.length - declined,
+            total,
+          }),
+        });
       }
     },
     [launchProfile, t],
@@ -1543,9 +2388,11 @@ export default function Home() {
   const executeBulkStop = useCallback(
     async (targets: BrowserProfile[]) => {
       setIsBulkActing(true);
+      const batch = performance.now();
       try {
-        await Promise.allSettled(targets.map((p) => handleKillProfile(p)));
-        setSelectedProfiles([]);
+        await Promise.allSettled(
+          targets.map((p) => handleKillProfile(p, { batch })),
+        );
       } finally {
         setIsBulkActing(false);
         setPendingBulkAction(null);
@@ -1553,6 +2400,29 @@ export default function Home() {
     },
     [handleKillProfile],
   );
+
+  const stopAllRunning = useCallback(() => {
+    const targets = profiles.filter((p) => runningProfiles.has(p.id));
+    if (targets.length === 0) {
+      showToast({ type: "info", title: t("profiles.stopAll.none") });
+      return;
+    }
+    void executeBulkStop(targets);
+  }, [profiles, runningProfiles, executeBulkStop, t]);
+  stopAllRunningRef.current = stopAllRunning;
+
+  // A profile that runs, however it was started, has no launch error left.
+  useEffect(() => {
+    setLaunchErrors((current) => {
+      const cleared = Object.keys(current).filter((id) =>
+        runningProfiles.has(id),
+      );
+      if (cleared.length === 0) return current;
+      const next = { ...current };
+      for (const id of cleared) delete next[id];
+      return next;
+    });
+  }, [runningProfiles]);
 
   // Bulk run/stop only touch eligible profiles (run: not already running;
   // stop: currently running). An empty result shows a toast instead of a silent
@@ -1572,6 +2442,27 @@ export default function Home() {
     }
     void executeBulkRun(targets);
   }, [selectedProfiles, profiles, runningProfiles, executeBulkRun, t]);
+
+  const handleAskAgent = useCallback(
+    (profileId: string | null) => {
+      setChatSeed((current) => ({
+        profileIds: profileId ? [profileId] : [],
+        nonce: (current?.nonce ?? 0) + 1,
+      }));
+      setAgentView("chat");
+      handleRailNavigate("agent");
+    },
+    [handleRailNavigate],
+  );
+
+  const handleRunAgentTask = useCallback(() => {
+    setChatSeed((current) => ({
+      profileIds: [...selectedProfiles],
+      nonce: (current?.nonce ?? 0) + 1,
+    }));
+    setAgentView("chat");
+    handleRailNavigate("agent");
+  }, [selectedProfiles, handleRailNavigate]);
 
   const handleBulkStop = useCallback(() => {
     if (selectedProfiles.length === 0) return;
@@ -1638,12 +2529,109 @@ export default function Home() {
         );
       } catch (error) {
         console.error("Failed to toggle sync:", error);
-        showErrorToast(t("errors.updateSyncSettingsFailed"));
+        showErrorToast(t("errors.updateSyncSettingsFailed"), {
+          description: translateBackendError(t, error),
+        });
       }
     },
     [t],
   );
 
+  // The per-profile toggle, for every selected profile whose sync is off.
+  const handleBulkEnableSync = useCallback(async () => {
+    const targets = profiles.filter(
+      (profile) =>
+        selectedProfiles.includes(profile.id) &&
+        !profile.ephemeral &&
+        (!profile.sync_mode || profile.sync_mode === "Disabled"),
+    );
+    if (targets.length === 0) {
+      showToast({ type: "info", title: t("sync.bulkEnableNone") });
+      return;
+    }
+    const results = await Promise.allSettled(
+      targets.map((profile) =>
+        invoke("set_profile_sync_mode", {
+          profileId: profile.id,
+          syncMode: "Regular",
+        }),
+      ),
+    );
+    const failure = results.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    const enabled = results.filter((r) => r.status === "fulfilled").length;
+    if (enabled > 0) {
+      showSuccessToast(t("sync.bulkEnabledToast", { count: enabled }), {
+        description: t("sync.enabledDescription"),
+      });
+    }
+    if (failure) {
+      showErrorToast(t("errors.updateSyncSettingsFailed"), {
+        description: translateBackendError(t, failure.reason),
+      });
+    }
+  }, [profiles, selectedProfiles, t]);
+
+  // A copy with the same settings and a new device, named by the backend.
+  const handleDuplicateProfile = useCallback(
+    async (profile: BrowserProfile) => {
+      try {
+        const copy = await invoke<BrowserProfile>("clone_profile", {
+          profileId: profile.id,
+          name: null,
+        });
+        showSuccessToast(t("profiles.duplicated", { name: copy.name }));
+      } catch (error) {
+        showErrorToast(
+          t("errors.cloneProfileFailed", {
+            error: translateBackendError(t, error),
+          }),
+        );
+      }
+    },
+    [t],
+  );
+
+  const handleLockProfile = useCallback(
+    async (profile: BrowserProfile) => {
+      try {
+        await invoke("lock_profile", { profileId: profile.id });
+        showSuccessToast(t("profiles.lockedToast", { name: profile.name }));
+      } catch (error) {
+        showErrorToast(translateBackendError(t, error));
+      }
+    },
+    [t],
+  );
+
+  // Open the profile on a leased host; the session stream reports the rest.
+  const handleRunRemote = useCallback(
+    async (profile: BrowserProfile) => {
+      try {
+        await startRemoteSession(profile.id);
+        showSuccessToast(t("profiles.remote.starting", { name: profile.name }));
+      } catch (error) {
+        showErrorToast(translateBackendError(t, error));
+      }
+    },
+    [t],
+  );
+
+  // The empty group's "Move profiles here": a picker of the other profiles.
+  const [moveTargetGroup, setMoveTargetGroup] = useState<{
+    id: string;
+    name: string;
+  } | null>(null);
+  const handleMoveProfilesHere = useCallback(() => {
+    const group = groupsData.find((g) => g.id === selectedGroupId);
+    if (group) setMoveTargetGroup({ id: group.id, name: group.name });
+  }, [groupsData, selectedGroupId]);
+
+  // Read through a ref so the sync listeners below subscribe once, and keep
+  // which profiles are transferring across profile list reloads.
+  const syncProfilesRef = useRef(profiles);
+  syncProfilesRef.current = profiles;
   useEffect(() => {
     let disposed = false;
     let unlistenStatus: (() => void) | undefined;
@@ -1659,7 +2647,9 @@ export default function Home() {
         }>("profile-sync-status", (event) => {
           const { profile_id, status, error, profile_name } = event.payload;
           const toastId = `sync-${profile_id}`;
-          const profile = profiles.find((p) => p.id === profile_id);
+          const profile = syncProfilesRef.current.find(
+            (p) => p.id === profile_id,
+          );
           const name =
             profile_name || profile?.name || t("common.labels.unknownProfile");
 
@@ -1667,7 +2657,9 @@ export default function Home() {
             dismissToast(toastId);
             if (profilesWithTransfer.has(profile_id)) {
               profilesWithTransfer.delete(profile_id);
-              showSuccessToast(t("sync.toast.profileSynced", { name }));
+              showSuccessToast(t("sync.toast.profileSynced", { name }), {
+                sound: "synced",
+              });
             }
           } else if (status === "error") {
             dismissToast(toastId);
@@ -1694,7 +2686,9 @@ export default function Home() {
         }>("profile-sync-progress", (event) => {
           const payload = event.payload;
           const toastId = `sync-${payload.profile_id}`;
-          const profile = profiles.find((p) => p.id === payload.profile_id);
+          const profile = syncProfilesRef.current.find(
+            (p) => p.id === payload.profile_id,
+          );
           const name =
             payload.profile_name ||
             profile?.name ||
@@ -1738,7 +2732,7 @@ export default function Home() {
       if (unlistenStatus) unlistenStatus();
       if (unlistenProgress) unlistenProgress();
     };
-  }, [profiles, t]);
+  }, [t]);
 
   useEffect(() => {
     // Listen for URL open events. Guard against the effect tearing down (or
@@ -1800,6 +2794,7 @@ export default function Home() {
     let unlistenProgress: (() => void) | undefined;
     let unlistenCompleted: (() => void) | undefined;
     let unlistenWayfernBlocked: (() => void) | undefined;
+    let unlistenGenerationLimit: (() => void) | undefined;
 
     void (async () => {
       unlistenRequired = await listen(
@@ -1814,8 +2809,7 @@ export default function Home() {
             action: {
               label: t("encryption.required.openSettings"),
               onClick: () => {
-                setSettingsDialogOpen(true);
-                setCurrentPage("settings");
+                handleRailNavigate("settings");
               },
             },
           });
@@ -1862,6 +2856,19 @@ export default function Home() {
         });
       });
 
+      unlistenGenerationLimit = await listen(
+        "profile-generation-limit-reached",
+        () => {
+          showToast({
+            id: "profile-generation-limit-reached",
+            type: "error",
+            title: t("profileGenerationLimit.title"),
+            description: t("profileGenerationLimit.description"),
+            duration: 15000,
+          });
+        },
+      );
+
       unlistenWayfernBlocked = await listen("wayfern-paid-blocked", () => {
         showToast({
           id: "wayfern-paid-blocked",
@@ -1880,6 +2887,7 @@ export default function Home() {
         unlistenProgress?.();
         unlistenCompleted?.();
         unlistenWayfernBlocked?.();
+        unlistenGenerationLimit?.();
       }
     })();
 
@@ -1890,8 +2898,9 @@ export default function Home() {
       unlistenProgress?.();
       unlistenCompleted?.();
       unlistenWayfernBlocked?.();
+      unlistenGenerationLimit?.();
     };
-  }, [t]);
+  }, [t, handleRailNavigate]);
 
   // Re-check Wayfern terms when a browser download completes
   useEffect(() => {
@@ -1921,617 +2930,969 @@ export default function Home() {
     }
   }, [isInitialized, firstRunOnboarding, checkAllPermissions]);
 
-  // Check self-hosted sync config on mount and when cloud user changes
+  // Check self-hosted sync config on mount, when cloud user changes, and when
+  // a signed-in device picks where it syncs.
   useEffect(() => {
     void checkSelfHostedSync();
+    const unlisten = listen("sync-source-changed", () => {
+      void checkSelfHostedSync();
+    });
+    return () => {
+      void unlisten.then((stop) => {
+        stop();
+      });
+    };
   }, [checkSelfHostedSync]);
 
-  // Filter data by selected group and search query
-  const filteredProfiles = useMemo(() => {
-    let filtered = profiles;
-
-    // Filter by group. "__all__" is a virtual filter that shows every
-    // profile (including ungrouped ones). Any other value is a real
-    // group id; ungrouped profiles only show through "All".
-    if (!selectedGroupId || selectedGroupId === "__all__") {
-      filtered = profiles;
-    } else {
-      filtered = profiles.filter(
-        (profile) => profile.group_id === selectedGroupId,
-      );
-    }
-
-    // Filter by search query
-    if (searchQuery.trim()) {
-      const query = searchQuery.toLowerCase().trim();
-      filtered = filtered.filter((profile) => {
-        // Search in profile name
-        if (profile.name.toLowerCase().includes(query)) return true;
-
-        // Search in note
-        if (profile.note?.toLowerCase().includes(query)) return true;
-
-        // Search in tags
-        if (profile.tags?.some((tag) => tag.toLowerCase().includes(query)))
-          return true;
-
-        return false;
+  // The tray menu acts through the same handlers as the window. The latest
+  // handlers and lists are read through a ref, so one listener serves all.
+  const trayRef = useRef({
+    profiles,
+    runningProfiles,
+    launchProfile,
+    handleKillProfile,
+    stopAllRunning,
+    goToProfilesThen,
+  });
+  trayRef.current = {
+    profiles,
+    runningProfiles,
+    launchProfile,
+    handleKillProfile,
+    stopAllRunning,
+    goToProfilesThen,
+  };
+  useEffect(() => {
+    // The backend brings the window forward itself for Show, Open and a
+    // launch that asks for a password; a plain launch or stop stays behind.
+    const unlisten = listen<{
+      action:
+        | "show"
+        | "stop-all"
+        | "stop-profile"
+        | "launch-profile"
+        | "open-profile";
+      profile_id?: string;
+    }>("tray-action", (event) => {
+      const tray = trayRef.current;
+      const { action, profile_id } = event.payload;
+      const profile = profile_id
+        ? tray.profiles.find((p) => p.id === profile_id)
+        : undefined;
+      switch (action) {
+        case "show":
+          break;
+        case "stop-all":
+          tray.stopAllRunning();
+          break;
+        case "stop-profile":
+          if (profile && tray.runningProfiles.has(profile.id)) {
+            void tray.handleKillProfile(profile).catch(() => {});
+          }
+          break;
+        case "launch-profile":
+          if (profile && !tray.runningProfiles.has(profile.id)) {
+            void tray.launchProfile(profile).catch(() => {});
+          }
+          break;
+        case "open-profile":
+          if (profile) {
+            tray.goToProfilesThen(() => {
+              setProfileInfoOpenMethod("pointer");
+              setProfileInfoDialog(profile);
+            });
+          }
+          break;
+      }
+    });
+    return () => {
+      void unlisten.then((stop) => {
+        stop();
       });
-    }
+    };
+  }, []);
 
-    return filtered;
-  }, [profiles, selectedGroupId, searchQuery]);
+  // The first start after an update says so, once; the notes open on request.
+  useEffect(() => {
+    void invoke<WhatsNew | null>("take_whats_new")
+      .then((notes) => {
+        if (!notes) return;
+        showSuccessToast(t("whatsNew.updated", { version: notes.version }), {
+          duration: 12000,
+          action: {
+            label: t("whatsNew.open"),
+            onClick: () => setWhatsNew(notes),
+          },
+        });
+      })
+      .catch(() => {});
+  }, [t]);
+
+  // Profiles that were running when the app last quit open again, through
+  // the bulk launch path, once the list is loaded and launches are allowed.
+  const reopenCheckedRef = useRef(false);
+  useEffect(() => {
+    if (reopenCheckedRef.current) return;
+    if (profilesLoading || termsAccepted !== true) return;
+    reopenCheckedRef.current = true;
+    void invoke<string[]>("take_reopen_profiles")
+      .then((ids) => {
+        const targets = trayRef.current.profiles.filter(
+          (profile) =>
+            ids.includes(profile.id) &&
+            !trayRef.current.runningProfiles.has(profile.id),
+        );
+        if (targets.length > 0) void executeBulkRun(targets);
+      })
+      .catch(() => {
+        // An older backend has no such command; nothing to reopen then.
+      });
+  }, [profilesLoading, termsAccepted, executeBulkRun]);
+
+  // A profile stores ids, and the query asks about names, so the matcher is
+  // handed the resolution up front. Built off the entity lists rather than off
+  // `profiles`, because the alternative — a .find() per row per term — is
+  // O(profiles x entities) on every single keystroke.
+  const proxyCountries = useProxyCountries(storedProxies);
+  const searchContext = useMemo<ProfileSearchContext>(
+    () => ({
+      groupNames: new Map(groupsData.map((g) => [g.id, g.name])),
+      proxyNames: new Map(storedProxies.map((p) => [p.id, p.name])),
+      proxyCountries,
+      vpnNames: new Map(vpnConfigs.map((v) => [v.id, v.name])),
+      extensionGroupNames: new Map(extensionGroups.map((e) => [e.id, e.name])),
+      statusNames: new Map(profileStatuses.map((s) => [s.id, s.name])),
+      runningProfiles,
+    }),
+    [
+      groupsData,
+      storedProxies,
+      vpnConfigs,
+      extensionGroups,
+      profileStatuses,
+      runningProfiles,
+      proxyCountries,
+    ],
+  );
+
+  const profilesInGroup = useMemo(
+    () =>
+      !selectedGroupId || selectedGroupId === "__all__"
+        ? profiles
+        : profiles.filter((profile) => profile.group_id === selectedGroupId),
+    [profiles, selectedGroupId],
+  );
+  const profileFilters = useProfileTableFilters(
+    profilesInGroup,
+    searchQuery,
+    searchContext,
+  );
+  const changeProfileSearch = (query: string) => {
+    setSearchQuery(query);
+  };
+  const clearProfileFilters = () => {
+    profileFilters.reset();
+    setSearchQuery("");
+  };
+  // The bulk launch summary's "Show": every filter off, then the failed
+  // profiles selected, so they are all on screen together.
+  showProfilesRef.current = (profileIds: string[]) => {
+    goToProfilesThen(() => {
+      setSelectedGroupId("__all__");
+      profileFilters.reset();
+      setSearchQuery("");
+      setSelectedProfiles(
+        profileIds.filter((id) => profiles.some((p) => p.id === id)),
+      );
+    });
+  };
 
   // Update loading states
   const isLoading = profilesLoading || groupsLoading || proxiesLoading;
 
   const subPageTitle =
-    currentPage === "profiles"
-      ? undefined
-      : currentPage === "import"
-        ? t("pageTitle.import")
-        : t(`pageTitle.${currentPage}`);
+    currentPage === "profiles" ? undefined : t(PAGE_TITLE_KEYS[currentPage]);
+  // Proxies and VPNs are one page with two tabs: switching tabs is no move.
+  const transitionKey = currentPage === "vpns" ? "proxies" : currentPage;
 
   return (
-    <div className="flex h-dvh flex-col bg-background font-(family-name:--font-geist-sans)">
-      <CloseConfirmDialog />
-      <HomeHeader
-        onCreateProfileDialogOpen={setCreateProfileDialogOpen}
-        searchQuery={searchQuery}
-        onSearchQueryChange={setSearchQuery}
-        groups={groupsData}
-        totalProfiles={profiles.length}
-        selectedGroupId={selectedGroupId}
-        onGroupSelect={handleSelectGroup}
-        pageTitle={subPageTitle}
-      />
-      <div className="flex min-h-0 flex-1">
-        <RailNav
-          currentPage={currentPage}
-          onNavigate={handleRailNavigate}
+    <ProfileGroupDragProvider
+      enabled={currentPage === "profiles"}
+      onAssign={handleDropProfilesToGroup}
+    >
+      <div className="flex h-dvh flex-col bg-background">
+        <CloseConfirmDialog />
+        <HomeHeader
+          onCreateProfileDialogOpen={(open) =>
+            open ? openCreateProfile() : setCreateProfileDialogOpen(false)
+          }
+          canCreateProfiles={!teamReadOnly}
+          searchQuery={searchQuery}
+          onSearchQueryChange={changeProfileSearch}
+          searchProfiles={profilesInGroup}
+          searchContext={searchContext}
+          groups={groupsData}
+          totalProfiles={profiles.length}
+          selectedGroupId={selectedGroupId}
+          onGroupSelect={handleSelectGroup}
+          pageTitle={subPageTitle}
+          page={currentPage}
+          pageDirection={pageMove.dir}
+        />
+        <div className="flex min-h-0 flex-1">
+          <RailNav
+            currentPage={currentPage}
+            onNavigate={handleRailNavigate}
+            onOpenAbout={() => {
+              setAboutDialogOpen(true);
+            }}
+            onOpenTips={() => openTips()}
+            onOpenFeedback={() => {
+              setFeedbackDialogOpen(true);
+            }}
+            cookieBotRunning={Object.keys(cookieBotLiveSessions).length > 0}
+            agentRequests={agentConsole.openRequests.length}
+          />
+          <main className="relative flex min-w-0 flex-1 flex-col overflow-hidden">
+            <PageTransition
+              pageKey={transitionKey}
+              direction={pageMove.dir}
+              className="flex min-h-0 flex-1 flex-col"
+            >
+              {currentPage === "profiles" && (
+                <div
+                  data-table-id="profiles"
+                  className="flex min-h-0 flex-1 flex-col px-3 pt-2.5"
+                >
+                  <SynchronizerPanel
+                    sessions={syncSessions}
+                    onSessionChanged={applySession}
+                  />
+                  <AutoHeight deps={[teamReadOnly]} className="shrink-0">
+                    {teamReadOnly && (
+                      <p
+                        className="mb-2 rounded-md bg-foreground/5 px-3 py-2 text-xs text-muted-foreground"
+                        data-testid="team-read-only-notice"
+                      >
+                        {t("teamRoles.readOnlyNotice")}
+                      </p>
+                    )}
+                  </AutoHeight>
+                  <ProfilesDataTable
+                    profileStatuses={profileStatuses}
+                    isLoading={isLoading && profiles.length === 0}
+                    showOnboardingEmptyState={profiles.length === 0}
+                    profiles={profileFilters.rows}
+                    filterControls={
+                      <TableFilterControls
+                        {...profileFilters}
+                        query={searchQuery}
+                        onQueryChange={changeProfileSearch}
+                        showSearch={false}
+                        count={profileFilters.rows.length}
+                        total={profilesInGroup.length}
+                        onReset={clearProfileFilters}
+                      />
+                    }
+                    onClearFilters={clearProfileFilters}
+                    allProfiles={profiles}
+                    infoDialogProfile={profileInfoDialog}
+                    infoOpenMethod={profileInfoOpenMethod}
+                    onInfoOpenMethodChange={setProfileInfoOpenMethod}
+                    onInfoDialogProfileChange={setProfileInfoDialog}
+                    onLaunchProfile={launchProfile}
+                    onKillProfile={handleKillProfile}
+                    onCloneProfile={handleCloneProfile}
+                    onSetPassword={handleSetPassword}
+                    onChangePassword={handleChangePassword}
+                    onRemovePassword={handleRemovePassword}
+                    onDeleteProfile={handleDeleteProfile}
+                    onRenameProfile={handleRenameProfile}
+                    onConfigureWayfern={handleConfigureWayfern}
+                    onCopyCookiesToProfile={handleCopyCookiesToProfile}
+                    onOpenCookieManagement={handleOpenCookieManagement}
+                    runningProfiles={runningProfiles}
+                    extensionGroups={extensionGroups}
+                    isUpdating={isUpdating}
+                    onDeleteSelectedProfiles={handleDeleteSelectedProfiles}
+                    onAssignProfilesToGroup={handleAssignProfilesToGroup}
+                    onAssignProfilesToProxy={handleAssignProfilesToProxy}
+                    selectedGroupId={selectedGroupId}
+                    selectedProfiles={selectedProfiles}
+                    onSelectedProfilesChange={setSelectedProfiles}
+                    onBulkDelete={handleBulkDelete}
+                    onBulkGroupAssignment={handleBulkGroupAssignment}
+                    onBulkProxyAssignment={handleBulkProxyAssignment}
+                    onBulkProxyDistribution={handleBulkProxyDistribution}
+                    onBulkCopyCookies={handleBulkCopyCookies}
+                    onBulkRun={handleBulkRun}
+                    onBulkStop={handleBulkStop}
+                    onRunAgentTask={
+                      agent.entitled ? handleRunAgentTask : undefined
+                    }
+                    bulkActionsUnlocked={automationUnlocked}
+                    onBulkExtensionGroupAssignment={
+                      handleBulkExtensionGroupAssignment
+                    }
+                    onAssignExtensionGroup={handleAssignExtensionGroup}
+                    onOpenProfileSyncDialog={handleOpenProfileSyncDialog}
+                    onToggleProfileSync={handleToggleProfileSync}
+                    crossOsUnlocked={crossOsUnlocked}
+                    syncUnlocked={syncUnlocked}
+                    getProfileSyncInfo={getProfileSyncInfo}
+                    onLaunchWithSync={(profile) => {
+                      setSyncLeaderProfile(profile);
+                    }}
+                    onCreateProfile={openCreateProfile}
+                    onImportProfiles={() => {
+                      handleRailNavigate("import");
+                    }}
+                    launchErrors={launchErrors}
+                    onCreateProfileInGroup={openCreateProfile}
+                    onMoveProfilesHere={handleMoveProfilesHere}
+                    onBulkEnableSync={() => void handleBulkEnableSync()}
+                    onDuplicateProfile={(profile) =>
+                      void handleDuplicateProfile(profile)
+                    }
+                    onLockProfile={(profile) => void handleLockProfile(profile)}
+                    onRunRemote={(profile) => void handleRunRemote(profile)}
+                    onAskAgent={
+                      agent.entitled
+                        ? (profile) => {
+                            handleAskAgent(profile.id);
+                          }
+                        : undefined
+                    }
+                  />
+                  <TipCoachMark
+                    flow={tipsFlow}
+                    page={currentPage}
+                    onAction={runTipAction}
+                  />
+                </div>
+              )}
+
+              {currentPage === "previews" && (
+                <div className="flex min-h-0 flex-1 flex-col">
+                  <ProfilePreviewsPage
+                    profiles={profiles}
+                    runningProfileIds={runningProfiles}
+                    unlocked={automationUnlocked}
+                  />
+                </div>
+              )}
+
+              {currentPage === "shortcuts" && (
+                <div className="flex min-h-0 flex-1 flex-col">
+                  <ShortcutsPage
+                    groupTargets={orderedGroupTargets}
+                    onOpenPalette={() => {
+                      setCommandPaletteOpen(true);
+                    }}
+                  />
+                </div>
+              )}
+
+              {settingsDialogOpen && (
+                <SettingsDialog
+                  isOpen={settingsDialogOpen}
+                  onClose={() => {
+                    closeSubPage(() => setSettingsDialogOpen(false));
+                  }}
+                  onIntegrationsOpen={() => {
+                    handleRailNavigate("integrations");
+                  }}
+                  subPage={currentPage === "settings"}
+                  initialSection={settingsInitialSection}
+                />
+              )}
+
+              {integrationsDialogOpen && (
+                <IntegrationsDialog
+                  isOpen={integrationsDialogOpen}
+                  onClose={() => {
+                    closeSubPage(() => setIntegrationsDialogOpen(false));
+                  }}
+                  subPage={currentPage === "integrations"}
+                  initialTab={integrationsInitialTab}
+                />
+              )}
+
+              {proxyManagementDialogOpen && (
+                <ProxyManagementDialog
+                  isOpen={proxyManagementDialogOpen}
+                  onClose={() => {
+                    closeSubPage(() => setProxyManagementDialogOpen(false));
+                  }}
+                  subPage={currentPage === "proxies" || currentPage === "vpns"}
+                  initialTab={proxyManagementInitialTab}
+                />
+              )}
+
+              {groupManagementDialogOpen && (
+                <GroupManagementDialog
+                  isOpen={groupManagementDialogOpen}
+                  onClose={() => {
+                    closeSubPage(() => setGroupManagementDialogOpen(false));
+                  }}
+                  onGroupManagementComplete={handleGroupManagementComplete}
+                  subPage={currentPage === "groups"}
+                />
+              )}
+
+              {extensionManagementDialogOpen && (
+                <ExtensionManagementDialog
+                  isOpen={extensionManagementDialogOpen}
+                  onClose={() => {
+                    closeSubPage(() => setExtensionManagementDialogOpen(false));
+                  }}
+                  limitedMode={false}
+                  subPage={currentPage === "extensions"}
+                  initialTab={extensionManagementInitialTab}
+                />
+              )}
+
+              {importProfileDialogOpen && (
+                <ImportProfileDialog
+                  isOpen={importProfileDialogOpen}
+                  onClose={() => {
+                    closeSubPage(() => setImportProfileDialogOpen(false));
+                  }}
+                  crossOsUnlocked={crossOsUnlocked}
+                  subPage={currentPage === "import"}
+                />
+              )}
+
+              {cookieBotDialogOpen && (
+                <CookieBotPage
+                  isOpen={cookieBotDialogOpen}
+                  onClose={() => {
+                    closeSubPage(() => setCookieBotDialogOpen(false));
+                  }}
+                  subPage={currentPage === "cookieBot"}
+                  initialTab={cookieBotInitialTab}
+                  profiles={profiles}
+                  cloudUser={cloudUser}
+                  onOpenProfileSync={handleOpenProfileSyncDialog}
+                  onAssignProxy={handleAssignProfilesToProxy}
+                />
+              )}
+
+              {agentDialogOpen && (
+                <AgentPage
+                  isOpen={agentDialogOpen}
+                  onClose={() => {
+                    closeSubPage(() => setAgentDialogOpen(false));
+                  }}
+                  subPage={currentPage === "agent"}
+                  initialView={agentView}
+                  onViewChange={setAgentView}
+                  profiles={profiles}
+                  cloudUser={cloudUser}
+                  agentConsole={agentConsole}
+                  onConnectAgent={() => {
+                    setIntegrationsInitialTab("remote");
+                    handleRailNavigate("integrations");
+                  }}
+                  onOpenAccount={() => {
+                    handleRailNavigate("account");
+                  }}
+                  agent={agent}
+                  chatSeed={chatSeed}
+                />
+              )}
+
+              {accountDialogOpen && (
+                <AccountPage
+                  isOpen={accountDialogOpen}
+                  onClose={() => {
+                    closeSubPage(() => setAccountDialogOpen(false));
+                  }}
+                  subPage={currentPage === "account"}
+                  onOpenSignIn={() => {
+                    closeSubPage(() => {
+                      setAccountDialogOpen(false);
+                      setDeviceCodeDialogOpen(true);
+                    });
+                  }}
+                />
+              )}
+
+              {trashPageOpen && (
+                <TrashPage
+                  isOpen={trashPageOpen}
+                  onClose={() => {
+                    closeSubPage(() => setTrashPageOpen(false));
+                  }}
+                  subPage={currentPage === "trash"}
+                />
+              )}
+            </PageTransition>
+
+            {/* A modal, so it stays out of the page transition: a page that
+                fades out must not take a second copy of it along. */}
+            <TotpToolDialog
+              isOpen={totpToolOpen}
+              onClose={() => setTotpToolOpen(false)}
+            />
+          </main>
+        </div>
+
+        <CreateProfileDialog
+          isOpen={createProfileDialogOpen}
+          onClose={() => {
+            setCreateProfileDialogOpen(false);
+          }}
+          onCreateProfile={handleCreateProfile}
+          selectedGroupId={selectedGroupId}
+          crossOsUnlocked={crossOsUnlocked}
+        />
+
+        <WhatsNewDialog whatsNew={whatsNew} onClose={() => setWhatsNew(null)} />
+        <CommandPalette
+          open={commandPaletteOpen}
+          onOpenChange={setCommandPaletteOpen}
+          onAction={runShortcut}
+          groupTargets={orderedGroupTargets}
+          onSelectGroup={(id) => {
+            goToProfilesThen(() => handleSelectGroup(id));
+          }}
+          profiles={profiles}
+          runningProfileIds={runningProfiles}
+          onLaunchProfile={(profile) => {
+            void launchProfile(profile);
+          }}
+          onKillProfile={(profile) => {
+            void handleKillProfile(profile);
+          }}
+          onShowProfileWindow={(profile) => {
+            void showProfileWindow(profile.id).catch((error: unknown) => {
+              showErrorToast(translateBackendError(t, error));
+            });
+          }}
+          onShowProfileInfo={(profile) => {
+            goToProfilesThen(() => {
+              setProfileInfoOpenMethod("keyboard");
+              setProfileInfoDialog(profile);
+            });
+          }}
+          onCreateProfile={openCreateProfile}
           onOpenAbout={() => {
             setAboutDialogOpen(true);
           }}
-          cookieBotRunning={Object.keys(cookieBotLiveSessions).length > 0}
-        />
-        <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
-          {currentPage === "profiles" && (
-            <motion.div
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.25, ease: MOTION_EASE_OUT }}
-              className="flex min-h-0 flex-1 flex-col px-3 pt-2.5"
-            >
-              <ProfilesDataTable
-                isLoading={isLoading && profiles.length === 0}
-                showOnboardingEmptyState={profiles.length === 0}
-                profiles={filteredProfiles}
-                infoDialogProfile={profileInfoDialog}
-                onInfoDialogProfileChange={setProfileInfoDialog}
-                onLaunchProfile={launchProfile}
-                onKillProfile={handleKillProfile}
-                onCloneProfile={handleCloneProfile}
-                onSetPassword={handleSetPassword}
-                onChangePassword={handleChangePassword}
-                onRemovePassword={handleRemovePassword}
-                onDeleteProfile={handleDeleteProfile}
-                onRenameProfile={handleRenameProfile}
-                onConfigureWayfern={handleConfigureWayfern}
-                onCopyCookiesToProfile={handleCopyCookiesToProfile}
-                onOpenCookieManagement={handleOpenCookieManagement}
-                runningProfiles={runningProfiles}
-                isUpdating={isUpdating}
-                onDeleteSelectedProfiles={handleDeleteSelectedProfiles}
-                onAssignProfilesToGroup={handleAssignProfilesToGroup}
-                onAssignProfilesToProxy={handleAssignProfilesToProxy}
-                selectedGroupId={selectedGroupId}
-                selectedProfiles={selectedProfiles}
-                onSelectedProfilesChange={setSelectedProfiles}
-                onBulkDelete={handleBulkDelete}
-                onBulkGroupAssignment={handleBulkGroupAssignment}
-                onBulkProxyAssignment={handleBulkProxyAssignment}
-                onBulkCopyCookies={handleBulkCopyCookies}
-                onBulkRun={handleBulkRun}
-                onBulkStop={handleBulkStop}
-                bulkActionsUnlocked={automationUnlocked}
-                onBulkExtensionGroupAssignment={
-                  handleBulkExtensionGroupAssignment
+          onNewAgentChat={
+            agent.entitled
+              ? () => {
+                  handleAskAgent(null);
                 }
-                onAssignExtensionGroup={handleAssignExtensionGroup}
-                onOpenProfileSyncDialog={handleOpenProfileSyncDialog}
-                onToggleProfileSync={handleToggleProfileSync}
-                crossOsUnlocked={crossOsUnlocked}
-                syncUnlocked={syncUnlocked}
-                getProfileSyncInfo={getProfileSyncInfo}
-                onLaunchWithSync={(profile) => {
-                  setSyncLeaderProfile(profile);
-                }}
-                onCreateProfile={() => {
-                  setCreateProfileDialogOpen(true);
-                }}
-                onImportProfiles={() => {
-                  handleRailNavigate("import");
-                }}
-              />
-            </motion.div>
-          )}
-
-          {currentPage === "shortcuts" && (
-            <motion.div
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.25, ease: MOTION_EASE_OUT }}
-              className="flex min-h-0 flex-1 flex-col"
-            >
-              <ShortcutsPage groupTargets={orderedGroupTargets} />
-            </motion.div>
-          )}
-
-          {settingsDialogOpen && (
-            <SettingsDialog
-              isOpen={settingsDialogOpen}
-              onClose={() => {
-                setSettingsDialogOpen(false);
-                setCurrentPage("profiles");
-              }}
-              onIntegrationsOpen={() => {
-                setSettingsDialogOpen(false);
-                setIntegrationsDialogOpen(true);
-                setCurrentPage("integrations");
-              }}
-              subPage={currentPage === "settings"}
-            />
-          )}
-
-          {integrationsDialogOpen && (
-            <IntegrationsDialog
-              isOpen={integrationsDialogOpen}
-              onClose={() => {
-                setIntegrationsDialogOpen(false);
-                setCurrentPage("profiles");
-              }}
-              subPage={currentPage === "integrations"}
-              initialTab={integrationsInitialTab}
-            />
-          )}
-
-          {proxyManagementDialogOpen && (
-            <ProxyManagementDialog
-              isOpen={proxyManagementDialogOpen}
-              onClose={() => {
-                setProxyManagementDialogOpen(false);
-                setCurrentPage("profiles");
-              }}
-              subPage={currentPage === "proxies" || currentPage === "vpns"}
-              initialTab={proxyManagementInitialTab}
-            />
-          )}
-
-          {groupManagementDialogOpen && (
-            <GroupManagementDialog
-              isOpen={groupManagementDialogOpen}
-              onClose={() => {
-                setGroupManagementDialogOpen(false);
-                setCurrentPage("profiles");
-              }}
-              onGroupManagementComplete={handleGroupManagementComplete}
-              subPage={currentPage === "groups"}
-            />
-          )}
-
-          {extensionManagementDialogOpen && (
-            <ExtensionManagementDialog
-              isOpen={extensionManagementDialogOpen}
-              onClose={() => {
-                setExtensionManagementDialogOpen(false);
-                setCurrentPage("profiles");
-              }}
-              limitedMode={false}
-              subPage={currentPage === "extensions"}
-              initialTab={extensionManagementInitialTab}
-            />
-          )}
-
-          {importProfileDialogOpen && (
-            <ImportProfileDialog
-              isOpen={importProfileDialogOpen}
-              onClose={() => {
-                setImportProfileDialogOpen(false);
-                setCurrentPage("profiles");
-              }}
-              crossOsUnlocked={crossOsUnlocked}
-              subPage={currentPage === "import"}
-            />
-          )}
-
-          {cookieBotDialogOpen && (
-            <CookieBotPage
-              isOpen={cookieBotDialogOpen}
-              onClose={() => {
-                setCookieBotDialogOpen(false);
-                setCurrentPage("profiles");
-              }}
-              subPage={currentPage === "cookieBot"}
-              initialTab={cookieBotInitialTab}
-              profiles={profiles}
-              cloudUser={cloudUser}
-              onOpenProfileSync={handleOpenProfileSyncDialog}
-              onAssignProxy={handleAssignProfilesToProxy}
-            />
-          )}
-
-          {accountDialogOpen && (
-            <AccountPage
-              isOpen={accountDialogOpen}
-              onClose={() => {
-                setAccountDialogOpen(false);
-                setCurrentPage("profiles");
-              }}
-              subPage={currentPage === "account"}
-              onOpenSignIn={() => {
-                setAccountDialogOpen(false);
-                setCurrentPage("profiles");
-                setDeviceCodeDialogOpen(true);
-              }}
-            />
-          )}
-        </main>
-      </div>
-
-      <CreateProfileDialog
-        isOpen={createProfileDialogOpen}
-        onClose={() => {
-          setCreateProfileDialogOpen(false);
-        }}
-        onCreateProfile={handleCreateProfile}
-        selectedGroupId={selectedGroupId}
-        crossOsUnlocked={crossOsUnlocked}
-      />
-
-      <CommandPalette
-        open={commandPaletteOpen}
-        onOpenChange={setCommandPaletteOpen}
-        onAction={runShortcut}
-        groupTargets={orderedGroupTargets}
-        onSelectGroup={(id) => {
-          handleRailNavigate("profiles");
-          handleSelectGroup(id);
-        }}
-        profiles={profiles}
-        runningProfileIds={runningProfiles}
-        onLaunchProfile={(profile) => {
-          void launchProfile(profile);
-        }}
-        onKillProfile={(profile) => {
-          void handleKillProfile(profile);
-        }}
-        onShowProfileInfo={(profile) => {
-          handleRailNavigate("profiles");
-          setProfileInfoDialog(profile);
-        }}
-        onCreateProfile={() => {
-          setCreateProfileDialogOpen(true);
-        }}
-        onOpenAbout={() => {
-          setAboutDialogOpen(true);
-        }}
-      />
-
-      <AboutDialog
-        isOpen={aboutDialogOpen}
-        onClose={() => {
-          setAboutDialogOpen(false);
-        }}
-      />
-
-      <PreLaunchGateDialog
-        isOpen={gateState !== null}
-        profileName={gateState?.req.profile.name ?? ""}
-        profileId={gateState?.req.profile.id ?? ""}
-        requestId={gateState?.id ?? 0}
-        findings={gateState?.req.findings ?? null}
-        remainingCount={gateState?.remaining ?? 0}
-        onResult={settleGate}
-      />
-
-      {pendingUrls.map((pendingUrl) => (
-        <ProfileSelectorDialog
-          key={pendingUrl.id}
-          isOpen={true}
-          onClose={() => {
-            setPendingUrls((prev) =>
-              prev.filter((u) => u.id !== pendingUrl.id),
-            );
-          }}
-          url={pendingUrl.url}
-          isUpdating={isUpdating}
-          runningProfiles={runningProfiles}
+              : undefined
+          }
         />
-      ))}
 
-      <PermissionDialog
-        isOpen={permissionDialogOpen}
-        onClose={() => {
-          setPermissionDialogOpen(false);
-        }}
-        permissionType={currentPermissionType}
-        onPermissionGranted={checkNextPermission}
-      />
+        <LeavePromptDialog />
 
-      <WelcomeDialog
-        isOpen={welcomeOpen}
-        needsSetup={profiles.length === 0}
-        onComplete={handleWelcomeComplete}
-      />
-      <ThankYouDialog
-        isOpen={thankYouOpen}
-        onClose={() => setThankYouOpen(false)}
-      />
+        <MoveProfilesDialog
+          group={moveTargetGroup}
+          onClose={() => setMoveTargetGroup(null)}
+          profiles={profiles}
+          runningProfiles={runningProfiles}
+          onMove={handleDropProfilesToGroup}
+        />
 
-      <CloneProfileDialog
-        isOpen={!!cloneProfile}
-        onClose={() => {
-          setCloneProfile(null);
-        }}
-        profile={cloneProfile}
-      />
+        <AboutDialog
+          isOpen={aboutDialogOpen}
+          onClose={() => {
+            setAboutDialogOpen(false);
+          }}
+          update={appUpdate}
+          onOpenFeedback={() => {
+            setAboutDialogOpen(false);
+            setFeedbackDialogOpen(true);
+          }}
+          onOpenShortcuts={() => {
+            setAboutDialogOpen(false);
+            handleRailNavigate("shortcuts");
+          }}
+        />
 
-      <ProfilePasswordDialog
-        isOpen={!!passwordDialogProfile}
-        onClose={() => {
-          pendingLaunchAfterUnlockRef.current = null;
-          setPasswordDialogProfile(null);
-        }}
-        profile={passwordDialogProfile}
-        mode={passwordDialogMode}
-        onSuccess={(p) => {
-          // Resume pending launch after unlock.
-          if (
-            passwordDialogMode === "unlock" &&
-            pendingLaunchAfterUnlockRef.current?.id === p.id
-          ) {
-            const target = pendingLaunchAfterUnlockRef.current;
+        <FeedbackDialog
+          isOpen={feedbackDialogOpen}
+          onClose={() => {
+            setFeedbackDialogOpen(false);
+          }}
+          accountEmail={cloudUser?.email ?? null}
+          profiles={profiles}
+        />
+
+        <PreLaunchGateDialog
+          isOpen={gateState !== null}
+          profileName={gateState?.req.profile.name ?? ""}
+          profileId={gateState?.req.profile.id ?? ""}
+          requestId={gateState?.id ?? 0}
+          findings={gateState?.req.findings ?? null}
+          remainingCount={gateState?.remaining ?? 0}
+          onResult={settleGate}
+        />
+
+        {pendingUrls.map((pendingUrl) => (
+          <ProfileSelectorDialog
+            key={pendingUrl.id}
+            isOpen={true}
+            onClose={() => {
+              setPendingUrls((prev) =>
+                prev.filter((u) => u.id !== pendingUrl.id),
+              );
+            }}
+            url={pendingUrl.url}
+            isUpdating={isUpdating}
+            runningProfiles={runningProfiles}
+          />
+        ))}
+
+        <PermissionDialog
+          isOpen={permissionDialogOpen}
+          onClose={() => {
+            setPermissionDialogOpen(false);
+          }}
+          permissionType={currentPermissionType}
+          onPermissionGranted={checkNextPermission}
+        />
+
+        <WelcomeDialog
+          isOpen={welcomeOpen}
+          needsSetup={profiles.length === 0}
+          onComplete={handleWelcomeComplete}
+        />
+        <OnboardingTour
+          open={tour.open}
+          step={tour.step}
+          onSkip={skipTour}
+          onFinish={finishTour}
+        />
+        <ThankYouDialog
+          isOpen={thankYouOpen}
+          onClose={() => setThankYouOpen(false)}
+        />
+        <TipsDialog
+          key={tipsFlow.dialog.session}
+          open={tipsFlow.dialog.open}
+          tips={tipsFlow.tips}
+          seen={tipsFlow.seen}
+          initialTipId={tipsFlow.dialog.initialTipId}
+          autoShow={tipsFlow.autoShow}
+          onOpenChange={(open) => {
+            if (!open) closeTips();
+          }}
+          onTipShown={tipsFlow.markSeen}
+          onAutoShowChange={(enabled) => void tipsFlow.setAutoShow(enabled)}
+          onAction={runTipAction}
+          onShowMe={(id) => {
+            goToProfilesThen(() => tipsFlow.showOnPage(id));
+          }}
+        />
+        <PaidWelcomeDialog
+          open={tipsFlow.paidWelcome.open}
+          plan={tipsFlow.paidWelcome.plan}
+          tips={tipsFlow.planTips}
+          onOpenChange={(open) => {
+            if (!open) tipsFlow.dismissPaidWelcome();
+          }}
+          onOpenTip={(id) => {
+            tipsFlow.dismissPaidWelcome();
+            openTips(id);
+          }}
+        />
+
+        <CloneProfileDialog
+          isOpen={!!cloneProfile}
+          onClose={() => {
+            setCloneProfile(null);
+          }}
+          profile={cloneProfile}
+        />
+
+        <ProfilePasswordDialog
+          isOpen={!!passwordDialogProfile}
+          onClose={() => {
             pendingLaunchAfterUnlockRef.current = null;
-            void launchProfile(target);
+            setPasswordDialogProfile(null);
+          }}
+          profile={passwordDialogProfile}
+          mode={passwordDialogMode}
+          onSuccess={(p) => {
+            // Resume pending launch after unlock.
+            if (
+              passwordDialogMode === "unlock" &&
+              pendingLaunchAfterUnlockRef.current?.id === p.id
+            ) {
+              const target = pendingLaunchAfterUnlockRef.current;
+              pendingLaunchAfterUnlockRef.current = null;
+              void launchProfile(target);
+            }
+            // On set/change/remove, the profile's encryption state changed.
+            // Push that state to the sync server immediately so other devices
+            // see the new envelope before they next pull. Skip if the profile
+            // is currently running — its files would be in flux.
+            if (
+              (passwordDialogMode === "set" ||
+                passwordDialogMode === "change" ||
+                passwordDialogMode === "remove") &&
+              !runningProfiles.has(p.id) &&
+              p.sync_mode !== "Disabled"
+            ) {
+              void invoke("request_profile_sync", { profileId: p.id }).catch(
+                (err: unknown) => {
+                  console.error("post-password sync failed", err);
+                },
+              );
+            }
+          }}
+        />
+
+        <WayfernConfigDialog
+          isOpen={wayfernConfigDialogOpen}
+          onClose={() => {
+            setWayfernConfigDialogOpen(false);
+          }}
+          profile={currentProfileForWayfernConfig}
+          onSave={handleSaveWayfernConfig}
+          isRunning={
+            currentProfileForWayfernConfig
+              ? runningProfiles.has(currentProfileForWayfernConfig.id)
+              : false
           }
-          // On set/change/remove, the profile's encryption state changed.
-          // Push that state to the sync server immediately so other devices
-          // see the new envelope before they next pull. Skip if the profile
-          // is currently running — its files would be in flux.
-          if (
-            (passwordDialogMode === "set" ||
-              passwordDialogMode === "change" ||
-              passwordDialogMode === "remove") &&
-            !runningProfiles.has(p.id) &&
-            p.sync_mode !== "Disabled"
-          ) {
-            void invoke("request_profile_sync", { profileId: p.id }).catch(
-              (err: unknown) => {
-                console.error("post-password sync failed", err);
-              },
-            );
+          crossOsUnlocked={crossOsUnlocked}
+        />
+
+        <GroupAssignmentDialog
+          isOpen={groupAssignmentDialogOpen}
+          onClose={() => {
+            setGroupAssignmentDialogOpen(false);
+          }}
+          selectedProfiles={selectedProfilesForGroup}
+          onAssignmentComplete={handleGroupAssignmentComplete}
+          profiles={profiles}
+        />
+
+        <ExtensionGroupAssignmentDialog
+          isOpen={extensionGroupAssignmentDialogOpen}
+          onClose={() => {
+            setExtensionGroupAssignmentDialogOpen(false);
+          }}
+          selectedProfiles={selectedProfilesForExtensionGroup}
+          onAssignmentComplete={handleExtensionGroupAssignmentComplete}
+          profiles={profiles}
+        />
+
+        <ProxyAssignmentDialog
+          isOpen={proxyAssignmentDialogOpen}
+          onClose={() => {
+            setProxyAssignmentDialogOpen(false);
+          }}
+          selectedProfiles={selectedProfilesForProxy}
+          onAssignmentComplete={handleProxyAssignmentComplete}
+          profiles={profiles}
+          storedProxies={storedProxies}
+          vpnConfigs={vpnConfigs}
+        />
+
+        <ProxyDistributionDialog
+          isOpen={proxyDistributionDialogOpen}
+          onClose={() => {
+            setProxyDistributionDialogOpen(false);
+          }}
+          selectedProfiles={selectedProfilesForDistribution}
+          profiles={profiles}
+          storedProxies={storedProxies}
+          onDistributionComplete={() => {
+            // useProfileEvents refreshes the table; only the selection needs
+            // clearing, and only once the assignments actually landed.
+            setSelectedProfiles([]);
+          }}
+        />
+
+        <CookieCopyDialog
+          isOpen={cookieCopyDialogOpen}
+          onClose={() => {
+            setCookieCopyDialogOpen(false);
+            setSelectedProfilesForCookies([]);
+          }}
+          selectedProfiles={selectedProfilesForCookies}
+          profiles={profiles}
+          runningProfiles={runningProfiles}
+          onCopyComplete={() => {
+            setSelectedProfilesForCookies([]);
+          }}
+        />
+
+        <CookieManagementDialog
+          isOpen={cookieManagementDialogOpen}
+          onClose={() => {
+            setCookieManagementDialogOpen(false);
+            setCurrentProfileForCookieManagement(null);
+          }}
+          profile={currentProfileForCookieManagement}
+        />
+
+        <DeleteConfirmationDialog
+          isOpen={pendingBulkAction !== null}
+          onClose={() => {
+            setPendingBulkAction(null);
+          }}
+          onConfirm={() => {
+            if (!pendingBulkAction) return;
+            if (pendingBulkAction.action === "run") {
+              void executeBulkRun(pendingBulkAction.profiles);
+            } else {
+              void executeBulkStop(pendingBulkAction.profiles);
+            }
+          }}
+          title={
+            pendingBulkAction?.action === "stop"
+              ? t("profiles.bulkStop.confirmTitle", {
+                  count: pendingBulkAction?.profiles.length ?? 0,
+                })
+              : t("profiles.bulkRun.confirmTitle", {
+                  count: pendingBulkAction?.profiles.length ?? 0,
+                })
           }
-        }}
-      />
-
-      <WayfernConfigDialog
-        isOpen={wayfernConfigDialogOpen}
-        onClose={() => {
-          setWayfernConfigDialogOpen(false);
-        }}
-        profile={currentProfileForWayfernConfig}
-        onSave={handleSaveWayfernConfig}
-        isRunning={
-          currentProfileForWayfernConfig
-            ? runningProfiles.has(currentProfileForWayfernConfig.id)
-            : false
-        }
-        crossOsUnlocked={crossOsUnlocked}
-      />
-
-      <GroupAssignmentDialog
-        isOpen={groupAssignmentDialogOpen}
-        onClose={() => {
-          setGroupAssignmentDialogOpen(false);
-        }}
-        selectedProfiles={selectedProfilesForGroup}
-        onAssignmentComplete={handleGroupAssignmentComplete}
-        profiles={profiles}
-      />
-
-      <ExtensionGroupAssignmentDialog
-        isOpen={extensionGroupAssignmentDialogOpen}
-        onClose={() => {
-          setExtensionGroupAssignmentDialogOpen(false);
-        }}
-        selectedProfiles={selectedProfilesForExtensionGroup}
-        onAssignmentComplete={handleExtensionGroupAssignmentComplete}
-        profiles={profiles}
-      />
-
-      <ProxyAssignmentDialog
-        isOpen={proxyAssignmentDialogOpen}
-        onClose={() => {
-          setProxyAssignmentDialogOpen(false);
-        }}
-        selectedProfiles={selectedProfilesForProxy}
-        onAssignmentComplete={handleProxyAssignmentComplete}
-        profiles={profiles}
-        storedProxies={storedProxies}
-        vpnConfigs={vpnConfigs}
-      />
-
-      <CookieCopyDialog
-        isOpen={cookieCopyDialogOpen}
-        onClose={() => {
-          setCookieCopyDialogOpen(false);
-          setSelectedProfilesForCookies([]);
-        }}
-        selectedProfiles={selectedProfilesForCookies}
-        profiles={profiles}
-        runningProfiles={runningProfiles}
-        onCopyComplete={() => {
-          setSelectedProfilesForCookies([]);
-        }}
-      />
-
-      <CookieManagementDialog
-        isOpen={cookieManagementDialogOpen}
-        onClose={() => {
-          setCookieManagementDialogOpen(false);
-          setCurrentProfileForCookieManagement(null);
-        }}
-        profile={currentProfileForCookieManagement}
-      />
-
-      <DeleteConfirmationDialog
-        isOpen={pendingBulkAction !== null}
-        onClose={() => {
-          setPendingBulkAction(null);
-        }}
-        onConfirm={() => {
-          if (!pendingBulkAction) return;
-          if (pendingBulkAction.action === "run") {
-            void executeBulkRun(pendingBulkAction.profiles);
-          } else {
-            void executeBulkStop(pendingBulkAction.profiles);
+          description={
+            pendingBulkAction?.action === "stop"
+              ? t("profiles.bulkStop.confirmDescription", {
+                  count: pendingBulkAction?.profiles.length ?? 0,
+                })
+              : t("profiles.bulkRun.confirmDescription", {
+                  count: pendingBulkAction?.profiles.length ?? 0,
+                })
           }
-        }}
-        title={
-          pendingBulkAction?.action === "stop"
-            ? t("profiles.bulkStop.confirmTitle", {
-                count: pendingBulkAction?.profiles.length ?? 0,
-              })
-            : t("profiles.bulkRun.confirmTitle", {
-                count: pendingBulkAction?.profiles.length ?? 0,
-              })
-        }
-        description={
-          pendingBulkAction?.action === "stop"
-            ? t("profiles.bulkStop.confirmDescription", {
-                count: pendingBulkAction?.profiles.length ?? 0,
-              })
-            : t("profiles.bulkRun.confirmDescription", {
-                count: pendingBulkAction?.profiles.length ?? 0,
-              })
-        }
-        confirmButtonText={
-          pendingBulkAction?.action === "stop"
-            ? t("profiles.bulkStop.confirmButton", {
-                count: pendingBulkAction?.profiles.length ?? 0,
-              })
-            : t("profiles.bulkRun.confirmButton", {
-                count: pendingBulkAction?.profiles.length ?? 0,
-              })
-        }
-        confirmButtonVariant="default"
-        isLoading={isBulkActing}
-      />
-      <DeleteConfirmationDialog
-        isOpen={showBulkDeleteConfirmation}
-        onClose={() => {
-          setShowBulkDeleteConfirmation(false);
-        }}
-        onConfirm={confirmBulkDelete}
-        title={t("profiles.bulkDelete.title")}
-        description={t("profiles.bulkDelete.description", {
-          count: selectedProfiles.length,
-        })}
-        confirmButtonText={t("profiles.bulkDelete.confirmButton", {
-          count: selectedProfiles.length,
-        })}
-        isLoading={isBulkDeleting}
-        profileIds={selectedProfiles}
-        profiles={profiles.map((p) => ({ id: p.id, name: p.name }))}
-      />
-
-      <SyncConfigDialog
-        isOpen={syncConfigDialogOpen}
-        onClose={(loginOccurred) => {
-          setSyncConfigDialogOpen(false);
-          void checkSelfHostedSync();
-          if (loginOccurred) {
-            setSyncAllDialogOpen(true);
+          confirmButtonText={
+            pendingBulkAction?.action === "stop"
+              ? t("profiles.bulkStop.confirmButton", {
+                  count: pendingBulkAction?.profiles.length ?? 0,
+                })
+              : t("profiles.bulkRun.confirmButton", {
+                  count: pendingBulkAction?.profiles.length ?? 0,
+                })
           }
-        }}
-        onLoginStarted={() => {
-          // Hand the verify step off to its own dialog. We close this one
-          // first so the verify dialog isn't stacked on top of it (and
-          // can't end up stacked on top of the profile selector either).
-          setSyncConfigDialogOpen(false);
-          setDeviceCodeDialogOpen(true);
-        }}
-      />
+          confirmButtonVariant="default"
+          isLoading={isBulkActing}
+        />
+        <DeleteConfirmationDialog
+          isOpen={leaseConflict !== null}
+          onClose={() => {
+            setLeaseConflict(null);
+          }}
+          onConfirm={confirmLeaseTakeOver}
+          title={t("leaseTakeOver.title")}
+          description={t("leaseTakeOver.description", {
+            profile: leaseConflict?.profile.name ?? "",
+            device: leaseConflict?.device ?? "",
+            time: leaseExpiryTime(leaseConflict?.expiresAt),
+          })}
+          confirmButtonText={t("leaseTakeOver.confirm")}
+          confirmButtonVariant="default"
+          isLoading={isTakingOver}
+        />
+        <DeleteConfirmationDialog
+          isOpen={showBulkDeleteConfirmation}
+          onClose={() => {
+            setShowBulkDeleteConfirmation(false);
+          }}
+          onConfirm={confirmBulkDelete}
+          title={t("profiles.bulkDelete.title")}
+          description={t("profiles.bulkDelete.description", {
+            count: selectedProfiles.length,
+          })}
+          confirmButtonText={t("profiles.bulkDelete.confirmButton", {
+            count: selectedProfiles.length,
+          })}
+          isLoading={isBulkDeleting}
+          profileIds={selectedProfiles}
+          profiles={profiles.map((p) => ({ id: p.id, name: p.name }))}
+        />
 
-      {/* Only render while no profile-selector flow is in progress, so the
-          verify dialog never lands on top of a deep-link-triggered selector. */}
-      {pendingUrls.length === 0 && (
-        <DeviceCodeVerifyDialog
-          isOpen={deviceCodeDialogOpen}
+        <SyncConfigDialog
+          isOpen={syncConfigDialogOpen}
           onClose={(loginOccurred) => {
-            setDeviceCodeDialogOpen(false);
+            setSyncConfigDialogOpen(false);
+            void checkSelfHostedSync();
             if (loginOccurred) {
               setSyncAllDialogOpen(true);
             }
           }}
+          onLoginStarted={() => {
+            // Hand the verify step off to its own dialog. We close this one
+            // first so the verify dialog isn't stacked on top of it (and
+            // can't end up stacked on top of the profile selector either).
+            setSyncConfigDialogOpen(false);
+            setDeviceCodeDialogOpen(true);
+          }}
         />
-      )}
 
-      <SyncAllDialog
-        isOpen={syncAllDialogOpen}
-        onClose={() => {
-          setSyncAllDialogOpen(false);
-        }}
-      />
+        {/* Only render while no profile-selector flow is in progress, so the
+          verify dialog never lands on top of a deep-link-triggered selector. */}
+        {pendingUrls.length === 0 && (
+          <DeviceCodeVerifyDialog
+            isOpen={deviceCodeDialogOpen}
+            onClose={(loginOccurred) => {
+              setDeviceCodeDialogOpen(false);
+              if (loginOccurred) {
+                setSyncAllDialogOpen(true);
+              }
+            }}
+          />
+        )}
 
-      <ProfileSyncDialog
-        isOpen={profileSyncDialogOpen}
-        onClose={() => {
-          setProfileSyncDialogOpen(false);
-          setCurrentProfileForSync(null);
-        }}
-        profile={currentProfileForSync}
-        onSyncConfigOpen={() => {
-          setSyncConfigDialogOpen(true);
-        }}
-      />
+        <SyncAllDialog
+          isOpen={syncAllDialogOpen}
+          onClose={() => {
+            setSyncAllDialogOpen(false);
+          }}
+        />
 
-      {/* Wayfern Terms and Conditions Dialog - shown if terms not accepted */}
-      <WayfernTermsDialog
-        isOpen={!termsLoading && termsAccepted === false}
-        onAccepted={checkTerms}
-      />
+        <ProfileSyncDialog
+          isOpen={profileSyncDialogOpen}
+          onClose={() => {
+            setProfileSyncDialogOpen(false);
+            setCurrentProfileForSync(null);
+          }}
+          profile={currentProfileForSync}
+          onSyncConfigOpen={() => {
+            setSyncConfigDialogOpen(true);
+          }}
+        />
 
-      {/* Commercial Trial Modal - shown once when trial expires (skip for paid users) */}
-      <CommercialTrialModal
-        isOpen={
-          !termsLoading &&
-          termsAccepted === true &&
-          trialStatus?.type === "Expired" &&
-          !trialAcknowledged &&
-          !crossOsUnlocked
-        }
-        onClose={checkTrialStatus}
-      />
+        {/* Wayfern Terms and Conditions Dialog - shown if terms not accepted */}
+        <WayfernTermsDialog
+          isOpen={!termsLoading && termsAccepted === false}
+          onAccepted={checkTerms}
+        />
 
-      <WindowResizeWarningDialog
-        isOpen={windowResizeWarningOpen}
-        onResult={(proceed) => {
-          setWindowResizeWarningOpen(false);
-          windowResizeWarningResolver.current?.(proceed);
-          windowResizeWarningResolver.current = null;
-        }}
-      />
+        {/* Commercial Trial Modal - shown once when trial expires (skip for paid users) */}
+        <CommercialTrialModal
+          isOpen={commercialTrialModalOpen}
+          onClose={checkTrialStatus}
+        />
 
-      <SyncFollowerDialog
-        isOpen={syncLeaderProfile !== null}
-        onClose={() => {
-          setSyncLeaderProfile(null);
-        }}
-        leaderProfile={syncLeaderProfile}
-        allProfiles={profiles}
-        runningProfiles={runningProfiles}
-      />
-    </div>
+        <WindowResizeWarningDialog
+          isOpen={windowResizeWarningOpen}
+          onResult={(proceed) => {
+            setWindowResizeWarningOpen(false);
+            windowResizeWarningResolver.current?.(proceed);
+            windowResizeWarningResolver.current = null;
+          }}
+        />
+
+        <SyncFollowerDialog
+          isOpen={syncLeaderProfile !== null}
+          onClose={() => {
+            setSyncLeaderProfile(null);
+          }}
+          leaderProfile={syncLeaderProfile}
+          allProfiles={profiles}
+          runningProfiles={runningProfiles}
+        />
+      </div>
+    </ProfileGroupDragProvider>
   );
 }

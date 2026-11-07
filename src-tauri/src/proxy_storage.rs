@@ -20,6 +20,10 @@ pub struct ProxyConfig {
   /// only reach domains in the file; everything else is blocked.
   #[serde(default)]
   pub dns_allowlist_mode: bool,
+  /// The profile's own DNS server (see `profile_dns`). `None` leaves name
+  /// resolution to the upstream.
+  #[serde(default)]
+  pub dns_server: Option<String>,
   /// Protocol the local worker serves to the browser: "socks5" (Wayfern/Chromium so QUIC and
   /// WebRTC UDP can be proxied without leaking the real IP). Independent of
   /// `upstream_url`, which is the real upstream proxy/VPN this worker dials.
@@ -39,6 +43,15 @@ pub struct ProxyConfig {
   /// upgrade never reaps a worker whose browser is still running.
   #[serde(default)]
   pub browser_pid_start_time: Option<u64>,
+  /// Whether the worker records which sites the browser reaches. Off keeps
+  /// byte and request counts only. Configs written before this field
+  /// existed record, as they always did.
+  #[serde(default = "default_record_domains")]
+  pub record_domains: bool,
+}
+
+fn default_record_domains() -> bool {
+  true
 }
 
 impl ProxyConfig {
@@ -54,10 +67,17 @@ impl ProxyConfig {
       bypass_rules: Vec::new(),
       blocklist_file: None,
       dns_allowlist_mode: false,
+      dns_server: None,
       local_protocol: None,
       browser_pid: None,
       browser_pid_start_time: None,
+      record_domains: true,
     }
+  }
+
+  pub fn with_record_domains(mut self, record_domains: bool) -> Self {
+    self.record_domains = record_domains;
+    self
   }
 
   pub fn with_profile_id(mut self, profile_id: Option<String>) -> Self {
@@ -77,6 +97,11 @@ impl ProxyConfig {
 
   pub fn with_dns_allowlist_mode(mut self, allowlist_mode: bool) -> Self {
     self.dns_allowlist_mode = allowlist_mode;
+    self
+  }
+
+  pub fn with_dns_server(mut self, dns_server: Option<String>) -> Self {
+    self.dns_server = dns_server;
     self
   }
 
@@ -112,10 +137,64 @@ pub fn build_proxy_url(
   } else if let Some(user) = username {
     url.push_str(&format!("{}@", urlencoding::encode(user)));
   }
-  url.push_str(host);
+  url.push_str(&url_host(host));
   url.push(':');
   url.push_str(&port.to_string());
   url
+}
+
+/// `host` without the brackets of an IPv6 address, for a socket connect.
+pub fn bare_host(host: &str) -> &str {
+  host
+    .strip_prefix('[')
+    .and_then(|h| h.strip_suffix(']'))
+    .unwrap_or(host)
+}
+
+/// `host` as the host of a URL: a bare IPv6 address gets its brackets, or
+/// its last group reads as the port.
+pub fn url_host(host: &str) -> std::borrow::Cow<'_, str> {
+  if host.parse::<std::net::Ipv6Addr>().is_ok() {
+    format!("[{host}]").into()
+  } else {
+    host.into()
+  }
+}
+
+/// Rewrite a stored upstream URL into something `reqwest::Proxy` accepts.
+///
+/// `donut-proxy` dials `httpstls://` itself, so the scheme is Donut's own and
+/// reqwest has never heard of it, `Proxy::all` would reject it outright and
+/// every probe through such a proxy would die as "Invalid proxy". reqwest's
+/// `https://` proxy scheme means exactly what `httpstls` means here (TLS to the
+/// proxy, then CONNECT), so the two agree on the wire; only the spelling
+/// differs. Every other scheme is passed through untouched.
+pub fn reqwest_upstream_url(url: &str) -> String {
+  match url.strip_prefix("httpstls://") {
+    Some(rest) => format!("https://{rest}"),
+    None => url.to_string(),
+  }
+}
+
+/// Whether `reqwest` can actually route a request through this upstream URL.
+///
+/// An ALLOW-list of the schemes hyper-util's matcher accepts. Anything else
+/// makes `reqwest::Proxy::all` SUCCEED and then match nothing, so the request is
+/// sent DIRECT with no error and no log line, which is how a geolocation probe
+/// and a proxy-check both came to report the machine's own address.
+///
+/// Callers should pass the url through [`reqwest_upstream_url`] first, so
+/// `httpstls` is judged as the `https` it becomes.
+pub fn reqwest_can_proxy(url: &str) -> bool {
+  let scheme = url
+    .split("://")
+    .next()
+    .unwrap_or_default()
+    .to_ascii_lowercase();
+  matches!(
+    scheme.as_str(),
+    "http" | "https" | "socks4" | "socks4a" | "socks5" | "socks5h"
+  )
 }
 
 pub fn get_storage_dir() -> PathBuf {
@@ -257,10 +336,17 @@ fn process_has_exited(process: &sysinfo::Process) -> bool {
   }
 }
 
+/// A process table refreshed as `refreshes` asks. sysinfo refuses only
+/// platforms Donut is not built for, so the error cannot happen here.
+pub fn process_table(refreshes: sysinfo::RefreshKind) -> sysinfo::System {
+  sysinfo::System::new_with_specifics(refreshes)
+    .expect("sysinfo supports every platform Donut is built for")
+}
+
 pub fn process_start_time(pid: u32) -> Option<u64> {
-  use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+  use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind};
   let pid = sysinfo::Pid::from_u32(pid);
-  let mut system = System::new();
+  let mut system = process_table(RefreshKind::nothing());
   system.refresh_processes_specifics(
     ProcessesToUpdate::Some(&[pid]),
     true,
@@ -610,6 +696,40 @@ mod tests {
     let config: ProxyConfig = serde_json::from_value(legacy).unwrap();
     assert_eq!(config.browser_pid, Some(4242));
     assert_eq!(config.browser_pid_start_time, None);
+  }
+
+  #[test]
+  fn reqwest_upstream_url_rewrites_only_the_donut_specific_scheme() {
+    // reqwest cannot parse `httpstls`, so without this rewrite every probe and
+    // every fallback check through such a proxy dies as "Invalid proxy". The
+    // credentials, host and port must survive untouched.
+    assert_eq!(
+      reqwest_upstream_url("httpstls://user:p%40ss@proxy.example:443"),
+      "https://user:p%40ss@proxy.example:443"
+    );
+
+    // Everything else is reqwest-native and must pass through byte-for-byte.
+    // `https` in particular: rewriting it would be a no-op today but pinning it
+    // here says the plaintext type is deliberately left alone.
+    for untouched in [
+      "http://proxy.example:8080",
+      "https://proxy.example:8080",
+      "socks5://proxy.example:1080",
+      "socks5h://proxy.example:1080",
+      "ss://proxy.example:8388",
+      "DIRECT",
+    ] {
+      assert_eq!(reqwest_upstream_url(untouched), untouched);
+    }
+  }
+
+  #[test]
+  fn reqwest_upstream_url_only_matches_the_scheme_prefix() {
+    // A host that merely starts with the scheme text must not be rewritten.
+    assert_eq!(
+      reqwest_upstream_url("http://httpstls://weird"),
+      "http://httpstls://weird"
+    );
   }
 
   #[test]

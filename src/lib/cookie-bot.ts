@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 /**
- * Cookie bot: overnight warming of a synced profile on a leased remote host.
+ * Cookie bot: scheduled warming of a synced profile on a leased remote host.
  *
  * Nothing about HOW the bot browses is here. The schedule, the calendar maths,
  * what a preset expands to, the site ordering, the dwell model and the pooled
@@ -31,8 +31,27 @@ export function isUserTemplateId(id: string | null | undefined): boolean {
   );
 }
 
-/** Hosts the fleet can lease. Linux is refused at enrolment. */
-export type CookieBotPlatform = "windows" | "macos";
+/**
+ * Operating systems a remote run can be scheduled on.
+ * Mirrors `BOT_PLATFORMS` in `src-tauri/src/cookie_bot.rs`.
+ */
+export type CookieBotPlatform = "windows" | "macos" | "linux";
+
+/**
+ * The one list every client-side platform check reads. A profile built for
+ * anything else has no machine to run on and is refused before a schedule row
+ * is ever written.
+ */
+export const BOT_PLATFORMS: readonly CookieBotPlatform[] = [
+  "windows",
+  "macos",
+  "linux",
+];
+
+/** Whether an OS name a profile reports is one the fleet can lease. */
+export function isCookieBotPlatform(value: string): value is CookieBotPlatform {
+  return (BOT_PLATFORMS as readonly string[]).includes(value);
+}
 
 /** `mine` shows the caller's enrolments, `team` the whole team's. */
 export type CookieBotScope = "mine" | "team";
@@ -90,13 +109,14 @@ export interface CookieBotSchedule {
   sticky_exit: boolean;
   /** When those facts were last refreshed. */
   profile_state_at?: string | null;
+  /** The last check of the profile's proxy or VPN from this computer. */
+  exit_check?: CookieBotExitCheck | null;
 
   /**
-   * Why tonight would be refused, or null. One of the run outcome codes.
+   * Why the next run would be refused, or null. One of the run outcome codes.
    *
    * The server computes this on every read so a broken enrolment is visible the
-   * moment it breaks, rather than first announcing itself as a skipped run at
-   * 02:00.
+   * moment it breaks, rather than first announcing itself as a skipped run.
    */
   blocked_by?: string | null;
 
@@ -106,6 +126,15 @@ export interface CookieBotSchedule {
   owner_user_id?: string | null;
   owner_email?: string | null;
   updated_at?: string | null;
+}
+
+/** Mirror of `cookie_bot_exit::ExitCheckView`. */
+export interface CookieBotExitCheck {
+  /** Unix seconds. */
+  checked_at: number;
+  ok: boolean;
+  /** False once the failures are confirmed and declared to the server. */
+  alive: boolean;
 }
 
 /**
@@ -181,9 +210,9 @@ export interface CookieBotRun {
   dispatch_after?: string | null;
   started_at?: string | null;
   ended_at?: string | null;
-  /** The night's whole budget, which may span several browser sessions. */
+  /** The run's whole budget, which may span several browser sessions. */
   max_minutes: number;
-  /** How many sessions this night is split into, and which one is running. */
+  /** How many sessions this run is split into, and which one is running. */
   chunks_total: number;
   chunk_index: number;
   sites_total: number;

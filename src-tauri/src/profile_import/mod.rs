@@ -106,9 +106,9 @@ pub fn import_into(
 /// executable name: the user may well have Chrome open on a *different*
 /// profile, which is no reason to block the import.
 fn running_source_browser(shape: &layout::SourceShape) -> Option<String> {
-  use sysinfo::{ProcessRefreshKind, RefreshKind, System};
+  use sysinfo::{ProcessRefreshKind, RefreshKind};
 
-  let system = System::new_with_specifics(
+  let system = crate::proxy_storage::process_table(
     RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
   );
 
@@ -221,7 +221,7 @@ pub fn repair_legacy_layout(user_data_dir: &Path) -> Result<bool, String> {
   let _ = os_crypt::TargetKey::ensure(user_data_dir);
 
   log::info!(
-    "Repaired legacy import layout at {} (moved profile content into {INITIAL_PROFILE_DIR}/)",
+    "Legacy import layout repaired: content moved into {INITIAL_PROFILE_DIR}/ path=\"{}\"",
     user_data_dir.display()
   );
   Ok(true)

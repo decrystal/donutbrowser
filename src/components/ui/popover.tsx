@@ -3,6 +3,7 @@
 import * as PopoverPrimitive from "@radix-ui/react-popover";
 import type * as React from "react";
 
+import { usePopupMotion } from "@/components/ui/popup-motion";
 import { cn } from "@/lib/utils";
 
 function Popover({
@@ -22,8 +23,10 @@ function PopoverContent({
   align = "center",
   sideOffset = 4,
   collisionPadding = 8,
+  ref,
   ...props
 }: React.ComponentProps<typeof PopoverPrimitive.Content>) {
+  const popupMotion = usePopupMotion(ref);
   return (
     <PopoverPrimitive.Portal>
       <PopoverPrimitive.Content
@@ -32,10 +35,11 @@ function PopoverContent({
         sideOffset={sideOffset}
         collisionPadding={collisionPadding}
         className={cn(
-          "z-50000 max-h-(--radix-popover-content-available-height) origin-(--radix-popover-content-transform-origin) overflow-y-auto rounded-md surface-material-popover border p-4 text-popover-foreground shadow-md outline-hidden data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-[state=closed]:pointer-events-none data-[state=closed]:animate-none data-[state=closed]:opacity-0 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95",
+          "popup-motion z-50000 max-h-(--radix-popover-content-available-height) origin-(--radix-popover-content-transform-origin) overflow-y-auto rounded-md border bg-popover p-4 text-popover-foreground shadow-sm outline-hidden",
           className,
         )}
         {...props}
+        {...popupMotion}
       />
     </PopoverPrimitive.Portal>
   );

@@ -1,29 +1,28 @@
-use axum::{
-  body::Body,
-  extract::State,
-  http::{header, Request, StatusCode},
-  middleware::{self, Next},
-  response::{IntoResponse, Response},
-  routing::{get, post},
-  Json, Router,
-};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::AppHandle;
-use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::browser::ProxySettings;
 use crate::cdp_target::{CdpError, CdpTarget};
 use crate::cloud_auth::CLOUD_AUTH;
 use crate::group_manager::GROUP_MANAGER;
+use crate::log_redaction::ShortId;
 use crate::profile::{BrowserProfile, ProfileManager};
 use crate::proxy_manager::PROXY_MANAGER;
-use crate::settings_manager::SettingsManager;
+use crate::wayfern_cdp::{
+  self, vellum, Engine, Extraction, ExtractionRequest, LocatorCandidate, LocatorDescription,
+  LocatorResolution, PerceptionFrame, PerceptionNode, PerceptionPage, PerceptionRequest,
+  PerceptionStats, PickedElement, ResolveOptions, ViewportTarget, WayfernError, WayfernSession,
+};
+
+static AUTOMATION_QUOTA: crate::log_streak::Throttle =
+  crate::log_streak::Throttle::new(std::time::Duration::from_secs(60));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,9 +35,10 @@ pub struct McpTool {
 /// JavaScript executed in the target page to enumerate visible interactive
 /// elements. Returns a JSON string `{elements, count, truncated}` where
 /// `elements` is the newline-joined labeled list. Live references are stashed
-/// on `window.__donut_interactive` so subsequent `click_by_index` /
+/// on a per-caller `window[...]` slot so subsequent `click_by_index` /
 /// `type_by_index` calls can resolve `index → Element` without round-tripping
-/// a selector. `__MAX_CHARS__` is substituted at call time.
+/// a selector. `__MAX_CHARS__`, `__CACHE__`, `__REGISTRY__` and `__MAX_SLOTS__`
+/// are substituted at call time.
 const INTERACTIVE_ELEMENTS_JS: &str = r#"(() => {
   const SELECTORS = 'a, button, input, select, textarea, [role="button"], [role="link"], [role="checkbox"], [role="radio"], [role="tab"], [role="menuitem"], [role="combobox"], [role="option"], [contenteditable=""], [contenteditable="true"], [tabindex]:not([tabindex="-1"])';
   const ATTRS = ['type','name','id','role','aria-label','aria-checked','aria-expanded','placeholder','title','value','href','alt'];
@@ -47,6 +47,20 @@ const INTERACTIVE_ELEMENTS_JS: &str = r#"(() => {
   const lines = [];
   let truncated = false;
   let total = 0;
+  // An id per element that stays the same across listings while the element
+  // lives, so a caller can act on `e12` after the page moved things around,
+  // and can tell which elements are new since its last listing.
+  let ids = window.__donut_element_ids;
+  if (!ids) {
+    ids = { map: new WeakMap(), next: 1, seen: {} };
+    try {
+      Object.defineProperty(window, '__donut_element_ids', { value: ids, enumerable: false, configurable: true });
+    } catch (e) {
+      window.__donut_element_ids = ids;
+    }
+  }
+  const seenBefore = ids.seen[__CACHE__];
+  const seenNow = new Set();
   const nodes = document.querySelectorAll(SELECTORS);
   for (const el of nodes) {
     if (el.disabled) continue;
@@ -65,15 +79,68 @@ const INTERACTIVE_ELEMENTS_JS: &str = r#"(() => {
       text = (el.innerText || el.textContent || '').trim().replace(/\s+/g,' ').slice(0,100);
     }
     const idx = interactive.length;
-    const line = '[' + idx + ']<' + tag + (parts.length ? ' ' + parts.join(' ') : '') + '>' + text + '</' + tag + '>';
+    let eid = ids.map.get(el);
+    if (!eid) { eid = ids.next++; ids.map.set(el, eid); }
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    const inView = cx >= 0 && cy >= 0 && cx < window.innerWidth && cy < window.innerHeight;
+    let covered = false;
+    if (inView) {
+      const hit = document.elementFromPoint(cx, cy);
+      covered = !!hit && hit !== el && !el.contains(hit) && !(hit.tagName === 'LABEL' && hit.control === el);
+    }
+    const marks = ' e' + eid
+      + (seenBefore && !seenBefore.has(eid) ? ' new' : '')
+      + (!inView ? ' offscreen' : covered ? ' covered' : '');
+    const line = '[' + idx + marks + ']<' + tag + (parts.length ? ' ' + parts.join(' ') : '') + '>' + text + '</' + tag + '>';
     if (total + line.length + 1 > MAX_CHARS) { truncated = true; break; }
     total += line.length + 1;
     interactive.push(el);
     lines.push(line);
+    seenNow.add(eid);
   }
-  window.__donut_interactive = interactive;
+  window[__CACHE__] = interactive;
+  ids.seen[__CACHE__] = seenNow;
+  // Bound how many snapshots one page carries. Each slot holds live element
+  // references, so it pins every node in it, including nodes the page has
+  // since detached, for as long as the tab lives, and NOTHING on the page
+  // ever hears that a session ended. `end_session` deletes a session's own
+  // slot, but no first-party client sends one, and an evicted or crashed
+  // session never will; without this cap a long-lived tab accumulates one
+  // array per session that ever listed it. Evicting the least recently
+  // written slot is safe in the way that matters: the evicted caller's next
+  // click_by_index finds no array and is told to re-list, which is an error,
+  // not a click on the wrong element.
+  try {
+    const registry = Array.isArray(window[__REGISTRY__]) ? window[__REGISTRY__] : [];
+    const kept = registry.filter((slot) => typeof slot === 'string' && slot !== __CACHE__ && slot in window);
+    kept.push(__CACHE__);
+    while (kept.length > __MAX_SLOTS__) {
+      const evicted = kept.shift();
+      try { delete window[evicted]; } catch (e) { window[evicted] = undefined; }
+    }
+    window[__REGISTRY__] = kept;
+  } catch (e) {
+    // A page that has made the registry unwritable only keeps its own slots
+    // alive; it must not cost the caller the listing it asked for.
+  }
   return JSON.stringify({ elements: lines.join('\n'), count: interactive.length, truncated: truncated });
 })()"#;
+
+/// Page global naming, in write order, every interactive-element slot the page
+/// currently holds. Read and rewritten by the enumeration script so the oldest
+/// slot can be evicted once [`MAX_CACHE_SLOTS_PER_PAGE`] is exceeded.
+///
+/// A quoted JS string literal, because it is substituted into `window[...]`.
+const INTERACTIVE_SLOT_REGISTRY: &str = "'__donut_interactive_slots'";
+
+/// How many interactive-element snapshots one page keeps at once.
+///
+/// Far above what any real page needs, a caller has one live snapshot, and
+/// the handful of callers driving one page at the same moment are a browser
+/// automation edge case already, and low enough that a tab open for a day
+/// cannot collect hundreds of arrays of detached DOM nodes.
+const MAX_CACHE_SLOTS_PER_PAGE: usize = 8;
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -85,8 +152,230 @@ pub struct McpRequest {
 }
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
+
+const INITIALIZE_INSTRUCTIONS: &str = "Donut Browser MCP server. Use tools/list to discover the browser tools. A person watches your work in Donut: call get_human_updates when you start and between steps, report_progress during longer jobs, ask_human when you are unsure, and request_human_help when a page needs a person. When a Donut tool fails in a way you cannot explain, or you need something it cannot do, tell the Donut team with send_feedback. A call refused with AGENT_PAUSED or PROFILE_HELD_BY_HUMAN means the person is in control; do not retry it until get_human_updates shows the pause or hold is gone.";
+
+const PLAN_WITHOUT_AUTOMATION: &str = " This account's plan does not include browser automation: tools that launch, drive or read a browser are refused with PLAN_REQUIRED. Managing profiles, groups, proxies, VPNs and extensions works.";
+
+/// Every MCP protocol revision this engine can speak, newest first.
+///
+/// The spec says a server MUST echo the client's requested version when it
+/// supports it. Answering with our own newest regardless meant a client on an
+/// older SDK compared the reply against ITS supported list, found nothing, and
+/// threw "Server's protocol version is not supported", so the whole feature
+/// was unreachable from any agent that had not upgraded in lockstep.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+  &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// The version to answer `initialize` with: the client's, when we speak it.
+fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
+  match requested {
+    Some(asked) => SUPPORTED_PROTOCOL_VERSIONS
+      .iter()
+      .find(|known| **known == asked)
+      .copied()
+      // Not a version we know. The spec's fallback is to answer with one we
+      // do support and let the client decide whether it can proceed.
+      .unwrap_or(PROTOCOL_VERSION),
+    None => PROTOCOL_VERSION,
+  }
+}
 const SERVER_NAME: &str = "donut-browser";
+const SERVER_TITLE: &str = "Donut Browser";
+const SERVER_WEBSITE: &str = "https://donutbrowser.com";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// What a tool does to the world, as MCP tool annotations say it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ToolHints {
+  read_only: bool,
+  destructive: bool,
+  idempotent: bool,
+  /// Acts on or reads websites, VPN servers or other parties.
+  open_world: bool,
+}
+
+const fn hints(
+  read_only: bool,
+  destructive: bool,
+  idempotent: bool,
+  open_world: bool,
+) -> ToolHints {
+  ToolHints {
+    read_only,
+    destructive,
+    idempotent,
+    open_world,
+  }
+}
+
+/// Reads the app's own data.
+const READS: ToolHints = hints(true, false, true, false);
+/// Reads the page of a running browser.
+const READS_PAGE: ToolHints = hints(true, false, true, true);
+/// Adds something and changes nothing that exists.
+const ADDS: ToolHints = hints(false, false, false, false);
+/// Changes or replaces what exists.
+const CHANGES: ToolHints = hints(false, true, true, false);
+/// Acts on a website, which can do anything in answer.
+const ACTS_ON_PAGE: ToolHints = hints(false, true, false, true);
+/// Opens or moves a browser without acting on the page.
+const BROWSES: ToolHints = hints(false, false, false, true);
+/// Stops something that runs.
+const STOPS: ToolHints = hints(false, false, true, false);
+
+/// The hints of every tool. None for a tool this table does not know, which a
+/// test forbids.
+fn tool_hints(name: &str) -> Option<ToolHints> {
+  Some(match name {
+    "list_profiles"
+    | "get_profile"
+    | "list_tags"
+    | "list_proxies"
+    | "get_profile_status"
+    | "list_profile_statuses"
+    | "list_profile_templates"
+    | "list_groups"
+    | "get_group"
+    | "get_proxy"
+    | "list_vpn_configs"
+    | "get_vpn_status"
+    | "get_profile_fingerprint"
+    | "get_dns_blocklist_status"
+    | "list_extensions"
+    | "list_extension_groups"
+    | "get_team_locks"
+    | "get_team_lock_status"
+    | "get_sync_sessions"
+    | "list_remote_sessions"
+    | "get_remote_session"
+    | "get_remote_hours_quota"
+    | "list_cookie_bot_schedules"
+    | "get_cookie_bot_schedule"
+    | "check_cookie_bot_conflicts"
+    | "list_cookie_bot_runs"
+    | "list_cookie_bot_presets"
+    | "get_cookie_bot_usage"
+    | "detect_browser_profiles"
+    | "export_proxies"
+    | "list_network_requests"
+    | "get_network_request"
+    | "get_human_updates"
+    | "get_diagnostics"
+    | "wait_for_human"
+    | "list_tabs"
+    | "pick_element" => READS,
+    "screenshot"
+    | "get_page_content"
+    | "get_page_info"
+    | "get_interactive_elements"
+    | "perceive_page"
+    | "resolve_locator"
+    | "wait_for" => READS_PAGE,
+    "create_profile"
+    | "create_profiles_from_template"
+    | "import_browser_profiles"
+    | "create_group"
+    | "create_proxy"
+    | "import_proxies"
+    | "import_vpn"
+    | "add_extension"
+    | "create_extension_group"
+    | "start_sync_session"
+    | "ask_human"
+    | "request_human_help"
+    | "report_progress" => ADDS,
+    "add_extension_to_group" | "start_network_capture" => hints(false, false, true, false),
+    "update_profile"
+    | "delete_profile"
+    | "bulk_update_profiles"
+    | "update_group"
+    | "delete_group"
+    | "assign_profiles_to_group"
+    | "update_proxy"
+    | "delete_proxy"
+    | "delete_vpn"
+    | "update_profile_fingerprint"
+    | "update_profile_proxy_bypass_rules"
+    | "update_profile_dns_blocklist"
+    | "update_extension"
+    | "update_extension_group"
+    | "remove_extension_from_group"
+    | "delete_extension"
+    | "delete_extension_group"
+    | "assign_extension_group_to_profile"
+    | "remove_sync_follower"
+    | "set_cookie_bot_schedule"
+    | "delete_cookie_bot_schedule"
+    | "cancel_cookie_bot_run"
+    | "stop_network_capture"
+    | "close_tab" => CHANGES,
+    "unlock_profile" | "migrate_profile_to_fingerprint_chromium" => CHANGES,
+    "distribute_proxies" | "import_profile_cookies" => hints(false, true, false, false),
+    "rotate_proxy_ip" => hints(false, true, false, true),
+    "run_actions"
+    | "press_key"
+    | "evaluate_javascript"
+    | "click_element"
+    | "type_text"
+    | "click_by_index"
+    | "type_by_index"
+    | "click_locator"
+    | "press_and_hold"
+    | "type_locator"
+    | "select_option"
+    | "file_upload" => ACTS_ON_PAGE,
+    "run_profile" | "batch_run_profiles" | "navigate" | "open_tab" | "scroll" | "go_back"
+    | "run_profile_remote" | "run_cookie_bot_now" | "extract_structured" | "send_feedback" => {
+      BROWSES
+    }
+    "connect_vpn" => hints(false, false, true, true),
+    "kill_profile"
+    | "batch_stop_profiles"
+    | "switch_tab"
+    | "stop_remote_session"
+    | "stop_sync_session"
+    | "disconnect_vpn" => STOPS,
+    _ => return None,
+  })
+}
+
+/// `list_profiles` as a person reads it: "List profiles".
+fn tool_title(name: &str) -> String {
+  let words: Vec<String> = name
+    .split('_')
+    .enumerate()
+    .map(|(i, word)| match word {
+      "ip" => "IP".to_string(),
+      "vpn" => "VPN".to_string(),
+      "dns" => "DNS".to_string(),
+      "javascript" => "JavaScript".to_string(),
+      _ if i == 0 => {
+        let mut chars = word.chars();
+        chars
+          .next()
+          .map(|first| first.to_uppercase().chain(chars).collect())
+          .unwrap_or_default()
+      }
+      _ => word.to_string(),
+    })
+    .collect();
+  words.join(" ")
+}
+
+/// The `title` and `annotations` of a tool in `tools/list`. Every hint is
+/// explicit: MCP directories require them. A tool missing from the table is
+/// described at its worst.
+fn tool_annotations(name: &str) -> serde_json::Value {
+  let hints = tool_hints(name).unwrap_or(hints(false, true, false, true));
+  serde_json::json!({
+    "title": tool_title(name),
+    "readOnlyHint": hints.read_only,
+    "destructiveHint": hints.destructive,
+    "idempotentHint": hints.idempotent,
+    "openWorldHint": hints.open_world,
+  })
+}
 
 #[derive(Debug, Serialize)]
 pub struct McpResponse {
@@ -103,6 +392,11 @@ pub struct McpResponse {
 pub struct McpError {
   code: i32,
   message: String,
+  /// Structured detail for errors an agent has to act on, such as the
+  /// candidate list behind an ambiguous locator. Absent for the rest, so the
+  /// wire shape of every existing error is unchanged.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  data: Option<serde_json::Value>,
 }
 
 /// Surface a CDP failure to the agent with the reason intact.
@@ -115,10 +409,104 @@ fn cdp_error(error: CdpError) -> McpError {
   McpError {
     code: -32000,
     message: error.to_string(),
+    data: None,
   }
 }
 
-const DEFAULT_MCP_PORT: u16 = 51080;
+/// Replace the engine's plan refusal with the server's device refusal.
+///
+/// A desktop the server will not give a Wayfern token, because another desktop
+/// on the account is the primary one, launches the engine without a token, and
+/// the engine then refuses every command as "requires a paid Donut Browser
+/// plan", which is false for a paying account.
+fn explain_engine_refusal(mut error: McpError, device_refusal: Option<String>) -> McpError {
+  if error.message.contains("requires a paid Donut Browser plan") {
+    if let Some(reason) = device_refusal {
+      error.message = reason;
+    }
+  }
+  error
+}
+
+/// Why a running browser refuses automation on an account whose plan includes
+/// it, when no device refusal explains it.
+///
+/// A browser keeps the plan token it was launched with for its whole life.
+/// That token expires, and a launch while the token service did not answer
+/// gets none, so only a new launch gives the browser a token that works.
+pub(crate) async fn stale_plan_token_refusal(profile_id: Option<&str>) -> Option<String> {
+  if CLOUD_AUTH.wayfern_device_refusal().is_some() || !CLOUD_AUTH.can_use_browser_automation().await
+  {
+    return None;
+  }
+  let running_for = profile_id
+    .and_then(|id| {
+      crate::profile::ProfileManager::instance()
+        .find_profile(id)
+        .ok()
+    })
+    .and_then(|profile| profile.process_id)
+    .and_then(crate::proxy_storage::process_start_time)
+    .and_then(|start| {
+      let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+      Some(now.saturating_sub(start))
+    });
+  Some(stale_plan_token_message(running_for))
+}
+
+fn stale_plan_token_message(running_for: Option<u64>) -> String {
+  let age = running_for
+    .map(|secs| format!(" This browser has run for {} h.", secs / 3600))
+    .unwrap_or_default();
+  format!(
+    "This browser cannot confirm the plan, although the account includes browser automation: \
+     a browser keeps the plan token it was launched with, and that token has expired, or the \
+     token service did not answer when the browser started.{age} Restart the profile to \
+     automate it: call kill_profile, then run_profile."
+  )
+}
+
+/// The create_profile result. A setting that failed after the profile was
+/// created is named as not applied, so the agent never takes it as set.
+fn created_profile_result(
+  name: &str,
+  id: &str,
+  not_applied: &[(&str, String)],
+) -> serde_json::Value {
+  let mut text = format!("Profile '{name}' created (id: {id})");
+  if !not_applied.is_empty() {
+    let failures: Vec<String> = not_applied
+      .iter()
+      .map(|(field, err)| format!("{field} ({err})"))
+      .collect();
+    text.push_str(&format!(
+      "\nNot applied: {}. Set them again with update_profile.",
+      failures.join("; ")
+    ));
+  }
+  let fields: Vec<&str> = not_applied.iter().map(|(field, _)| *field).collect();
+  serde_json::json!({
+    "content": [{ "type": "text", "text": text }],
+    "structuredContent": { "id": id, "not_applied": fields },
+  })
+}
+
+/// The proxy types the proxy tools accept. The last four are Xray share links
+/// passed in `vless_uri`.
+const MCP_PROXY_TYPES: [&str; 9] = [
+  "http",
+  "https",
+  "httpstls",
+  "socks4",
+  "socks5",
+  "vless",
+  "vmess",
+  "trojan",
+  "hysteria2",
+];
 
 fn is_mcp_browser(browser: &str) -> bool {
   matches!(browser, "wayfern" | crate::fingerprint_chromium::BROWSER_ID)
@@ -133,38 +521,3884 @@ const KEYSTROKE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 
 struct McpSession {
   initialized: bool,
+  /// When this session was last USED, which is what the cap evicts by.
+  ///
+  /// Not creation time: a long-lived agent's session is by definition the
+  /// oldest, so evicting by age threw out the one client actually working and
+  /// kept 512 abandoned ones from browser tabs that were closed hours ago.
+  last_used: std::time::Instant,
+  /// Every `(profile_id, slot)` this session has written an interactive-element
+  /// snapshot to, so `end_session` can delete the page globals it left behind.
+  ///
+  /// Server-side state alone was never the whole session: the snapshot lives in
+  /// somebody's still-open tab, holds live element references, and outlives the
+  /// session that made it. Forgetting the session without deleting the array
+  /// leaks one array per session for the life of the page.
+  cached_pages: HashSet<(String, String)>,
 }
+
+/// How many MCP sessions one desktop will hold at once.
+///
+/// The map had no bound at all: nothing evicts a session except an explicit
+/// `end_session`, and no first-party client sends one, the website mints a
+/// session per page load in which the customer actually clicks something, and
+/// the one-shot 404 retry abandons an id and mints a replacement. That is tens
+/// of kilobytes over months rather than a leak with teeth, but "grows for the
+/// life of the process with no ceiling" is not a property worth keeping when a
+/// bound costs this little. Far above any real client's usage, so hitting it
+/// means something is wrong rather than someone is busy.
+const MAX_SESSIONS: usize = 512;
 
 struct McpServerInner {
   app_handle: Option<AppHandle>,
-  token: Option<String>,
-  shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
   sessions: HashMap<String, McpSession>,
 }
 
-#[derive(Clone)]
-struct McpHttpState {
-  server: &'static McpServer,
-  token: String,
+/// What answering one JSON-RPC message produced, in transport-neutral terms.
+///
+/// Session validation, the notification path and the automation limiter live
+/// in [`McpServer::handle_message`], and the cloud bridge in
+/// [`crate::mcp_remote`] only translates this enum into whatever "no such
+/// session" means on its own wire.
+pub(crate) enum McpOutcome {
+  /// A JSON-RPC response to send back. `new_session_id` is set only by
+  /// `initialize`, and is the id the caller must echo on later messages.
+  Body {
+    body: serde_json::Value,
+    new_session_id: Option<String>,
+  },
+  /// A notification was accepted. JSON-RPC defines no reply to one.
+  Accepted,
+  /// The caller named a session this process does not have.
+  UnknownSession,
+  /// The payload was not a JSON-RPC message.
+  BadRequest,
+  /// The shared automation limiter refused the call.
+  RateLimited { retry_after_secs: u64 },
 }
 
 pub struct McpServer {
   inner: Arc<AsyncMutex<McpServerInner>>,
-  is_running: AtomicBool,
-  port: AtomicU16,
+  /// Whether the tool engine can answer at all: set once it holds the app
+  /// handle every tool needs.
+  engine_ready: AtomicBool,
+}
+
+/// Who is asking: the MCP session a message belongs to, which decides whose
+/// page state a caller is looking at. Every caller reached this machine over
+/// the cloud bridge with an account credential, so tools that read the local
+/// filesystem or export stored secrets are refused to all of them.
+#[derive(Clone, Copy)]
+pub(crate) struct McpCaller<'a> {
+  /// The session id echoed back by the caller, when it opened one at all.
+  session: Option<&'a str>,
+  /// The toolsets the caller connected with; `None` is every tool.
+  toolsets: Option<&'a crate::mcp_toolsets::Selection>,
+}
+
+/// The longest a single `type_text` call may plan to spend typing, over the
+/// local REST API.
+///
+/// Five minutes is far past any real form field (roughly 2,000 words at the
+/// default rate) and far short of the hours an unbounded string can reach.
+pub(crate) const MAX_TYPING_SECONDS: f64 = 300.0;
+
+/// The same bound over MCP.
+///
+/// A call over the bridge is answered with a timeout if it runs too long, so a
+/// plan that would type for longer than that is not slow, it is a guaranteed
+/// failure that still holds one of the eight process-wide permits for the full
+/// five minutes. Sitting under that budget leaves room for the focus step, the
+/// round trips and the answer itself.
+const MAX_BRIDGE_TYPING_SECONDS: f64 = 80.0;
+
+/// The longest text `type_text` will even PLAN, checked before planning starts.
+///
+/// `MarkovTyper::run` is superlinear, so the duration bound alone was not a
+/// bound at all: the plan for a megabyte of text costs minutes of CPU to build,
+/// and the refusal only arrives afterwards.
+const MAX_TYPING_CHARS: usize = 4096;
+
+/// Build the keystroke plan for `type_text`, or refuse it as too long.
+///
+/// Refused up front rather than typed for hours. Human typing sleeps between
+/// keystrokes, `session_wpm` is floored at 10 (human_typing.rs), and the text is
+/// bounded only by the 1 MiB frame cap, so at the floor a 10,000 character
+/// string types for over three hours and a megabyte for a fortnight. Over the
+/// bridge such a call holds one of eight PROCESS-WIDE permits the whole time, so
+/// eight of them wedge remote control for the account, and the caller cannot
+/// tell that apart from an outage.
+///
+/// Measured on the generated plan rather than the character count, so the bound
+/// means the same thing at any wpm. Refusing beats truncating: a half-typed form
+/// field is worse than an error that says what to do.
+///
+/// Separated from the sending loop so the decision can be tested for what it
+/// DOES, not merely asserted to be present in the source.
+fn plan_typing(
+  text: &str,
+  wpm: Option<f64>,
+  max_seconds: f64,
+) -> Result<Vec<crate::human_typing::TypingEvent>, McpError> {
+  // Length FIRST, before a plan is built. `MarkovTyper::run` is superlinear -
+  // planning 20,000 characters took a single unit test 24 seconds of solid CPU -
+  // so a duration bound measured on the finished plan is defeated by the work of
+  // producing it: the caller still burns minutes of CPU, and over the bridge
+  // still holds one of eight process-wide permits, before being told no.
+  //
+  // 4,096 characters is far past any real form field and cheap to plan. The
+  // duration bound below still applies, because a slow wpm can exceed the time
+  // limit well under this many characters.
+  let chars = text.chars().count();
+  if chars > MAX_TYPING_CHARS {
+    return Err(McpError {
+      code: -32602,
+      message: serde_json::json!({
+        "code": "TYPING_TOO_LONG",
+        "params": {
+          "seconds": format!("{chars}"),
+          "limit": format!("{MAX_TYPING_CHARS}"),
+        }
+      })
+      .to_string(),
+      data: None,
+    });
+  }
+
+  let events = crate::human_typing::MarkovTyper::new(text, wpm).run();
+  let planned = events.last().map_or(0.0, |event| event.time);
+  if planned > max_seconds {
+    return Err(McpError {
+      code: -32602,
+      message: serde_json::json!({
+        "code": "TYPING_TOO_LONG",
+        "params": {
+          "seconds": format!("{planned:.0}"),
+          "limit": format!("{max_seconds:.0}"),
+        }
+      })
+      .to_string(),
+      data: None,
+    });
+  }
+  Ok(events)
+}
+
+/// The page-global slot one SESSION caches its interactive-element snapshot in.
+///
+/// Keyed by MCP session. One shared slot was not enough: the website console
+/// and an agent both arrive over the bridge, as do two runs of the same agent,
+/// so one caller's `get_interactive_elements` overwrote the array another had
+/// just built and that caller's next `click_by_index(3)` resolved against the
+/// wrong array, a wrong click on somebody's real browser, reported as a
+/// successful one. Sessions are what tell two callers apart.
+///
+/// The session is not an `Option` here on purpose. A caller that never ran
+/// `initialize` used to fall back to the literal `"anon"`, which is a SHARED
+/// slot by another name: two such callers still overwrote each other's array
+/// and still clicked each other's elements. Taking a `&str` means
+/// no caller can reach a slot without a session at all -
+/// [`require_indexed_session`] is the only way to get one, and it refuses.
+///
+/// A quoted JS string literal, because it is substituted into `window[...]`.
+fn interactive_cache_slot(session: &str) -> String {
+  format!(
+    "'__donut_interactive_bridge_{}'",
+    cache_key_for_session(session)
+  )
+}
+
+/// Reduce a session id to a distinct, JS-safe fragment of a global's name.
+///
+/// Hashed rather than truncated. Replacing every character outside
+/// `[A-Za-z0-9_]` and cutting at 64 was safe but NOT distinct, whatever the doc
+/// claimed: `"abc-def"` and `"abc_def"` mapped to one slot, as did any two ids
+/// agreeing on their first 64 characters, and a slot collision is the wrong
+/// click this key exists to prevent. A hash of the WHOLE id collides only at
+/// the 128-bit birthday bound, and hex is inherently safe to paste inside a JS
+/// string literal, so nothing caller-supplied survives to close the quote,
+/// inject an expression, or grow the evaluated script.
+///
+/// Deterministic: the same id yields the same slot for the life of the session,
+/// which is what lets a second `click_by_index` find the array the first
+/// `get_interactive_elements` built.
+fn cache_key_for_session(session: &str) -> String {
+  let mut digest = blake3::hash(session.as_bytes()).to_hex().to_string();
+  // 128 bits of it. The full 256 would only make the global's name longer.
+  digest.truncate(32);
+  digest
+}
+
+/// The session an index-based tool needs, or a refusal explaining why.
+///
+/// Refusing is the only answer that cannot click the wrong element. The
+/// alternative considered, minting a per-connection identity for a caller that
+/// skipped `initialize`, keeps such a caller working, but every scheme for it
+/// either shares a slot between two connections (the bug again) or invents an
+/// identity the caller cannot name on its NEXT request, so its `click_by_index`
+/// resolves against a slot it does not own. An index is meaningless without a
+/// session anyway: it is a pointer into an array a PREVIOUS call left on the
+/// page, and only the session says whose array that is. An error the agent can
+/// act on ("call initialize") beats a click on somebody's real browser reported
+/// as a success.
+fn require_indexed_session(caller: McpCaller<'_>) -> Result<&str, McpError> {
+  caller.session.ok_or_else(|| McpError {
+    code: -32600,
+    message: "This tool needs an MCP session: call initialize and send the session id it \
+              returns on every later request. An element index only means something inside \
+              the session whose get_interactive_elements produced it."
+      .to_string(),
+    data: None,
+  })
+}
+
+/// Tools that take a caller-supplied filesystem path.
+///
+/// Refused over the bridge rather than sanitised: a remote caller cannot know
+/// this machine's filesystem, so there is no legitimate remote use to preserve
+///, which makes refusing strictly better than guessing at safe roots.
+const LOCAL_PATH_TOOLS: &[&str] = &[
+  "add_extension",
+  "update_extension",
+  "detect_browser_profiles",
+  // Its path arrives nested inside `items[].source_path` rather than as a
+  // top-level argument, which is exactly how it stayed off this list: the
+  // regression test used to grep each handler for the literal "path" and a
+  // deserialized struct field has no such literal. It reads a caller-named
+  // directory off this disk and copies it into a profile, including the
+  // source browser's cookies and passwords, so over the bridge it is an
+  // arbitrary local-file read with an account credential.
+  "import_browser_profiles",
+];
+
+/// Tools refused over the bridge because their whole output is stored secrets.
+///
+/// The bridge gate is by tool, not by field. `export_proxies` exists to write
+/// every proxy's password and VLESS URI out in full, which is exactly what the
+/// redaction on `list_proxies` and `get_proxy` withholds from a remote caller,
+/// so there is no redacted form of it worth serving. Refused with the same
+/// code as the local-path tools: it is a local-only action.
+const SECRET_EXPORT_TOOLS: &[&str] = &["export_proxies"];
+
+/// Strip the fields of a stored proxy a remote caller must not see.
+///
+/// A bridge caller holds an account credential, not this machine. The proxy
+/// password, the VLESS URI (which carries the credential inline), the dynamic
+/// list URL and the change-IP link (which usually carry an API key) are secrets of the
+/// machine, not of the account, and an agent needs none of them to pick a
+/// proxy by id. Present values are replaced rather than removed so the shape
+/// an agent has learned stays the same, and absent ones stay absent.
+fn redact_proxy_secrets(proxy: &mut serde_json::Value) {
+  const REDACTED: &str = "[redacted]";
+  if let Some(settings) = proxy
+    .get_mut("proxy_settings")
+    .and_then(serde_json::Value::as_object_mut)
+  {
+    for field in ["password", "vless_uri"] {
+      if settings.get(field).is_some_and(|v| !v.is_null()) {
+        settings.insert(field.to_string(), serde_json::Value::from(REDACTED));
+      }
+    }
+  }
+  if let Some(map) = proxy.as_object_mut() {
+    for field in ["dynamic_proxy_url", "rotation_url"] {
+      if map.get(field).is_some_and(|v| !v.is_null()) {
+        map.insert(field.to_string(), serde_json::Value::from(REDACTED));
+      }
+    }
+  }
+}
+
+/// Reject a URL the browser should never be told to open on a customer's behalf.
+///
+/// `Page.navigate` will happily load `file:///Users/…/.ssh/id_rsa`, and
+/// `get_page_content` will then hand the bytes straight back to the caller.
+/// Over the CLOUD BRIDGE that is an arbitrary local-file read reachable from
+/// the internet by anyone holding an account credential, which is not "control
+/// your browser", and is exactly the machine this module exists to protect.
+///
+/// Allowed: the schemes a browser is actually asked to browse. `about:blank`
+/// is permitted because it is the standard way to park a tab. Everything else,
+/// including `file:`, `data:`, `blob:`, `chrome:`, `devtools:` and
+/// `javascript:`, is refused.
+pub(crate) fn is_navigable_url(url: &str) -> bool {
+  let trimmed = url.trim();
+  if trimmed.eq_ignore_ascii_case("about:blank") {
+    return true;
+  }
+  let lowered = trimmed.to_ascii_lowercase();
+  lowered.starts_with("http://") || lowered.starts_with("https://")
+}
+
+fn validate_navigable_url(url: &str) -> Result<(), McpError> {
+  if is_navigable_url(url) {
+    return Ok(());
+  }
+  Err(McpError {
+    code: -32602,
+    message: crate::backend_error("URL_SCHEME_NOT_ALLOWED"),
+    data: None,
+  })
+}
+
+// --- Agent surface: perception, locators, extraction, picker, humanized input --
+
+/// The longest `pick_element` waits for a click over the local REST API.
+pub(crate) const MAX_PICK_TIMEOUT_MS: u64 = 300_000;
+
+/// How long `pick_element` waits when the caller does not say.
+pub(crate) const DEFAULT_PICK_TIMEOUT_MS: u64 = 60_000;
+
+/// The same bound over MCP.
+///
+/// A call over the bridge is answered with a timeout if it runs too long, so a
+/// wait that would outlive it is not patience, it is a guaranteed failure that
+/// still holds one of the eight process-wide permits. Same margin as typing.
+/// The browser's own two-minute ceiling on `extract_structured` is cut to the
+/// same budget for the same reason.
+const MAX_BRIDGE_PICK_TIMEOUT_MS: u64 = 80_000;
+
+/// How long the browser's own typing rhythm is budgeted per character.
+///
+/// `Vellum.inscribe` paces the keys itself, so this is a per-character ceiling
+/// rather than an estimate: a text the budget refuses is one the browser would
+/// have turned into a hung call.
+const VELLUM_SECONDS_PER_CHAR: f64 = 0.25;
+
+/// How long a click waits for the page it may have navigated to.
+const CLICK_LOAD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The `TYPING_TOO_LONG` envelope, shared by both typing engines.
+fn typing_too_long(seconds: f64, limit: f64) -> McpError {
+  McpError {
+    code: -32602,
+    message: serde_json::json!({
+      "code": "TYPING_TOO_LONG",
+      "params": {
+        "seconds": format!("{seconds:.0}"),
+        "limit": format!("{limit:.0}"),
+      }
+    })
+    .to_string(),
+    data: None,
+  }
+}
+
+/// The time a `Vellum.inscribe` of `text` may take, or the refusal.
+///
+/// Decided BEFORE anything touches the page, for the same reason `plan_typing`
+/// is: a refusal that arrives after the field was emptied is a lie.
+fn vellum_typing_budget(text: &str, max_seconds: f64) -> Result<Duration, McpError> {
+  let chars = text.chars().count();
+  if chars > MAX_TYPING_CHARS {
+    return Err(typing_too_long(chars as f64, MAX_TYPING_CHARS as f64));
+  }
+  let estimate = chars as f64 * VELLUM_SECONDS_PER_CHAR + 1.0;
+  if estimate > max_seconds {
+    return Err(typing_too_long(estimate, max_seconds));
+  }
+  Ok(Duration::from_secs_f64(max_seconds))
+}
+
+/// Why an agent operation could not be completed.
+///
+/// One vocabulary for both front doors. The MCP transport renders it as a
+/// JSON-RPC error whose `data` carries the structured part, and the REST
+/// transport maps the same variants onto statuses, so a locator that matched
+/// three buttons is reported the same way whichever door it came through.
+#[derive(Debug)]
+pub(crate) enum AgentError {
+  /// The caller's arguments cannot mean anything on any page.
+  InvalidArgument(String),
+  /// The profile runs a Wayfern older than the feature.
+  RequiresWayfern152 {
+    version: String,
+  },
+  /// The browser refused: no paid plan behind this browser.
+  PaymentRequired(String),
+  /// The browser refused: too many calls too fast.
+  RateLimited(String),
+  /// The browser could not confirm this account's plan.
+  AuthorizationUnavailable(String),
+  AmbiguousLocator {
+    match_count: u64,
+    candidates: Vec<serde_json::Value>,
+    message: String,
+  },
+  NoMatch {
+    message: String,
+  },
+  PickerTimedOut {
+    timeout_ms: u64,
+  },
+  PickerCancelled {
+    reason: String,
+  },
+  TypingTooLong {
+    seconds: f64,
+    limit: f64,
+  },
+  /// The field does not hold the typed text: it never took the focus
+  /// (`reason` "not_focused"), or the page kept or reset another value
+  /// ("value").
+  TypeNotApplied {
+    reason: &'static str,
+    /// What the field holds; withheld for a password or card field.
+    value: Option<String>,
+    message: String,
+  },
+  /// The browser refused the request as malformed (`-32602`), or the page
+  /// threw at it: what was asked for does not exist or cannot be done.
+  BadRequest(String),
+  /// The browser failed to do what it was asked (`-32000`).
+  Browser(String),
+  /// The transport, or the browser's absence.
+  Cdp(CdpError),
+  /// A reply without the documented shape.
+  Malformed(String),
+}
+
+impl AgentError {
+  /// A stable code an agent can branch on.
+  pub(crate) fn code(&self) -> &'static str {
+    match self {
+      Self::InvalidArgument(_) => "INVALID_ARGUMENT",
+      Self::RequiresWayfern152 { .. } => "WAYFERN_152_REQUIRED",
+      Self::PaymentRequired(_) => "PAYMENT_REQUIRED",
+      Self::RateLimited(_) => "RATE_LIMITED",
+      Self::AuthorizationUnavailable(_) => "AUTHORIZATION_UNAVAILABLE",
+      Self::AmbiguousLocator { .. } => "LOCATOR_AMBIGUOUS",
+      Self::NoMatch { .. } => "LOCATOR_NO_MATCH",
+      Self::PickerTimedOut { .. } => "PICKER_TIMEOUT",
+      Self::PickerCancelled { .. } => "PICKER_CANCELLED",
+      Self::TypingTooLong { .. } => "TYPING_TOO_LONG",
+      Self::TypeNotApplied { .. } => "TYPE_NOT_APPLIED",
+      Self::BadRequest(_) => "BAD_REQUEST",
+      Self::Browser(_) => "BROWSER_ERROR",
+      Self::Cdp(_) => "CDP_ERROR",
+      Self::Malformed(_) => "MALFORMED_REPLY",
+    }
+  }
+
+  /// The human-readable part.
+  pub(crate) fn message(&self) -> String {
+    match self {
+      Self::InvalidArgument(m)
+      | Self::PaymentRequired(m)
+      | Self::RateLimited(m)
+      | Self::AuthorizationUnavailable(m)
+      | Self::BadRequest(m)
+      | Self::Browser(m)
+      | Self::Malformed(m) => m.clone(),
+      Self::RequiresWayfern152 { version } => format!(
+        "This tool requires Wayfern 152 or newer; the profile runs {version}. Update the profile's browser, or use the selector and index tools."
+      ),
+      Self::AmbiguousLocator { message, .. }
+      | Self::NoMatch { message }
+      | Self::TypeNotApplied { message, .. } => message.clone(),
+      Self::PickerTimedOut { timeout_ms } => {
+        format!("No element was picked within {timeout_ms} ms; the picker has been disarmed")
+      }
+      Self::PickerCancelled { reason } => format!("The element picker was cancelled ({reason})"),
+      Self::TypingTooLong { seconds, limit } => {
+        format!("Typing this text would take about {seconds:.0}s, over the {limit:.0}s limit")
+      }
+      Self::Cdp(e) => e.to_string(),
+    }
+  }
+
+  /// The structured part, when there is one.
+  pub(crate) fn detail(&self) -> serde_json::Value {
+    let mut detail = serde_json::json!({ "code": self.code() });
+    match self {
+      Self::AmbiguousLocator {
+        match_count,
+        candidates,
+        ..
+      } => {
+        detail["matchCount"] = serde_json::Value::from(*match_count);
+        detail["candidates"] = serde_json::Value::Array(candidates.clone());
+      }
+      Self::NoMatch { .. } => {
+        detail["matchCount"] = serde_json::Value::from(0);
+        detail["candidates"] = serde_json::json!([]);
+      }
+      Self::RequiresWayfern152 { version } => {
+        detail["version"] = serde_json::Value::from(version.as_str());
+      }
+      Self::PickerTimedOut { timeout_ms } => {
+        detail["timeoutMs"] = serde_json::Value::from(*timeout_ms);
+      }
+      Self::PickerCancelled { reason } => {
+        detail["reason"] = serde_json::Value::from(reason.as_str());
+      }
+      Self::TypingTooLong { seconds, limit } => {
+        detail["seconds"] = serde_json::Value::from(*seconds);
+        detail["limit"] = serde_json::Value::from(*limit);
+      }
+      Self::TypeNotApplied { reason, value, .. } => {
+        detail["reason"] = serde_json::Value::from(*reason);
+        if let Some(value) = value {
+          detail["value"] = serde_json::Value::from(value.as_str());
+        }
+      }
+      _ => {}
+    }
+    detail
+  }
+
+  /// As a JSON-RPC error. Argument problems are `-32602`; the rest is the
+  /// same `-32000` every other browser tool answers with, with `data` telling
+  /// the two apart.
+  fn into_mcp(self) -> McpError {
+    let code = match self {
+      Self::InvalidArgument(_) | Self::TypingTooLong { .. } | Self::BadRequest(_) => -32602,
+      _ => -32000,
+    };
+    let message = match &self {
+      // The same envelope `plan_typing` answers with, so a client that already
+      // understands one typing refusal understands both.
+      Self::TypingTooLong { seconds, limit } => typing_too_long(*seconds, *limit).message,
+      _ => self.message(),
+    };
+    McpError {
+      code,
+      message,
+      data: Some(self.detail()),
+    }
+  }
+}
+
+impl From<CdpError> for AgentError {
+  fn from(error: CdpError) -> Self {
+    if let Some(refusal) = wayfern_cdp::classify_refusal(&error) {
+      let message = wayfern_cdp::protocol_message(&error).unwrap_or_else(|| error.to_string());
+      return match refusal {
+        wayfern_cdp::BrowserRefusal::PaymentRequired => Self::PaymentRequired(message),
+        wayfern_cdp::BrowserRefusal::RateLimited => Self::RateLimited(message),
+        wayfern_cdp::BrowserRefusal::AuthorizationUnavailable => {
+          Self::AuthorizationUnavailable(message)
+        }
+      };
+    }
+    match wayfern_cdp::protocol_code(&error) {
+      Some(-32602) => {
+        Self::BadRequest(wayfern_cdp::protocol_message(&error).unwrap_or_else(|| error.to_string()))
+      }
+      Some(_) => {
+        Self::Browser(wayfern_cdp::protocol_message(&error).unwrap_or_else(|| error.to_string()))
+      }
+      None => Self::Cdp(error),
+    }
+  }
+}
+
+impl From<WayfernError> for AgentError {
+  fn from(error: WayfernError) -> Self {
+    match error {
+      WayfernError::Cdp(e) => Self::from(e),
+      WayfernError::AmbiguousLocator {
+        match_count,
+        candidates,
+        message,
+      } => Self::AmbiguousLocator {
+        match_count,
+        candidates,
+        message,
+      },
+      WayfernError::NoMatch { message } => Self::NoMatch { message },
+      WayfernError::PickerTimedOut { timeout_ms } => Self::PickerTimedOut { timeout_ms },
+      WayfernError::PickerCancelled { reason } => Self::PickerCancelled { reason },
+      WayfernError::NotVisible(m) => Self::BadRequest(m),
+      WayfernError::Malformed(m) => Self::Malformed(m),
+    }
+  }
+}
+
+impl From<McpError> for AgentError {
+  /// The typing planner answers in the `TYPING_TOO_LONG` envelope; anything
+  /// else from that layer is a browser-side failure.
+  fn from(error: McpError) -> Self {
+    if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&error.message) {
+      if envelope.get("code").and_then(|c| c.as_str()) == Some("TYPING_TOO_LONG") {
+        let number = |key: &str| {
+          envelope["params"][key]
+            .as_str()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0)
+        };
+        return Self::TypingTooLong {
+          seconds: number("seconds"),
+          limit: number("limit"),
+        };
+      }
+    }
+    Self::Browser(error.message)
+  }
+}
+
+/// A running browser, and the engine its version entitles it to.
+pub(crate) struct AgentContext {
+  pub profile: BrowserProfile,
+  pub target: CdpTarget,
+  pub engine: Engine,
+}
+
+impl AgentContext {
+  /// The engine is read from the profile HERE, at the point of use, never
+  /// cached: a profile updated to 152 gets the native path on its next call.
+  pub(crate) fn new(profile: BrowserProfile, target: CdpTarget) -> Self {
+    let engine = Engine::for_version(&profile.version);
+    Self {
+      profile,
+      target,
+      engine,
+    }
+  }
+
+  fn requires_wayfern_152(&self) -> Result<(), AgentError> {
+    if self.engine.is_wayfern() {
+      Ok(())
+    } else {
+      Err(AgentError::RequiresWayfern152 {
+        version: self.profile.version.clone(),
+      })
+    }
+  }
+}
+
+/// The body of `resolve_locator`.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub(crate) struct AgentResolveRequest {
+  pub locator: LocatorDescription,
+  /// How many candidates an ambiguity error lists. Default 10, ceiling 100.
+  #[serde(default, alias = "candidateLimit")]
+  pub candidate_limit: Option<u64>,
+}
+
+/// The body of `click_locator`.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub(crate) struct AgentClickRequest {
+  pub locator: LocatorDescription,
+  /// "left" (default), "middle", "right", "back" or "forward".
+  #[serde(default)]
+  pub button: Option<String>,
+  /// 1 (default), 2 for a double click, 3 for a triple.
+  #[serde(default, alias = "clickCount")]
+  pub click_count: Option<u32>,
+}
+
+/// What `click_locator` did.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct AgentClick {
+  pub clicked: bool,
+  #[serde(rename = "match")]
+  pub matched: LocatorCandidate,
+  pub engine: Engine,
+  /// Whether a page load followed the click.
+  pub navigated: bool,
+}
+
+/// The body of `POST /agent/hold`. The MCP tool `press_and_hold` takes the
+/// same fields, and also `index` or `element_id`.
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+pub(crate) struct AgentHoldRequest {
+  /// How to name the element. Give this or `selector`, not both.
+  #[serde(default)]
+  pub locator: Option<LocatorDescription>,
+  /// CSS selector of the element. Give this or `locator`, not both.
+  #[serde(default)]
+  pub selector: Option<String>,
+  /// How long to keep the button down: a whole number from 100 to 30000
+  /// milliseconds. Default 3000.
+  #[serde(default, alias = "durationMs")]
+  pub duration_ms: Option<f64>,
+  /// "left" (default), "middle" or "right".
+  #[serde(default)]
+  pub button: Option<String>,
+}
+
+/// What `press_and_hold` did.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct AgentHold {
+  pub held: bool,
+  /// The element a locator settled on. Absent when another way named it.
+  #[serde(rename = "match", skip_serializing_if = "Option::is_none")]
+  pub matched: Option<LocatorCandidate>,
+  pub engine: Engine,
+  /// Whether a page load followed the release.
+  pub navigated: bool,
+  pub button: String,
+  /// How long the button was down, in milliseconds.
+  pub held_ms: u64,
+}
+
+/// The body of `type_locator`.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub(crate) struct AgentTypeRequest {
+  pub locator: LocatorDescription,
+  pub text: String,
+  /// Empty the field first. Default true.
+  #[serde(default, alias = "clearFirst")]
+  pub clear_first: Option<bool>,
+  /// Mistype and correct a few characters, as a hand does. Default true.
+  #[serde(default)]
+  pub typos: Option<bool>,
+  /// Target words per minute. Honoured by the fallback engine only: Wayfern
+  /// 152 types at the profile's own rhythm.
+  #[serde(default)]
+  pub wpm: Option<f64>,
+}
+
+/// What `type_locator` did.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct AgentTyping {
+  pub typed: bool,
+  /// Characters delivered.
+  pub characters: u64,
+  /// Mistyped characters that were corrected. Absent on the fallback engine,
+  /// which does not count its own.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub corrections: Option<u64>,
+  pub duration_ms: f64,
+  pub engine: Engine,
+  #[serde(rename = "match")]
+  pub matched: LocatorCandidate,
+  /// The field was read back and holds the text. False only for a field whose
+  /// value is not the typed text (a date or colour picker): a field that does
+  /// not hold the text is refused with `TYPE_NOT_APPLIED`.
+  pub verified: bool,
+}
+
+/// The body of `pick_element`.
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+pub(crate) struct AgentPickRequest {
+  /// How long to wait for the click. Default 60000, ceiling 300000.
+  #[serde(default, alias = "timeoutMs")]
+  pub timeout_ms: Option<u64>,
+}
+
+/// Where a locator refers to, spelled the way the browser spells it in its
+/// own error messages.
+fn describe_locator(locator: &LocatorDescription) -> String {
+  let mut parts = Vec::new();
+  if let Some(role) = &locator.role {
+    parts.push(format!("role={role}"));
+  }
+  if let Some(name) = &locator.name {
+    parts.push(format!("name={name}"));
+  }
+  if let Some(name) = &locator.name_contains {
+    parts.push(format!("nameContains={name}"));
+  }
+  if let Some(text) = &locator.text {
+    parts.push(format!("text={text}"));
+  }
+  if let Some(text) = &locator.text_contains {
+    parts.push(format!("textContains={text}"));
+  }
+  for attribute in locator.attributes.iter().flatten() {
+    parts.push(format!("{}={}", attribute.name, attribute.value));
+  }
+  parts.join(", ")
+}
+
+/// ARIA role names for the Blink AX tokens the browser indexes.
+///
+/// The perception snapshot and the locator resolver speak Blink's own role
+/// vocabulary (`textField`, `staticText`, `radioButton`), and so does the
+/// fallback engine, so the two agree. An agent that has read ARIA writes
+/// `textbox`. The browser matches roles case- and separator-insensitively, so
+/// only the tokens that differ in substance are translated here, and only
+/// where the ARIA role has exactly one Blink counterpart.
+const ROLE_SYNONYMS: [(&str, &str); 7] = [
+  ("textbox", "textField"),
+  ("radio", "radioButton"),
+  ("progressbar", "progressIndicator"),
+  ("separator", "splitter"),
+  ("generic", "genericContainer"),
+  ("text", "staticText"),
+  ("img", "image"),
+];
+
+/// The locator with its role spelled the way the browser spells it.
+fn canonical_locator(locator: &LocatorDescription) -> LocatorDescription {
+  let mut canonical = locator.clone();
+  if let Some(role) = &locator.role {
+    let key: String = role
+      .chars()
+      .filter(char::is_ascii_alphanumeric)
+      .collect::<String>()
+      .to_ascii_lowercase();
+    if let Some((_, blink)) = ROLE_SYNONYMS.iter().find(|(aria, _)| *aria == key) {
+      canonical.role = Some((*blink).to_string());
+    }
+  }
+  canonical
+}
+
+fn validate_locator(locator: &LocatorDescription) -> Result<(), AgentError> {
+  if locator.is_empty() {
+    return Err(AgentError::InvalidArgument(
+      "locator needs at least one of role, name, nameContains, text, textContains or attributes"
+        .to_string(),
+    ));
+  }
+  for attribute in locator.attributes.iter().flatten() {
+    if attribute.name.trim().is_empty() {
+      return Err(AgentError::InvalidArgument(
+        "every locator attribute needs a name".to_string(),
+      ));
+    }
+  }
+  Ok(())
+}
+
+/// The mouse button names both engines accept.
+const MOUSE_BUTTONS: [&str; 5] = ["left", "middle", "right", "back", "forward"];
+
+fn validate_click(request: &AgentClickRequest) -> Result<(), AgentError> {
+  validate_locator(&request.locator)?;
+  if let Some(button) = request.button.as_deref() {
+    if !MOUSE_BUTTONS.contains(&button) {
+      return Err(AgentError::InvalidArgument(format!(
+        "button must be one of {}",
+        MOUSE_BUTTONS.join(", ")
+      )));
+    }
+  }
+  if let Some(count) = request.click_count {
+    if !(1..=3).contains(&count) {
+      return Err(AgentError::InvalidArgument(
+        "click_count must be 1, 2 or 3".to_string(),
+      ));
+    }
+  }
+  Ok(())
+}
+
+fn validate_extraction(request: &ExtractionRequest) -> Result<(), AgentError> {
+  validate_locator(&request.container)?;
+  if request.field_map.is_empty() {
+    return Err(AgentError::InvalidArgument(
+      "field_map needs at least one field".to_string(),
+    ));
+  }
+  for field in &request.field_map {
+    if field.key.trim().is_empty() {
+      return Err(AgentError::InvalidArgument(
+        "every field needs a key".to_string(),
+      ));
+    }
+    validate_locator(&field.locator)?;
+    match field.source.as_str() {
+      "text" | "link" => {}
+      "attribute" => {
+        if field
+          .attribute
+          .as_deref()
+          .is_none_or(|a| a.trim().is_empty())
+        {
+          return Err(AgentError::InvalidArgument(format!(
+            "field '{}' reads an attribute but names none",
+            field.key
+          )));
+        }
+      }
+      other => {
+        return Err(AgentError::InvalidArgument(format!(
+          "field '{}' has source '{other}'; it must be text, attribute or link",
+          field.key
+        )))
+      }
+    }
+  }
+  if let Some(next) = &request.next_page {
+    validate_locator(next)?;
+  }
+  Ok(())
+}
+
+/// Evaluate `expression` on a fresh connection and hand back the JSON string
+/// it returned, or the exception it threw as a [`AgentError::BadRequest`].
+///
+/// Every fallback script returns `JSON.stringify(...)`, so one reader serves
+/// them all.
+async fn evaluate_json_script(
+  target: &CdpTarget,
+  expression: String,
+) -> Result<serde_json::Value, AgentError> {
+  let result = crate::cdp_target::run_command(
+    target,
+    "Runtime.evaluate",
+    serde_json::json!({ "expression": expression, "returnByValue": true }),
+  )
+  .await?;
+  parse_json_script_result(&result)
+}
+
+/// What a page script threw, as a [`AgentError::BadRequest`].
+fn script_exception(result: &serde_json::Value) -> Option<AgentError> {
+  let exception = result.get("exceptionDetails")?;
+  let message = exception
+    .get("exception")
+    .and_then(|e| e.get("description"))
+    .or_else(|| exception.get("text"))
+    .and_then(|v| v.as_str())
+    .unwrap_or("the page script failed");
+  Some(AgentError::BadRequest(message.to_string()))
+}
+
+/// The same reader for a script evaluated on an existing session.
+fn parse_json_script_result(result: &serde_json::Value) -> Result<serde_json::Value, AgentError> {
+  if let Some(thrown) = script_exception(result) {
+    return Err(thrown);
+  }
+  let text = result
+    .get("result")
+    .and_then(|r| r.get("value"))
+    .and_then(|v| v.as_str())
+    .ok_or_else(|| AgentError::Malformed("the page script returned no value".to_string()))?;
+  serde_json::from_str(text)
+    .map_err(|e| AgentError::Malformed(format!("the page script returned invalid JSON: {e}")))
+}
+
+/// A page function that reads an element's rendered text as `innerText` does,
+/// but over the flat tree: into open shadow roots and the nodes a slot shows.
+/// `innerText` stops at both, so the text of a web component (a profile's
+/// stats, a nav link that slots its label) reads as nothing.
+const FLAT_TEXT_JS: &str = r#"(root) => {
+  if (root.nodeType === 1 && !root.getClientRects().length && getComputedStyle(root).display !== 'contents') return root.textContent;
+  const SKIP = new Set(['script', 'style', 'noscript', 'template', 'head', 'meta', 'link', 'title']);
+  const out = [];
+  const last = () => (out.length ? out[out.length - 1] : '\n');
+  const brk = () => { if (!/\n$/.test(last())) out.push('\n'); };
+  const kids = (n) => { if (n.shadowRoot) return n.shadowRoot.childNodes; if (n.localName === 'slot') { const shown = n.assignedNodes(); if (shown.length) return shown; } return n.childNodes; };
+  const walk = (n, pre, shown) => {
+    if (n.nodeType === 3) {
+      if (!shown) return;
+      let t = pre ? n.nodeValue : n.nodeValue.replace(/[ \t\n\r\f]+/g, ' ');
+      if (!pre && t[0] === ' ' && /[ \t\n]$/.test(last())) t = t.slice(1);
+      if (t) out.push(t);
+      return;
+    }
+    if (n.nodeType !== 1 || SKIP.has(n.localName)) return;
+    if (n.localName === 'br') { if (shown) out.push('\n'); return; }
+    const s = getComputedStyle(n);
+    if (s.display === 'none') return;
+    const block = !/^(inline|contents|table-cell|ruby)/.test(s.display);
+    if (block) brk();
+    for (const c of kids(n)) walk(c, /^pre/.test(s.whiteSpace), s.visibility === 'visible');
+    if (block) brk(); else if (s.display === 'table-cell') out.push('\t');
+  };
+  walk(root, false, true);
+  return out.join('').replace(/ +\n/g, '\n').trim();
+}"#;
+
+/// A page expression for the rendered text of the element `element` names:
+/// its `innerText`, or the flat-tree reading of [`FLAT_TEXT_JS`] when it or
+/// anything inside it holds an open shadow root.
+fn rendered_text_js(element: &str) -> String {
+  format!(
+    "((el) => {{ if (!el) return null; const flat = {FLAT_TEXT_JS}; if (el.shadowRoot) return flat(el); for (const n of el.querySelectorAll('*')) {{ if (n.shadowRoot) return flat(el); }} return el.innerText; }})({element})"
+  )
+}
+
+/// The pre-152 stand-in for the browser's perception and locator domains, and
+/// the page side of the 152 locator path.
+///
+/// One script, three modes, over the light DOM and every open shadow root.
+/// `perceive` walks the visible DOM and describes it in the SAME node shape
+/// `Wayfern.capturePagePerception` answers with, so an agent written against
+/// 152 reads both. `resolve` applies a locator with the browser's own semantics
+/// (role token, exact or substring name and text, every attribute pair) and
+/// refuses ambiguity the same way; with `act` it also scrolls to, or focuses
+/// and prepares, the one match, because the element reference cannot leave the
+/// page and a second script could resolve a different node. `pin` finds the
+/// element behind a match the browser described, by its attributes, role and
+/// text. With `returnElement`, `resolve` and `pin` answer `[report, element]`
+/// for a caller that reads the element by reference. `__OPTS__` is substituted
+/// with a JSON object at call time.
+const AGENT_FALLBACK_JS: &str = r#"(() => {
+  const opts = __OPTS__;
+  const now = () => (window.performance && performance.now) ? performance.now() : Date.now();
+  const started = now();
+  const norm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+  const roleKey = (r) => norm(r).toLowerCase().replace(/[^a-z0-9]/g, '');
+  // Blink refines a button with aria-haspopup or aria-pressed into its own
+  // role; a locator naming either spelling means the same control.
+  const roleMatchKey = (r) => { const k = roleKey(r); return k === 'popupbutton' || k === 'togglebutton' ? 'button' : k; };
+  // Blink's own AX role tokens, which is what Wayfern 152 answers with, so an
+  // agent reads one vocabulary whichever engine answered.
+  const INPUT_ROLES = { button: 'button', submit: 'button', reset: 'button', image: 'button', file: 'button', color: 'button', checkbox: 'checkBox', radio: 'radioButton', range: 'slider', number: 'spinButton', search: 'searchBox', hidden: 'none' };
+  const TAG_ROLES = { a: 'link', area: 'link', button: 'button', select: 'comboBoxSelect', textarea: 'textField', img: 'image', h1: 'heading', h2: 'heading', h3: 'heading', h4: 'heading', h5: 'heading', h6: 'heading', nav: 'navigation', main: 'main', header: 'banner', footer: 'contentInfo', form: 'form', table: 'table', tr: 'row', td: 'cell', th: 'columnHeader', ul: 'list', ol: 'list', li: 'listItem', p: 'paragraph', option: 'listBoxOption', label: 'labelText', dialog: 'dialog', section: 'region', article: 'article', aside: 'complementary', summary: 'disclosureTriangle', details: 'details', fieldset: 'group', legend: 'legend', progress: 'progressIndicator', meter: 'meter', hr: 'splitter', blockquote: 'blockquote', code: 'code', em: 'emphasis', strong: 'strong', figure: 'figure', menu: 'menu', output: 'status', time: 'time', dd: 'definition', dt: 'term', dl: 'descriptionList', caption: 'caption', video: 'video', audio: 'audio', iframe: 'iframe' };
+  const NAMED_FROM_CONTENT = new Set(['button', 'link', 'heading', 'tab', 'menuitem', 'menuitemcheckbox', 'menuitemradio', 'listboxoption', 'option', 'cell', 'columnheader', 'rowheader', 'gridcell', 'checkbox', 'radiobutton', 'radio', 'switch', 'treeitem', 'tooltip', 'legend', 'caption', 'labeltext', 'label', 'disclosuretriangle']);
+  const ATTRS = ['id', 'name', 'type', 'role', 'href', 'src', 'placeholder', 'aria-label', 'title', 'alt', 'data-testid', 'data-test', 'data-id', 'for', 'value'];
+  const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'HEAD', 'META', 'LINK', 'TITLE', 'BR', 'WBR']);
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const fnv = (s) => { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return ('00000000' + h.toString(16)).slice(-8); };
+  const tagOf = (el) => String(el.tagName || '').toLowerCase();
+  // Parents and containment cross shadow boundaries: the browser's accessibility
+  // tree is built over the flattened tree, so a button inside a web component is
+  // a child of its host here too.
+  const parentOf = (el) => el.parentElement || (el.parentNode && el.parentNode.host) || null;
+  const containsDeep = (outer, inner) => { for (let n = inner; n; n = n.parentNode || n.host) { if (n === outer) return true; } return false; };
+  const pathOf = (el) => { const parts = []; let n = el; while (n && n.nodeType === 1 && n !== document.documentElement) { let i = 1, s = n; while ((s = s.previousElementSibling)) { if (s.tagName === n.tagName) i++; } parts.push(tagOf(n) + ':' + i); n = parentOf(n); } return parts.reverse().join('>'); };
+  const roleOf = (el) => {
+    const explicit = el.getAttribute('role');
+    if (explicit && norm(explicit)) return norm(explicit).split(' ')[0];
+    const tag = tagOf(el);
+    if (tag === 'input') { const t = (el.getAttribute('type') || 'text').toLowerCase(); return INPUT_ROLES[t] || 'textField'; }
+    if (tag === 'a' && !el.hasAttribute('href')) return 'genericContainer';
+    if (el.isContentEditable && !TAG_ROLES[tag]) return 'textField';
+    return TAG_ROLES[tag] || 'genericContainer';
+  };
+  const isProtected = (el) => tagOf(el) === 'input' && ((el.getAttribute('type') || '').toLowerCase() === 'password' || /(^|\s)(cc-|password|one-time-code)/i.test(el.getAttribute('autocomplete') || ''));
+  // innerText misses what a shadow root or a slot shows.
+  const flatText = __FLAT_TEXT__;
+  const contentText = (el) => norm(el.shadowRoot || el.getElementsByTagName('slot').length ? flatText(el) : el.innerText != null ? el.innerText : el.textContent);
+  // The browser's name from content also reads image alt text, which
+  // innerText leaves out ("User Avatar Expand user menu").
+  const altText = (el) => { const parts = []; const walk = (n) => { for (const c of n.childNodes) { if (c.nodeType === 3) parts.push(c.nodeValue); else if (c.nodeType === 1 && !SKIP.has(String(c.tagName).toUpperCase()) && c.getAttribute('aria-hidden') !== 'true') { const t = tagOf(c); if (t === 'img' || t === 'area' || t === 'svg') { const a = c.getAttribute('aria-label') || c.getAttribute('alt'); if (a) parts.push(a); } else walk(c); } } }; walk(el); return norm(parts.join(' ')).slice(0, 300); };
+  const nameOf = (el, role) => {
+    const ids = el.getAttribute('aria-labelledby');
+    if (ids) { const scope = el.getRootNode && el.getRootNode().getElementById ? el.getRootNode() : document; const t = norm(ids.split(/\s+/).map((id) => { const n = scope.getElementById(id); return n ? (n.innerText != null ? n.innerText : n.textContent) : ''; }).join(' ')); if (t) return t.slice(0, 300); }
+    const aria = el.getAttribute('aria-label'); if (aria && norm(aria)) return norm(aria).slice(0, 300);
+    if (el.labels && el.labels.length) { const t = norm(Array.from(el.labels).map((l) => l.innerText != null ? l.innerText : l.textContent).join(' ')); if (t) return t.slice(0, 300); }
+    const tag = tagOf(el);
+    if (tag === 'img' || tag === 'area') { const alt = el.getAttribute('alt'); if (alt != null && norm(alt)) return norm(alt).slice(0, 300); }
+    if (tag === 'input') { const t = (el.getAttribute('type') || 'text').toLowerCase(); if (t === 'button' || t === 'submit' || t === 'reset') { const v = el.getAttribute('value'); if (v && norm(v)) return norm(v).slice(0, 300); if (t === 'submit') return 'Submit'; if (t === 'reset') return 'Reset'; } }
+    const ph = el.getAttribute('placeholder'); if (ph && norm(ph)) return norm(ph).slice(0, 300);
+    const title = el.getAttribute('title'); if (title && norm(title)) return norm(title).slice(0, 300);
+    if (NAMED_FROM_CONTENT.has(roleKey(role)) || tag === 'summary') return contentText(el).slice(0, 300);
+    return '';
+  };
+  const namesOf = (el, role) => { const name = nameOf(el, role); if (!NAMED_FROM_CONTENT.has(roleKey(role)) || el.hasAttribute('aria-label') || el.hasAttribute('aria-labelledby')) return [name]; const alt = altText(el); return alt && alt !== name ? [name, alt] : [name]; };
+  const liveValue = (el) => { const tag = tagOf(el); if (tag === 'input' || tag === 'textarea') return String(el.value); if (tag === 'select') { const o = el.options[el.selectedIndex]; return o ? norm(o.text) : ''; } return null; };
+  const attrsOf = (el) => { const out = []; for (const a of ATTRS) { if (a === 'value') { if (isProtected(el)) continue; const v = liveValue(el); if (v !== null) { if (norm(v)) out.push({ name: a, value: norm(v).slice(0, 200) }); continue; } } const v = el.getAttribute(a); if (v != null && norm(v)) out.push({ name: a, value: norm(v).slice(0, 200) }); } return out; };
+  const attrValue = (el, name) => { if (name === 'value') { if (isProtected(el)) return null; const v = liveValue(el); if (v !== null) return v; } const v = el.getAttribute(name); return v == null ? null : v; };
+  const urlOf = (el) => { const tag = tagOf(el); if (tag === 'a' || tag === 'area') return el.href || undefined; if (tag === 'img') return el.currentSrc || el.src || undefined; return undefined; };
+  const visibleRect = (el) => { if (SKIP.has(String(el.tagName).toUpperCase())) return null; const style = window.getComputedStyle(el); if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return null; const r = el.getBoundingClientRect(); if (!(r.width > 0 && r.height > 0)) return null; return r; };
+  // A form control the page draws itself (a styled radio, an autocomplete's
+  // input) is often transparent or too small to aim at. It is still the control
+  // a person uses, through its label when it has one; `hit` is what to act on.
+  // A transparent one hidden from assistive technology is a trap for bots.
+  const CONTROLS = new Set(['input', 'select', 'textarea']);
+  const presentRect = (el) => { if (SKIP.has(String(el.tagName).toUpperCase())) return null; const style = window.getComputedStyle(el); if (style.display === 'none' || style.visibility === 'hidden') return null; if (style.opacity === '0' && (!CONTROLS.has(tagOf(el)) || el.closest('[aria-hidden="true"]'))) return null; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 ? r : null; };
+  const shownOf = (el) => { const r = presentRect(el); const control = CONTROLS.has(tagOf(el)); if (r && !(control && (r.width < 4 || r.height < 4))) return { r, hit: el }; if (control && el.labels) { for (const l of el.labels) { const lr = visibleRect(l); if (lr) return { r: lr, hit: l }; } } return r ? { r, hit: el } : null; };
+  const signatureOf = (el) => { const role = roleOf(el); return 'js-' + fnv(tagOf(el) + '|' + role + '|' + nameOf(el, role) + '|' + pathOf(el)); };
+  const describe = (el, r) => {
+    const role = roleOf(el); const name = nameOf(el, role);
+    const out = { role, name, text: contentText(el).slice(0, 2000), signature: signatureOf(el), attributes: attrsOf(el), bounds: { x: r.left, y: r.top, width: r.width, height: r.height } };
+    if (!isProtected(el)) { const v = liveValue(el); if (v !== null) out.value = v; }
+    const u = urlOf(el); if (u) out.url = u;
+    return out;
+  };
+  const clampCenter = (r) => { const left = Math.max(r.left, 0), top = Math.max(r.top, 0), right = Math.min(r.right, vw), bottom = Math.min(r.bottom, vh); if (right <= left || bottom <= top) return { x: r.left + r.width / 2, y: r.top + r.height / 2, width: r.width, height: r.height, visible: false }; return { x: left + (right - left) / 2, y: top + (bottom - top) / 2, width: right - left, height: bottom - top, visible: true }; };
+  // Document order, with each open shadow tree right after its host.
+  const collect = (root, out) => { for (const el of root.querySelectorAll('*')) { out.push(el); if (el.shadowRoot) collect(el.shadowRoot, out); } return out; };
+  const all = collect(document, []);
+  const answer = (report, el) => opts.returnElement ? [JSON.stringify(report), el || null] : JSON.stringify(report);
+
+  if (opts.mode === 'pin') {
+    const want = opts.match || {};
+    const skip = new Set((opts.skipAttributes || []).map((n) => String(n).toLowerCase()));
+    const bagOf = (pairs) => pairs.filter((a) => !skip.has(String(a.name).toLowerCase())).map((a) => String(a.name).toLowerCase() + '=' + a.value).sort().join('\n');
+    const wanted = bagOf(Array.isArray(want.attributes) ? want.attributes : []);
+    const squash = (s) => norm(s).replace(/ /g, '');
+    let found = [];
+    for (const el of all) { if (bagOf(Array.from(el.attributes)) !== wanted) continue; const shown = shownOf(el); if (shown) found.push({ el, hit: shown.hit }); }
+    // Each step narrows only when something survives it: the role and text the
+    // browser computed can differ from this script's in spacing or token.
+    const narrow = (keep) => { if (found.length > 1) { const kept = found.filter((m) => keep(m.el)); if (kept.length) found = kept; } };
+    if (want.role) narrow((el) => roleMatchKey(roleOf(el)) === roleMatchKey(want.role));
+    if (want.text) narrow((el) => squash(contentText(el)) === squash(want.text));
+    if (want.name) narrow((el) => namesOf(el, roleOf(el)).includes(norm(want.name)));
+    narrow((el) => !found.some((o) => o.el !== el && containsDeep(el, o.el)));
+    return answer({ matchCount: found.length }, found.length === 1 ? found[0].hit : null);
+  }
+
+  if (opts.mode === 'resolve') {
+    const L = opts.locator || {};
+    const roleWanted = L.role != null ? roleMatchKey(L.role) : null;
+    const attrs = Array.isArray(L.attributes) ? L.attributes : [];
+    const matches = [];
+    let hidden = 0;
+    for (const el of all) {
+      if (SKIP.has(String(el.tagName).toUpperCase())) continue;
+      const role = roleOf(el);
+      if (roleWanted !== null && roleMatchKey(role) !== roleWanted) continue;
+      if (L.name != null || L.nameContains != null) {
+        const names = namesOf(el, role);
+        if (L.name != null && !names.includes(norm(L.name))) continue;
+        if (L.nameContains != null && !names.some((name) => name.includes(norm(L.nameContains)))) continue;
+      }
+      if (L.text != null || L.textContains != null) {
+        const text = contentText(el);
+        if (L.text != null && text !== norm(L.text)) continue;
+        if (L.textContains != null && !text.includes(norm(L.textContains))) continue;
+      }
+      let ok = true;
+      for (const a of attrs) { if (!a || typeof a.name !== 'string' || attrValue(el, a.name) !== String(a.value)) { ok = false; break; } }
+      if (!ok) continue;
+      const shown = shownOf(el);
+      if (shown) matches.push({ el, r: shown.r, hit: shown.hit }); else hidden++;
+    }
+    // A label and the control it stands in for are one match: the control.
+    const merged = matches.filter((m) => !(m.el === m.hit && matches.some((o) => o !== m && o.hit === m.el)));
+    // A wrapper matches a text locator only because its child does; the
+    // innermost of nested matches is the element the caller meant.
+    let kept = merged.filter((m) => !merged.some((o) => o !== m && m.el !== o.el && containsDeep(m.el, o.el)));
+    if (opts.pick) { const chosen = kept.filter((m) => signatureOf(m.el) === opts.pick); if (chosen.length === 1) kept = chosen; }
+    const limit = Math.max(1, Math.min(100, Number(opts.candidateLimit) || 10));
+    const result = { matchCount: kept.length, hiddenCount: hidden, candidates: kept.slice(0, limit).map((m) => describe(m.el, m.r)) };
+    if (kept.length === 1) {
+      const { el, hit } = kept[0];
+      if (opts.act === 'scroll') {
+        try { hit.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (e) { hit.scrollIntoView(); }
+      }
+      const box = hit.getBoundingClientRect();
+      result.match = describe(el, box);
+      result.center = clampCenter(box);
+    }
+    return answer(result, kept.length === 1 ? kept[0].hit : null);
+  }
+
+  const maxNodes = Number(opts.maxNodes) > 0 ? Number(opts.maxNodes) : 100000;
+  const maxBytes = Number(opts.maxBytes) > 0 ? Number(opts.maxBytes) : 1048576;
+  const includeText = opts.includeText !== false;
+  const ids = new Map();
+  const scrollables = new Set();
+  const nodes = [];
+  let total = 0;
+  let truncated = false;
+  for (const el of all) {
+    const r = visibleRect(el); if (!r) continue;
+    total++;
+    const role = roleOf(el);
+    if (role === 'none' || role === 'presentation') continue;
+    const own = norm(Array.from(el.childNodes).filter((n) => n.nodeType === 3).map((n) => n.nodeValue).join(' '));
+    if (role === 'genericContainer' && !own) continue;
+    const inViewport = r.right > 0 && r.bottom > 0 && r.left < vw && r.top < vh;
+    if (opts.viewportOnly && !inViewport) continue;
+    if (nodes.length >= maxNodes) { truncated = true; break; }
+    const id = 'n' + nodes.length;
+    ids.set(el, id);
+    const node = { id, frameId: 'f0', role, x: r.left, y: r.top, width: r.width, height: r.height, inViewport, visible: true, focused: document.activeElement === el, disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true' };
+    for (let p = parentOf(el); p; p = parentOf(p)) { const pid = ids.get(p); if (pid) { node.parentId = pid; if (scrollables.has(pid)) node.scrollContainerId = pid; break; } }
+    if (!node.scrollContainerId) { for (let p = parentOf(el); p; p = parentOf(p)) { const pid = ids.get(p); if (pid && scrollables.has(pid)) { node.scrollContainerId = pid; break; } } }
+    const name = nameOf(el, role); if (name) node.name = name;
+    if (own && includeText) node.text = own.slice(0, 2000);
+    if (!isProtected(el)) { const v = liveValue(el); if (v !== null && v !== '') node.value = v.slice(0, 500); }
+    const tag = tagOf(el);
+    const rk = roleKey(role);
+    if (rk === 'checkbox' || rk === 'radiobutton' || rk === 'radio' || rk === 'switch' || rk === 'menuitemcheckbox' || rk === 'menuitemradio') { const ac = el.getAttribute('aria-checked'); node.checked = ac != null ? ac : (el.indeterminate ? 'mixed' : (el.checked ? 'true' : 'false')); }
+    const ae = el.getAttribute('aria-expanded');
+    if (ae != null) node.expanded = ae === 'true'; else if (tag === 'summary' && el.parentElement && tagOf(el.parentElement) === 'details') node.expanded = !!el.parentElement.open;
+    const style = window.getComputedStyle(el); const oy = style.overflowY, ox = style.overflowX;
+    if (((oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight + 1) || ((ox === 'auto' || ox === 'scroll') && el.scrollWidth > el.clientWidth + 1)) { node.scrollable = true; scrollables.add(id); }
+    nodes.push(node);
+  }
+  // The browser's text covers exactly the nodes it returns: for a window, or
+  // a capture cut at maxNodes, that is theirs, not the whole page's.
+  const body = document.body;
+  const pageText = () => (opts.viewportOnly || truncated ? nodes.map((n) => n.text || '').join(' ') : all.some((el) => el.shadowRoot) ? flatText(body) : body.innerText);
+  let text = includeText && body ? norm(pageText()) : '';
+  let bytes = JSON.stringify(nodes).length + text.length;
+  if (bytes > maxBytes) {
+    truncated = true;
+    if (text.length > maxBytes / 2) text = text.slice(0, Math.floor(maxBytes / 2));
+    while (nodes.length && JSON.stringify(nodes).length + text.length > maxBytes) nodes.splice(Math.floor(nodes.length * 0.9));
+    bytes = JSON.stringify(nodes).length + text.length;
+  }
+  const frames = [{ frameId: 'f0', url: location.href, crossOrigin: false }];
+  let framesFailed = 0;
+  document.querySelectorAll('iframe, frame').forEach((f, i) => { let cross = true; try { cross = !f.contentDocument; } catch (e) { cross = true; } frames.push({ frameId: 'f' + (i + 1), url: f.src || '', crossOrigin: cross, parentFrameId: 'f0' }); framesFailed++; });
+  return JSON.stringify({ nodes, frames, text, truncated, stats: { totalNodes: total, returnedNodes: nodes.length, bytes, elapsedMs: Math.round(now() - started), framesVisited: 1, framesFailed } });
+})()"#;
+
+/// The fallback script with its options substituted.
+fn fallback_script(opts: &serde_json::Value) -> String {
+  AGENT_FALLBACK_JS
+    .replace("__FLAT_TEXT__", FLAT_TEXT_JS)
+    .replace("__OPTS__", &opts.to_string())
+}
+
+/// What the fallback perception script answers with, before it is wrapped.
+#[derive(Debug, Deserialize)]
+struct FallbackPerception {
+  nodes: Vec<PerceptionNode>,
+  frames: Vec<PerceptionFrame>,
+  text: String,
+  truncated: bool,
+  stats: PerceptionStats,
+}
+
+/// Where the fallback resolver left the one match, in viewport pixels.
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct FallbackCenter {
+  x: f64,
+  y: f64,
+  width: f64,
+  height: f64,
+  visible: bool,
+}
+
+/// What the fallback resolver answers with.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FallbackResolution {
+  match_count: u64,
+  /// Elements that match but have no box on screen.
+  #[serde(default)]
+  hidden_count: u64,
+  #[serde(default)]
+  candidates: Vec<serde_json::Value>,
+  #[serde(rename = "match")]
+  matched: Option<LocatorCandidate>,
+  center: Option<FallbackCenter>,
+}
+
+impl FallbackResolution {
+  fn from_report(report: serde_json::Value) -> Result<Self, AgentError> {
+    serde_json::from_value(report)
+      .map_err(|e| AgentError::Malformed(format!("fallback resolver: {e}")))
+  }
+
+  /// The signature of the candidate an ambiguous resolution prefers.
+  fn preferred_signature(&self, locator: &LocatorDescription) -> Option<String> {
+    let index = preferred_candidate(locator, self.match_count, &self.candidates)?;
+    self.candidates[index]["signature"]
+      .as_str()
+      .map(str::to_string)
+  }
+}
+
+/// How many candidates a resolver is asked for, so that an ambiguity can be
+/// ranked over all of them. The caller's own limit applies to the error.
+const RANKED_CANDIDATES: u64 = 100;
+
+/// Collapsed whitespace, the way both resolvers compare names and text.
+fn collapsed(text: &str) -> String {
+  text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Roles of the words that name a control rather than the control: a label,
+/// and the text inside one.
+const LABEL_ROLES: [&str; 5] = ["labeltext", "label", "statictext", "inlinetextbox", "text"];
+
+/// The one candidate of an ambiguous match that stands out, if one does.
+///
+/// Only a complete list is ranked: a candidate left out of it could be the
+/// better one. A visible candidate comes first; then, for a substring locator,
+/// the one whose name or text is exactly the substring (case first, then any
+/// case); then a control over the label, or the label's text, that names it;
+/// then the innermost, whose box no other candidate's box lies within. Each
+/// step narrows only when something survives it.
+fn preferred_candidate(
+  locator: &LocatorDescription,
+  match_count: u64,
+  candidates: &[serde_json::Value],
+) -> Option<usize> {
+  if candidates.len() < 2 || candidates.len() as u64 != match_count {
+    return None;
+  }
+  let narrow = |kept: &mut Vec<usize>, keep: &dyn Fn(usize) -> bool| {
+    let next: Vec<usize> = kept.iter().copied().filter(|&i| keep(i)).collect();
+    if !next.is_empty() {
+      *kept = next;
+    }
+  };
+  let bounds = |i: usize| {
+    let side = |key: &str| candidates[i]["bounds"][key].as_f64().unwrap_or(0.0);
+    (side("x"), side("y"), side("width"), side("height"))
+  };
+  let mut kept: Vec<usize> = (0..candidates.len()).collect();
+  narrow(&mut kept, &|i| {
+    let (_, _, width, height) = bounds(i);
+    width > 0.0 && height > 0.0
+  });
+  for (key, wanted) in [
+    ("name", locator.name_contains.as_deref()),
+    ("text", locator.text_contains.as_deref()),
+  ] {
+    let Some(wanted) = wanted.map(collapsed) else {
+      continue;
+    };
+    let field = |i: usize| collapsed(candidates[i][key].as_str().unwrap_or_default());
+    narrow(&mut kept, &|i| field(i) == wanted);
+    narrow(&mut kept, &|i| {
+      field(i).to_lowercase() == wanted.to_lowercase()
+    });
+  }
+  narrow(&mut kept, &|i| {
+    let role: String = candidates[i]["role"]
+      .as_str()
+      .unwrap_or_default()
+      .chars()
+      .filter(char::is_ascii_alphanumeric)
+      .collect::<String>()
+      .to_ascii_lowercase();
+    !LABEL_ROLES.contains(&role.as_str())
+  });
+  // Innermost, as the page's resolver keeps it: no box around another match.
+  let around = |outer: usize, inner: usize| {
+    let (left, top, width, height) = bounds(outer);
+    let (in_left, in_top, in_width, in_height) = bounds(inner);
+    width * height > in_width * in_height
+      && left <= in_left
+      && top <= in_top
+      && left + width >= in_left + in_width
+      && top + height >= in_top + in_height
+  };
+  let before = kept.clone();
+  narrow(&mut kept, &|i| {
+    !before.iter().any(|&other| other != i && around(i, other))
+  });
+  (kept.len() == 1).then(|| kept[0])
+}
+
+/// A candidate from the browser's ambiguity reply as a match. That reply lists
+/// no box, and the box is read again once the node is confirmed.
+fn ambiguity_candidate(candidate: &serde_json::Value) -> Option<wayfern_cdp::LocatorCandidate> {
+  let mut candidate = candidate.clone();
+  let fields = candidate.as_object_mut()?;
+  fields
+    .entry("bounds")
+    .or_insert_with(|| serde_json::json!({ "x": 0.0, "y": 0.0, "width": 0.0, "height": 0.0 }));
+  serde_json::from_value(candidate).ok()
+}
+
+/// The ambiguity refusal, listing at most `limit` candidates.
+fn ambiguity(
+  match_count: u64,
+  mut candidates: Vec<serde_json::Value>,
+  limit: Option<u64>,
+) -> AgentError {
+  candidates.truncate(limit.unwrap_or(10).clamp(1, RANKED_CANDIDATES) as usize);
+  AgentError::AmbiguousLocator {
+    match_count,
+    message: format!(
+      "Ambiguous locator: {match_count} nodes match. Refine it with a role, a stable attribute, or more exact text. Candidates: {}",
+      serde_json::Value::Array(candidates.clone())
+    ),
+    candidates,
+  }
+}
+
+/// What to do to the one match, once the fallback resolver has found it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FallbackAct {
+  /// Describe it and nothing more.
+  Describe,
+  /// Scroll it into view, for a click.
+  Scroll,
+}
+
+/// Resolve `locator` in the page with the fallback script.
+///
+/// Refuses ambiguity and absence in the same structured form the native
+/// resolver does, so a caller sees one contract whichever engine answered.
+async fn fallback_resolve(
+  target: &CdpTarget,
+  locator: &LocatorDescription,
+  candidate_limit: Option<u64>,
+  act: FallbackAct,
+) -> Result<(LocatorCandidate, Option<FallbackCenter>), AgentError> {
+  let act_name = match act {
+    FallbackAct::Describe => "none",
+    FallbackAct::Scroll => "scroll",
+  };
+  let script = |pick: Option<&str>| {
+    fallback_script(&serde_json::json!({
+      "mode": "resolve",
+      "locator": locator,
+      "candidateLimit": RANKED_CANDIDATES,
+      "act": act_name,
+      "pick": pick,
+    }))
+  };
+  let mut resolution =
+    FallbackResolution::from_report(evaluate_json_script(target, script(None)).await?)?;
+  if let Some(signature) = resolution.preferred_signature(locator) {
+    let picked = FallbackResolution::from_report(
+      evaluate_json_script(target, script(Some(&signature))).await?,
+    )?;
+    if picked.match_count == 1 {
+      resolution = picked;
+    }
+  }
+  let center = resolution.center;
+  Ok((
+    settle_fallback(resolution, locator, candidate_limit)?,
+    center,
+  ))
+}
+
+/// The one match a fallback resolution found, or its refusal.
+fn settle_fallback(
+  resolution: FallbackResolution,
+  locator: &LocatorDescription,
+  candidate_limit: Option<u64>,
+) -> Result<LocatorCandidate, AgentError> {
+  match resolution.match_count {
+    0 if resolution.hidden_count > 0 => Err(AgentError::NoMatch {
+      message: format!(
+        "No visible node matches locator ({}); {} hidden element(s) match it. Open, expand or scroll to the part of the page that shows it, or name what is shown.",
+        describe_locator(locator),
+        resolution.hidden_count
+      ),
+    }),
+    0 => Err(AgentError::NoMatch {
+      message: format!("No node matches locator ({}).", describe_locator(locator)),
+    }),
+    1 => resolution
+      .matched
+      .ok_or_else(|| AgentError::Malformed("fallback resolver answered one match without it".into())),
+    count => Err(ambiguity(count, resolution.candidates, candidate_limit)),
+  }
+}
+
+/// Attributes left out when a matched node is compared with a DOM element.
+///
+/// The browser's index never carries `id` and `class` (Blink serializes them
+/// apart from the other HTML attributes), withholds `value` on a protected
+/// field, and reads `style` without the update the CSSOM leaves pending.
+const UNCOMPARED_ATTRIBUTES: [&str; 4] = ["id", "class", "style", "value"];
+
+/// Attribute pairs as a set that compares equal between the browser's index
+/// and the DOM.
+fn attribute_bag<'a>(pairs: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<(String, &'a str)> {
+  let mut bag: Vec<(String, &str)> = pairs
+    .map(|(name, value)| (name.to_ascii_lowercase(), value))
+    .filter(|(name, _)| !UNCOMPARED_ATTRIBUTES.contains(&name.as_str()))
+    .collect();
+  bag.sort();
+  bag
+}
+
+/// A locator settled on one element of a Wayfern 152 page.
+struct LocatedNode {
+  /// The id the DOM domain knows the element by.
+  backend_node_id: i64,
+  matched: LocatorCandidate,
+  /// Wayfern when the browser's resolver matched, Fallback when the page did.
+  engine: Engine,
+}
+
+/// Text and whitespace-free text, the way both sides compare it: the browser
+/// joins text runs with spaces where the DOM may have none.
+fn squashed(text: &str) -> String {
+  text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// The text under a `DOM.describeNode` subtree, without script and style.
+fn described_text(node: &serde_json::Value, out: &mut String) {
+  if node.get("nodeType").and_then(|t| t.as_i64()) == Some(3) {
+    out.push_str(node.get("nodeValue").and_then(|v| v.as_str()).unwrap_or(""));
+    return;
+  }
+  if matches!(
+    node.get("nodeName").and_then(|n| n.as_str()),
+    Some("SCRIPT" | "STYLE" | "TEMPLATE")
+  ) {
+    return;
+  }
+  for key in ["shadowRoots", "children"] {
+    for child in node
+      .get(key)
+      .and_then(|c| c.as_array())
+      .into_iter()
+      .flatten()
+    {
+      described_text(child, out);
+    }
+  }
+}
+
+/// The browser's node id for `matched`, when the DOM shows that node carries
+/// the attributes and the text the browser matched.
+///
+/// Attributes alone are not enough: a renumbered id can land on a sibling with
+/// the same markup. A match with no comparable attribute, or text deeper than
+/// the subtree read here, is left to [`page_element`].
+async fn confirmed_node_id(
+  session: &mut WayfernSession,
+  matched: &LocatorCandidate,
+) -> Option<i64> {
+  let id = matched.backend_node_id?;
+  let wanted = attribute_bag(
+    matched
+      .attributes
+      .iter()
+      .map(|a| (a.name.as_str(), a.value.as_str())),
+  );
+  if wanted.is_empty() {
+    return None;
+  }
+  let reply = session
+    .call(
+      "DOM.describeNode",
+      serde_json::json!({ "backendNodeId": id, "depth": 4, "pierce": true }),
+    )
+    .await
+    .ok()?;
+  let node = reply.get("node")?;
+  if node.get("nodeType").and_then(|t| t.as_i64()) != Some(1) {
+    return None;
+  }
+  let flat: Vec<&str> = node
+    .get("attributes")?
+    .as_array()?
+    .iter()
+    .filter_map(|v| v.as_str())
+    .collect();
+  let actual = attribute_bag(
+    flat
+      .as_chunks::<2>()
+      .0
+      .iter()
+      .map(|[name, value]| (*name, *value)),
+  );
+  let mut text = String::new();
+  described_text(node, &mut text);
+  (actual == wanted && squashed(&text) == squashed(&matched.text)).then_some(id)
+}
+
+/// Run the fallback script with `returnElement` on an open session: its report,
+/// and the backend node id of the element it settled on, if it settled on one.
+async fn page_element(
+  session: &mut WayfernSession,
+  opts: &serde_json::Value,
+) -> Result<(serde_json::Value, Option<i64>), AgentError> {
+  const GROUP: &str = "donut-locator";
+  let outcome = async {
+    let result = session
+      .call(
+        "Runtime.evaluate",
+        serde_json::json!({
+          "expression": fallback_script(opts),
+          "returnByValue": false,
+          "objectGroup": GROUP,
+        }),
+      )
+      .await?;
+    if let Some(thrown) = script_exception(&result) {
+      return Err(thrown);
+    }
+    let pair = result
+      .pointer("/result/objectId")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| AgentError::Malformed("the page script returned no pair".into()))?;
+    let properties = session
+      .call(
+        "Runtime.getProperties",
+        serde_json::json!({ "objectId": pair, "ownProperties": true }),
+      )
+      .await?;
+    let entry = |index: &str| {
+      properties
+        .get("result")
+        .and_then(|r| r.as_array())
+        .and_then(|list| list.iter().find(|p| p["name"] == index))
+        .and_then(|p| p.get("value"))
+        .cloned()
+    };
+    let report = entry("0")
+      .as_ref()
+      .and_then(|v| v.get("value"))
+      .and_then(|v| v.as_str())
+      .and_then(|text| serde_json::from_str(text).ok())
+      .ok_or_else(|| AgentError::Malformed("the page script returned no report".into()))?;
+    let element = entry("1")
+      .filter(|v| v["subtype"] == "node")
+      .and_then(|v| v["objectId"].as_str().map(str::to_string));
+    let backend_node_id = match element {
+      Some(object_id) => session
+        .call(
+          "DOM.describeNode",
+          serde_json::json!({ "objectId": object_id }),
+        )
+        .await?
+        .pointer("/node/backendNodeId")
+        .and_then(|v| v.as_i64()),
+      None => None,
+    };
+    Ok((report, backend_node_id))
+  }
+  .await;
+  let _ = session
+    .call(
+      "Runtime.releaseObjectGroup",
+      serde_json::json!({ "objectGroup": GROUP }),
+    )
+    .await;
+  outcome
+}
+
+/// Resolve `locator` to one DOM node on a Wayfern 152 page.
+///
+/// The browser's resolver decides what matches. Wayfern 152 to 155 report the
+/// wrong node id for that match: the index reads its snapshot through
+/// Chromium's frame combiner, which renumbers every node, so the id names some
+/// other node (a Google result link came back as a `<script>`). The id is used
+/// when the DOM confirms it; otherwise the page finds the element the browser
+/// described. When the browser matches nothing, the page applies the locator
+/// itself: the index never carries `id` or `class`, and a large page can outrun
+/// its snapshot budget. Several matches settle on the one
+/// [`preferred_candidate`] picks, or are refused.
+async fn wayfern_locate(
+  session: &mut WayfernSession,
+  locator: &LocatorDescription,
+  candidate_limit: Option<u64>,
+) -> Result<LocatedNode, AgentError> {
+  let options = ResolveOptions {
+    candidate_limit: Some(RANKED_CANDIDATES),
+    ..Default::default()
+  };
+  let native = match wayfern_cdp::resolve_locator(session, locator, options).await {
+    Ok(resolution) => Some(resolution.matched),
+    Err(WayfernError::NoMatch { .. }) => None,
+    Err(WayfernError::AmbiguousLocator {
+      match_count,
+      candidates,
+      ..
+    }) => {
+      let preferred = preferred_candidate(locator, match_count, &candidates)
+        .and_then(|index| ambiguity_candidate(&candidates[index]));
+      match preferred {
+        Some(matched) => Some(matched),
+        // The browser's ambiguity reply lists no boxes, so neither the
+        // visible nor the innermost candidate can stand out in it: a feed
+        // card's full-card link and its title link, both named by the title,
+        // were refused. The page's resolver has the boxes. When it cannot
+        // settle either, the browser's refusal stands: its candidates carry
+        // every attribute to refine with.
+        None if candidates.iter().all(|c| c.get("bounds").is_none()) => {
+          return match page_locate(session, locator, candidate_limit).await {
+            Ok(located) => Ok(located),
+            Err(_) => Err(ambiguity(match_count, candidates, candidate_limit)),
+          };
+        }
+        None => return Err(ambiguity(match_count, candidates, candidate_limit)),
+      }
+    }
+    Err(other) => return Err(other.into()),
+  };
+  if let Some(mut matched) = native {
+    let backend_node_id = match confirmed_node_id(session, &matched).await {
+      Some(id) => Some(id),
+      None => {
+        let opts = serde_json::json!({
+          "mode": "pin",
+          "match": &matched,
+          "skipAttributes": UNCOMPARED_ATTRIBUTES,
+          "returnElement": true,
+        });
+        page_element(session, &opts).await?.1
+      }
+    };
+    if let Some(id) = backend_node_id {
+      matched.backend_node_id = Some(id);
+      return Ok(LocatedNode {
+        backend_node_id: id,
+        matched,
+        engine: Engine::Wayfern,
+      });
+    }
+    log::debug!(
+      "Locator match not found in the page, applying the locator there node={}",
+      matched.backend_node_id.unwrap_or_default()
+    );
+  }
+  page_locate(session, locator, candidate_limit).await
+}
+
+/// Resolve `locator` to one DOM node with the page's own resolver.
+async fn page_locate(
+  session: &mut WayfernSession,
+  locator: &LocatorDescription,
+  candidate_limit: Option<u64>,
+) -> Result<LocatedNode, AgentError> {
+  let opts = |pick: Option<&str>| {
+    serde_json::json!({
+      "mode": "resolve",
+      "locator": locator,
+      "candidateLimit": RANKED_CANDIDATES,
+      "act": "none",
+      "returnElement": true,
+      "pick": pick,
+    })
+  };
+  let (report, mut backend_node_id) = page_element(session, &opts(None)).await?;
+  let mut resolution = FallbackResolution::from_report(report)?;
+  if let Some(signature) = resolution.preferred_signature(locator) {
+    let (report, picked_node) = page_element(session, &opts(Some(&signature))).await?;
+    let picked = FallbackResolution::from_report(report)?;
+    if picked.match_count == 1 {
+      resolution = picked;
+      backend_node_id = picked_node;
+    }
+  }
+  let mut matched = settle_fallback(resolution, locator, candidate_limit)?;
+  let backend_node_id = backend_node_id
+    .ok_or_else(|| AgentError::Malformed("the page resolved a match it did not return".into()))?;
+  matched.backend_node_id = Some(backend_node_id);
+  Ok(LocatedNode {
+    backend_node_id,
+    matched,
+    engine: Engine::Fallback,
+  })
+}
+
+/// A point the fallback resolver left an element at, as somewhere to strike.
+fn fallback_target(center: Option<FallbackCenter>) -> Result<ViewportTarget, AgentError> {
+  let center = center
+    .ok_or_else(|| AgentError::Malformed("the fallback resolver answered no position".into()))?;
+  if !center.visible {
+    return Err(AgentError::BadRequest(
+      "the element could not be scrolled into view; it may be hidden or clipped".to_string(),
+    ));
+  }
+  Ok(ViewportTarget {
+    x: center.x,
+    y: center.y,
+    width: center.width,
+    height: center.height,
+  })
+}
+
+/// Keep a strike point inside the layout viewport.
+fn clamp_to_viewport(point: ViewportTarget, viewport: (f64, f64)) -> ViewportTarget {
+  let (width, height) = viewport;
+  if width <= 0.0 || height <= 0.0 {
+    return point;
+  }
+  ViewportTarget {
+    x: point.x.clamp(1.0, (width - 1.0).max(1.0)),
+    y: point.y.clamp(1.0, (height - 1.0).max(1.0)),
+    ..point
+  }
+}
+
+/// Glide to `point` and strike it, on an open session with `Page.enable` on,
+/// waiting for a load afterwards.
+async fn vellum_click_in(
+  session: &mut WayfernSession,
+  point: ViewportTarget,
+  button: Option<&str>,
+  click_count: Option<u32>,
+) -> Result<(vellum::Strike, bool), AgentError> {
+  let viewport = wayfern_cdp::layout_viewport(session).await?;
+  let point = clamp_to_viewport(point, viewport);
+  let origin = wayfern_cdp::glide_origin(&point, viewport);
+  let width = Some(point.width.min(point.height));
+  // Owned by the gesture: the boxed future may only borrow what the gesture
+  // itself holds, never the caller's frame.
+  let button = button.map(str::to_owned);
+  let outcome = vellum::with_pointer(session, origin.0, origin.1, |s, p| {
+    Box::pin(async move {
+      vellum::glide(s, p, point.x, point.y, width).await?;
+      vellum::strike_awaiting_load(s, p, button.as_deref(), click_count, CLICK_LOAD_TIMEOUT).await
+    })
+  })
+  .await?;
+  Ok(outcome)
+}
+
+/// Turn the wheel at the viewport's centre, with the pointer gliding there
+/// first, as a hand on a mouse would.
+async fn vellum_wheel(target: &CdpTarget, delta_x: f64, delta_y: f64) -> Result<(), AgentError> {
+  let mut session = WayfernSession::open(target).await?;
+  let outcome = async {
+    let viewport = wayfern_cdp::layout_viewport(&mut session).await?;
+    let (x, y) = (viewport.0 / 2.0, viewport.1 / 2.0);
+    let centre = ViewportTarget {
+      x,
+      y,
+      width: viewport.0,
+      height: viewport.1,
+    };
+    let origin = wayfern_cdp::glide_origin(&centre, viewport);
+    vellum::with_pointer(&mut session, origin.0, origin.1, |s, p| {
+      Box::pin(async move {
+        vellum::glide(s, p, x, y, None).await?;
+        s.call(
+          "Input.dispatchMouseEvent",
+          serde_json::json!({
+            "type": "mouseWheel",
+            "x": x,
+            "y": y,
+            "deltaX": delta_x,
+            "deltaY": delta_y,
+          }),
+        )
+        .await?;
+        Ok::<(), WayfernError>(())
+      })
+    })
+    .await?;
+    Ok::<(), AgentError>(())
+  }
+  .await;
+  session.close().await;
+  outcome
+}
+
+/// Strike `point` with a humanized pointer on a fresh session.
+async fn vellum_click(
+  target: &CdpTarget,
+  point: ViewportTarget,
+  button: Option<&str>,
+  click_count: Option<u32>,
+) -> Result<(vellum::Strike, bool), AgentError> {
+  let mut session = WayfernSession::open(target).await?;
+  let outcome = async {
+    session.call("Page.enable", serde_json::json!({})).await?;
+    vellum_click_in(&mut session, point, button, click_count).await
+  }
+  .await;
+  let _ = session.call("Page.disable", serde_json::json!({})).await;
+  session.close().await;
+  outcome
+}
+
+/// One page function for every step of typing into a field, run on an element
+/// with `Runtime.callFunctionOn` and named by its first argument:
+///
+/// - `field`: what to type into: the element, the control a label is for, the
+///   one field inside a container, or the editing host of a rich text editor.
+///   Answered by reference.
+/// - `point`: where a hand would click it, in viewport pixels: on the element,
+///   its label or, for a control too small to aim at, the box around it, and
+///   only where that is what the click would hit. When nothing of it can be hit
+///   where it is, it is scrolled to the centre first. `covered` names what lies
+///   on top when still nothing can be hit, `hidden` means it has no box, and
+///   `frame` that it is in a frame, where the DOM's quads decide.
+/// - `focus`: whether the focus is on the field or inside it, after focusing it
+///   when `arg` is true and it is not.
+/// - `prepare`: what the field holds; then, with `arg`, select all of it, so
+///   the typed text replaces it with the input events a person's typing fires,
+///   or else park the caret at its end.
+/// - `read`: what the field holds, and whether the focus moved on to another
+///   field while the text was typed.
+const TYPING_FN: &str = r#"function (step, arg) {
+  const el = this;
+  const tagOf = (n) => String((n && n.tagName) || '').toLowerCase();
+  const NOT_TEXT = new Set(['checkbox', 'radio', 'button', 'submit', 'reset', 'file', 'image', 'range', 'color', 'hidden']);
+  const editable = (n) => !!n && n.nodeType === 1 && ((tagOf(n) === 'input' && !NOT_TEXT.has(String(n.type || 'text').toLowerCase())) || tagOf(n) === 'textarea' || !!n.isContentEditable);
+  const parentOf = (n) => n.parentElement || (n.parentNode && n.parentNode.host) || null;
+  const containsDeep = (outer, inner) => { for (let n = inner; n; n = n.parentNode || n.host) { if (n === outer) return true; } return false; };
+  const deepActive = () => { let a = document.activeElement; while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement; return a; };
+  const nameOf = (n) => { if (!n || n === document.body || n === document.documentElement) return 'the page'; let s = tagOf(n); if (n.id) s += '#' + n.id; const label = n.getAttribute && (n.getAttribute('aria-label') || n.getAttribute('name')); if (label) s += ' "' + String(label).slice(0, 40) + '"'; return s; };
+  const labelsOf = (n) => Array.from(n.labels || []);
+  const typedInto = (n) => { if (editable(n)) return n; const a = deepActive(); return a && containsDeep(n, a) && editable(a) ? a : null; };
+  const valueOf = (n) => {
+    const f = typedInto(n);
+    if (!f) return { kind: 'none' };
+    const tag = tagOf(f);
+    const type = tag === 'input' ? String(f.type || 'text').toLowerCase() : tag;
+    const secret = type === 'password' || /(^|\s)(cc-|password|one-time-code)/i.test(f.getAttribute('autocomplete') || '');
+    if (tag === 'input' || tag === 'textarea') return { kind: 'value', type, value: String(f.value), secret };
+    return { kind: 'editable', type, value: String(f.innerText || ''), secret };
+  };
+  if (step === 'field') {
+    if (el.isContentEditable) { let h = el; while (parentOf(h) && parentOf(h).isContentEditable) h = parentOf(h); return h; }
+    if (editable(el)) return el;
+    if (el.control && editable(el.control)) return el.control;
+    const inner = [];
+    const walk = (root) => { for (const n of root.querySelectorAll('*')) { if (editable(n) && !(n.isContentEditable && parentOf(n) && parentOf(n).isContentEditable)) inner.push(n); if (n.shadowRoot) walk(n.shadowRoot); } };
+    walk(el);
+    if (el.shadowRoot) walk(el.shadowRoot);
+    return inner.length === 1 ? inner[0] : el;
+  }
+  if (step === 'point') {
+    if (window !== window.top) return { frame: true };
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const aimable = (n) => { const r = n.getBoundingClientRect(); if (!(r.width >= 4 && r.height >= 4)) return false; const s = window.getComputedStyle(n); return s.display !== 'none' && s.visibility !== 'hidden'; };
+    const boxes = [];
+    if (aimable(el)) boxes.push(el);
+    for (const l of labelsOf(el)) { if (aimable(l)) boxes.push(l); }
+    if (!boxes.length) { for (let p = parentOf(el), i = 0; p && i < 4; p = parentOf(p), i++) { if (aimable(p)) { boxes.push(p); break; } } }
+    if (!boxes.length) return { hidden: true };
+    const hitAt = (x, y) => { let h = document.elementFromPoint(x, y); while (h && h.shadowRoot) { const inner = h.shadowRoot.elementFromPoint(x, y); if (!inner || inner === h) break; h = inner; } return h; };
+    const takes = (box, h) => !!h && (containsDeep(el, h) || containsDeep(box, h) || labelsOf(el).some((l) => containsDeep(l, h)));
+    const centre = (box) => { const r = box.getBoundingClientRect(); const left = Math.max(r.left, 0), top = Math.max(r.top, 0), right = Math.min(r.right, vw), bottom = Math.min(r.bottom, vh); if (right - left < 1 || bottom - top < 1) return null; return { x: left + (right - left) / 2, y: top + (bottom - top) / 2, width: right - left, height: bottom - top }; };
+    const aim = () => { for (const box of boxes) { const p = centre(box); if (p && takes(box, hitAt(p.x, p.y))) return p; } return null; };
+    let point = aim();
+    if (!point) { try { boxes[0].scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (e) { boxes[0].scrollIntoView(); } point = aim(); }
+    if (point) return point;
+    const p = centre(boxes[0]);
+    return p ? Object.assign(p, { covered: nameOf(hitAt(p.x, p.y)) }) : { hidden: true };
+  }
+  if (step === 'focus') {
+    const holds = () => { const a = deepActive(); return !!a && (a === el || containsDeep(el, a)); };
+    if (!holds() && arg) { try { el.focus({ preventScroll: true }); } catch (e) {} }
+    return { focused: holds(), active: nameOf(deepActive()) };
+  }
+  if (step === 'prepare') {
+    const before = valueOf(el);
+    const f = typedInto(el);
+    if (f && f.isContentEditable) { const sel = window.getSelection(); if (sel) { sel.selectAllChildren(f); if (!arg) sel.collapseToEnd(); } }
+    else if (f && arg) { try { f.select(); } catch (e) {} }
+    else if (f) { try { const n = String(f.value).length; f.setSelectionRange(n, n); } catch (e) {} }
+    return before;
+  }
+  if (step === 'read') {
+    const now = valueOf(el);
+    const a = deepActive();
+    now.focusMoved = !!a && a !== el && !containsDeep(el, a) && editable(a);
+    return now;
+  }
+  return null;
+}"#;
+
+/// Where a hand would click an element, as the `point` step of [`TYPING_FN`]
+/// answers it.
+enum Aim {
+  /// What the click would hit there is the element, or its label.
+  At(ViewportTarget),
+  /// Something else lies on top of the element's centre, named here.
+  Covered(ViewportTarget, String),
+  /// The element has no box to click.
+  Hidden,
+  /// The element is in a frame; its position is the DOM's to tell.
+  Frame,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AimReply {
+  #[serde(default)]
+  x: f64,
+  #[serde(default)]
+  y: f64,
+  #[serde(default)]
+  width: f64,
+  #[serde(default)]
+  height: f64,
+  #[serde(default)]
+  covered: Option<String>,
+  #[serde(default)]
+  hidden: bool,
+  #[serde(default)]
+  frame: bool,
+}
+
+/// What a field holds, as the `prepare` and `read` steps answer it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FieldValue {
+  /// "value" for an input or textarea, "editable" for rich text, "none" when
+  /// the element is no field and holds none in focus.
+  #[serde(default)]
+  kind: String,
+  #[serde(default, rename = "type")]
+  field_type: String,
+  #[serde(default)]
+  value: String,
+  /// A password or card field: its value is compared, never shown.
+  #[serde(default)]
+  secret: bool,
+  #[serde(default)]
+  focus_moved: bool,
+}
+
+/// Field types whose value is the text typed into them. A date, time or
+/// colour field turns keys into its own value, which a comparison would
+/// misread.
+const TEXT_FIELD_TYPES: [&str; 8] = [
+  "text", "search", "email", "url", "tel", "password", "number", "textarea",
+];
+
+impl FieldValue {
+  fn holds_typed_text(&self) -> bool {
+    self.kind == "editable"
+      || (self.kind == "value" && TEXT_FIELD_TYPES.contains(&self.field_type.as_str()))
+  }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FieldFocus {
+  #[serde(default)]
+  focused: bool,
+  #[serde(default)]
+  active: String,
+}
+
+/// Run one step of [`TYPING_FN`] on `object` and read its answer.
+async fn typing_step<T: serde::de::DeserializeOwned>(
+  session: &mut WayfernSession,
+  object: &str,
+  step: &str,
+  arg: serde_json::Value,
+) -> Result<T, AgentError> {
+  let answer = call_on(
+    session,
+    object,
+    TYPING_FN,
+    serde_json::json!([{ "value": step }, { "value": arg }]),
+  )
+  .await?;
+  serde_json::from_value(answer)
+    .map_err(|e| AgentError::Malformed(format!("the page answered the {step} step with: {e}")))
+}
+
+/// The field behind `element`, by reference in [`FORM_GROUP`].
+async fn typing_field(session: &mut WayfernSession, element: &str) -> Result<String, AgentError> {
+  let reply = session
+    .call(
+      "Runtime.callFunctionOn",
+      serde_json::json!({
+        "objectId": element,
+        "functionDeclaration": TYPING_FN,
+        "arguments": [{ "value": "field" }, { "value": null }],
+        "returnByValue": false,
+        "objectGroup": FORM_GROUP,
+      }),
+    )
+    .await?;
+  if let Some(thrown) = script_exception(&reply) {
+    return Err(thrown);
+  }
+  reply
+    .pointer("/result/objectId")
+    .and_then(|v| v.as_str())
+    .map(str::to_string)
+    .ok_or_else(|| AgentError::Malformed("the page answered the field step with no element".into()))
+}
+
+/// Where a hand would click `object`.
+async fn aim_at(session: &mut WayfernSession, object: &str) -> Result<Aim, AgentError> {
+  let reply: AimReply = typing_step(session, object, "point", serde_json::Value::Null).await?;
+  if reply.frame {
+    return Ok(Aim::Frame);
+  }
+  if reply.hidden || !(reply.width > 0.0 && reply.height > 0.0) {
+    return Ok(Aim::Hidden);
+  }
+  let point = ViewportTarget {
+    x: reply.x,
+    y: reply.y,
+    width: reply.width,
+    height: reply.height,
+  };
+  Ok(match reply.covered {
+    Some(cover) => Aim::Covered(point, cover),
+    None => Aim::At(point),
+  })
+}
+
+/// The refusal for an element with no box to act on.
+fn not_visible() -> AgentError {
+  AgentError::BadRequest(
+    "The element has no visible box to click or type into; it may be hidden or collapsed. Open, expand or scroll to the part of the page that shows it."
+      .to_string(),
+  )
+}
+
+/// Where to strike a field before typing, or `None` when something covers it
+/// and a click would land on that instead.
+async fn typing_point(
+  session: &mut WayfernSession,
+  field: &str,
+  backend_node_id: Option<i64>,
+) -> Result<Option<ViewportTarget>, AgentError> {
+  match aim_at(session, field).await? {
+    Aim::At(point) => Ok(Some(point)),
+    Aim::Covered(_, cover) => {
+      log::debug!("Field is covered, focusing it without a click cover={cover}");
+      Ok(None)
+    }
+    Aim::Hidden => Err(not_visible()),
+    Aim::Frame => match backend_node_id {
+      Some(id) => Ok(Some(wayfern_cdp::viewport_target(session, id).await?)),
+      None => Err(AgentError::BadRequest(
+        "The field is inside a frame; name it with a locator (type_locator).".to_string(),
+      )),
+    },
+  }
+}
+
+/// How typed keys reach a field.
+#[derive(Clone, Copy)]
+enum TypingMethod<'a> {
+  /// The browser's own humanized keyboard, Wayfern 152 and newer.
+  Vellum { typos: bool, timeout: Duration },
+  /// An accepted keystroke plan, sent as key events.
+  Keystrokes(&'a [crate::human_typing::TypingEvent]),
+  /// The whole text at once, the way an input method commits it.
+  Insert,
+}
+
+impl<'a> TypingMethod<'a> {
+  /// The method the budgets decided on: Vellum when it was budgeted, the plan
+  /// when one was made, otherwise all at once.
+  fn chosen(
+    vellum_timeout: Option<Duration>,
+    plan: Option<&'a [crate::human_typing::TypingEvent]>,
+    typos: bool,
+  ) -> Self {
+    match (vellum_timeout, plan) {
+      (Some(timeout), _) => Self::Vellum { typos, timeout },
+      (None, Some(plan)) => Self::Keystrokes(plan),
+      (None, None) => Self::Insert,
+    }
+  }
+}
+
+/// How long the page has to answer the keys (a framework's re-render, a mask)
+/// before the field is read back.
+const TYPING_SETTLE: Duration = Duration::from_millis(150);
+
+/// What typing into a field did.
+struct FieldTyping {
+  inscription: Option<vellum::Inscription>,
+  /// The field was read back and holds the text. False when it is not a field
+  /// whose value is the typed text (a date picker, a colour well).
+  verified: bool,
+}
+
+/// Letters and digits, lower-cased: what survives an input mask.
+fn mask_fold(text: &str) -> String {
+  text
+    .chars()
+    .filter(|c| c.is_alphanumeric())
+    .flat_map(char::to_lowercase)
+    .collect()
+}
+
+/// Whether a field that held `before` and holds `after` took `typed`.
+///
+/// Compared on letters and digits, so a mask that adds separators, a prefix or
+/// a different case still counts. When the field was not emptied, only what
+/// came after `before` counts. A field that moved the focus on while the text
+/// was typed (one box per character) took it when it holds its start. A text
+/// with no letters or digits cannot be told apart from a mask and passes.
+fn field_took(typed: &str, before: &str, after: &str, cleared: bool, focus_moved: bool) -> bool {
+  let wanted = mask_fold(typed);
+  if wanted.is_empty() {
+    return true;
+  }
+  let now = mask_fold(after);
+  let held = mask_fold(before);
+  let added = if cleared {
+    now.as_str()
+  } else {
+    now.strip_prefix(held.as_str()).unwrap_or(now.as_str())
+  };
+  added.contains(&wanted) || (focus_moved && !added.is_empty() && wanted.starts_with(added))
+}
+
+/// The verdict on a field read back after typing: whether it was checked, or
+/// the refusal when it does not hold the text.
+fn typing_verdict(
+  typed: &str,
+  before: &FieldValue,
+  after: &FieldValue,
+  cleared: bool,
+) -> Result<bool, AgentError> {
+  if !after.holds_typed_text() {
+    return Ok(false);
+  }
+  if field_took(
+    typed,
+    &before.value,
+    &after.value,
+    cleared,
+    after.focus_moved,
+  ) {
+    return Ok(true);
+  }
+  let shown: String = after.value.chars().take(200).collect();
+  let holds = if after.secret {
+    format!("{} characters", after.value.chars().count())
+  } else if after.value.is_empty() {
+    "nothing".to_string()
+  } else {
+    format!("{shown:?}")
+  };
+  Err(AgentError::TypeNotApplied {
+    reason: "value",
+    value: (!after.secret).then_some(shown),
+    message: format!(
+      "The field did not take the text: after typing it holds {holds}. The page may have reset it, or the field takes another kind of input (a mask, a length limit, a picker). Read it with perceive_page, then click the field and type again, or use press_key."
+    ),
+  })
+}
+
+/// Make sure the focus is in `field`, then select what it holds or park the
+/// caret at its end. Answers what it held.
+async fn focus_and_prepare(
+  session: &mut WayfernSession,
+  field: &str,
+  clear: bool,
+) -> Result<FieldValue, AgentError> {
+  let focus: FieldFocus = typing_step(session, field, "focus", true.into()).await?;
+  if !focus.focused {
+    return Err(AgentError::TypeNotApplied {
+      reason: "not_focused",
+      value: None,
+      message: format!(
+        "The field did not take the focus, so nothing was typed; the focus is on {}. Close what covers the field, or name the input itself.",
+        focus.active
+      ),
+    });
+  }
+  typing_step(session, field, "prepare", clear.into()).await
+}
+
+/// A trusted click at `point`, for the engines that type without Vellum.
+async fn dispatch_click(
+  session: &mut WayfernSession,
+  point: ViewportTarget,
+) -> Result<(), AgentError> {
+  session
+    .call(
+      "Input.dispatchMouseEvent",
+      serde_json::json!({ "type": "mouseMoved", "x": point.x, "y": point.y }),
+    )
+    .await?;
+  for kind in ["mousePressed", "mouseReleased"] {
+    session
+      .call(
+        "Input.dispatchMouseEvent",
+        serde_json::json!({
+          "type": kind, "x": point.x, "y": point.y, "button": "left", "clickCount": 1,
+        }),
+      )
+      .await?;
+  }
+  Ok(())
+}
+
+/// Type `text` into the field behind `element`, then read the field back.
+///
+/// With Vellum the field is struck where a hand would land and typed into by
+/// the browser's own keyboard. Otherwise it is focused, and clicked when that
+/// does not take. Either way the focus must be in the field before a key is
+/// sent, and a field that does not hold the text afterwards is a
+/// [`AgentError::TypeNotApplied`], never a success.
+async fn type_into(
+  session: &mut WayfernSession,
+  target: &CdpTarget,
+  element: &str,
+  backend_node_id: Option<i64>,
+  text: &str,
+  clear: bool,
+  method: TypingMethod<'_>,
+) -> Result<FieldTyping, AgentError> {
+  let field = typing_field(session, element).await?;
+  let point = typing_point(session, &field, backend_node_id).await?;
+  let (before, inscription) = if let TypingMethod::Vellum { typos, timeout } = method {
+    let viewport = wayfern_cdp::layout_viewport(session).await?;
+    let point = point.map(|p| clamp_to_viewport(p, viewport));
+    let rest = point.unwrap_or(ViewportTarget {
+      x: viewport.0 / 2.0,
+      y: viewport.1 / 2.0,
+      width: viewport.0,
+      height: viewport.1,
+    });
+    let origin = wayfern_cdp::glide_origin(&rest, viewport);
+    // Owned by the gesture, for the reason `vellum_click_in` gives.
+    let (field, text) = (field.clone(), text.to_owned());
+    vellum::with_pointer(session, origin.0, origin.1, |s, p| {
+      Box::pin(async move {
+        if let Some(point) = point {
+          vellum::glide(s, p, point.x, point.y, Some(point.width.min(point.height))).await?;
+          vellum::strike(s, p, None, None).await?;
+        }
+        let before = focus_and_prepare(s, &field, clear).await?;
+        let inscription = vellum::inscribe(s, p, &text, typos, timeout).await?;
+        Ok::<_, AgentError>((before, Some(inscription)))
+      })
+    })
+    .await?
+  } else {
+    let focus: FieldFocus = typing_step(session, &field, "focus", true.into()).await?;
+    if let (false, Some(point)) = (focus.focused, point) {
+      dispatch_click(session, point).await?;
+    }
+    let before = focus_and_prepare(session, &field, clear).await?;
+    match method {
+      TypingMethod::Keystrokes(plan) => dispatch_keystrokes(target, plan).await?,
+      _ => {
+        session
+          .call("Input.insertText", serde_json::json!({ "text": text }))
+          .await?;
+      }
+    }
+    (before, None)
+  };
+  tokio::time::sleep(TYPING_SETTLE).await;
+  let after: FieldValue = typing_step(session, &field, "read", serde_json::Value::Null).await?;
+  let verified = typing_verdict(text, &before, &after, clear)?;
+  Ok(FieldTyping {
+    inscription,
+    verified,
+  })
+}
+
+/// Type into the element `element` names, on a fresh session: what typing
+/// did, and the locator's match when a locator named it.
+async fn type_element(
+  target: &CdpTarget,
+  engine: Engine,
+  element: &ElementRef,
+  text: &str,
+  clear: bool,
+  method: TypingMethod<'_>,
+) -> Result<(FieldTyping, Option<LocatedNode>), AgentError> {
+  let mut session = WayfernSession::open(target).await?;
+  let outcome = async {
+    let (object, located) = form_element(&mut session, engine, element).await?;
+    let backend_node_id = located.as_ref().map(|l| l.backend_node_id);
+    let typed = type_into(
+      &mut session,
+      target,
+      &object,
+      backend_node_id,
+      text,
+      clear,
+      method,
+    )
+    .await?;
+    Ok::<_, AgentError>((typed, located))
+  }
+  .await;
+  let _ = session
+    .call(
+      "Runtime.releaseObjectGroup",
+      serde_json::json!({ "objectGroup": FORM_GROUP }),
+    )
+    .await;
+  session.close().await;
+  outcome
+}
+
+/// Deliver an accepted keystroke plan through `Input.dispatchKeyEvent`.
+///
+/// The transport-level half of the pre-152 typing path, shared by the MCP
+/// handlers and the REST agent endpoints.
+pub(crate) async fn dispatch_keystrokes(
+  target: &CdpTarget,
+  events: &[crate::human_typing::TypingEvent],
+) -> Result<(), CdpError> {
+  use crate::human_typing::TypingAction;
+
+  let mut connection = target.connect().await?;
+
+  let mut cmd_id = 1u64;
+  let mut last_time = 0.0;
+
+  for event in events {
+    let delay = event.time - last_time;
+    if delay > 0.0 {
+      tokio::time::sleep(Duration::from_secs_f64(delay)).await;
+    }
+    last_time = event.time;
+
+    let (down, up) = match &event.action {
+      TypingAction::Char(ch) => {
+        let ch = ch.to_string();
+        (
+          serde_json::json!({
+            "type": "keyDown",
+            "text": ch,
+            "key": ch,
+            "unmodifiedText": ch,
+          }),
+          serde_json::json!({ "type": "keyUp", "key": ch }),
+        )
+      }
+      TypingAction::Backspace => (
+        serde_json::json!({
+          "type": "keyDown",
+          "key": "Backspace",
+          "code": "Backspace",
+          "windowsVirtualKeyCode": 8,
+          "nativeVirtualKeyCode": 8,
+        }),
+        serde_json::json!({
+          "type": "keyUp",
+          "key": "Backspace",
+          "code": "Backspace",
+          "windowsVirtualKeyCode": 8,
+          "nativeVirtualKeyCode": 8,
+        }),
+      ),
+    };
+
+    for params in [down, up] {
+      connection
+        .send_command(cmd_id, "Input.dispatchKeyEvent", params)
+        .await?;
+      // Drained rather than matched: the point is to keep reading so the
+      // browser is never writing into a full socket while the next keystroke
+      // is being timed. Bounded, because a reply that never comes must not
+      // freeze typing forever — the keystroke itself was already delivered.
+      let _ = tokio::time::timeout(KEYSTROKE_ACK_TIMEOUT, connection.next_text()).await;
+      cmd_id += 1;
+    }
+  }
+
+  connection.close().await;
+  Ok(())
+}
+
+/// Read the page as the agent sees it.
+pub(crate) async fn agent_perceive(
+  ctx: &AgentContext,
+  request: &PerceptionRequest,
+) -> Result<PerceptionPage, AgentError> {
+  if let Some(order) = request.text_order.as_deref() {
+    if order != "reading" && order != "visual" {
+      return Err(AgentError::InvalidArgument(
+        "text_order must be \"reading\" or \"visual\"".to_string(),
+      ));
+    }
+  }
+  let continuation = request.cursor.as_deref().is_some_and(|c| !c.is_empty());
+  if ctx.engine.is_wayfern() {
+    // The browser applies max_nodes to its tree in document order, before the
+    // viewport filter: after a scroll, a small ceiling held only the sticky
+    // header and never marked the result truncated. A viewport capture is
+    // taken without it, and the ceiling bounds the nodes returned instead.
+    let viewport_cap = request
+      .max_nodes
+      .filter(|&cap| cap > 0 && request.viewport_only == Some(true) && !continuation);
+    let uncapped = PerceptionRequest {
+      max_nodes: None,
+      ..request.clone()
+    };
+    let browser_request = if viewport_cap.is_some() {
+      &uncapped
+    } else {
+      request
+    };
+    let mut session = WayfernSession::open(&ctx.target).await?;
+    let page = wayfern_cdp::capture_page_perception(&mut session, browser_request).await;
+    session.close().await;
+    let page = page?;
+    // Wayfern 152 to 155 start the budget clock before the accessibility
+    // snapshot, and stop the walk when it runs out without marking the result
+    // truncated: a heavy page came back as its header and no text. A capture
+    // that used its whole budget is not trusted, nor one whose tree the
+    // renderer cut short with no ceiling from the caller; the DOM answers.
+    let budget = request.budget_ms.unwrap_or(5_000).clamp(100, 60_000);
+    let caller_ceiling = browser_request.max_nodes.is_some_and(|cap| cap > 0);
+    let reason = if continuation {
+      None
+    } else if page.stats.elapsed_ms >= budget {
+      Some("budget")
+    } else if page.stats.frames_truncated > 0 && !caller_ceiling {
+      Some("frame_cut")
+    } else if viewport_cap.is_some_and(|cap| page.nodes.len() as u64 > cap) {
+      Some("max_nodes")
+    } else {
+      None
+    };
+    let Some(reason) = reason else {
+      return Ok(page);
+    };
+    let level = if reason == "max_nodes" {
+      log::Level::Debug
+    } else {
+      log::Level::Info
+    };
+    log::log!(
+      level,
+      "Perception incomplete, answering from the page profile={} reason={reason} budget_ms={budget} elapsed_ms={} nodes={} frames_truncated={}",
+      ctx.profile.id,
+      page.stats.elapsed_ms,
+      page.nodes.len(),
+      page.stats.frames_truncated
+    );
+  } else if continuation {
+    return Err(AgentError::InvalidArgument(
+      "the fallback engine answers in one page and has no cursors to continue".to_string(),
+    ));
+  }
+  let opts = serde_json::json!({
+    "mode": "perceive",
+    "maxNodes": request.max_nodes.unwrap_or(100_000),
+    "maxBytes": request.byte_cap(),
+    "includeText": request.include_text.unwrap_or(true),
+    "viewportOnly": request.viewport_only.unwrap_or(false),
+  });
+  let answer = evaluate_json_script(&ctx.target, fallback_script(&opts)).await?;
+  let perception: FallbackPerception = serde_json::from_value(answer)
+    .map_err(|e| AgentError::Malformed(format!("fallback perception: {e}")))?;
+  let snapshot_id = format!(
+    "fallback-{}",
+    std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .map(|d| d.as_millis())
+      .unwrap_or(0)
+  );
+  Ok(PerceptionPage {
+    snapshot_id,
+    nodes: perception.nodes,
+    frames: perception.frames,
+    text: perception.text,
+    truncated: perception.truncated,
+    stats: perception.stats,
+    cursor: None,
+    engine: Engine::Fallback,
+  })
+}
+
+/// Resolve a locator to exactly one node.
+pub(crate) async fn agent_resolve_locator(
+  ctx: &AgentContext,
+  request: &AgentResolveRequest,
+) -> Result<LocatorResolution, AgentError> {
+  validate_locator(&request.locator)?;
+  let locator = canonical_locator(&request.locator);
+  if ctx.engine.is_wayfern() {
+    let mut session = WayfernSession::open(&ctx.target).await?;
+    let located = wayfern_locate(&mut session, &locator, request.candidate_limit).await;
+    session.close().await;
+    let located = located?;
+    return Ok(LocatorResolution {
+      backend_node_id: Some(located.backend_node_id),
+      match_count: 1,
+      matched: located.matched,
+      locator,
+      engine: located.engine,
+    });
+  }
+
+  let (matched, _) = fallback_resolve(
+    &ctx.target,
+    &locator,
+    request.candidate_limit,
+    FallbackAct::Describe,
+  )
+  .await?;
+  Ok(LocatorResolution {
+    backend_node_id: None,
+    match_count: 1,
+    matched,
+    locator,
+    engine: Engine::Fallback,
+  })
+}
+
+/// Where to strike a located node: where a hand would click it, which for a
+/// control the page draws through its label (a transparent or collapsed radio,
+/// checkbox or file input) is the label, and never a spot where something
+/// else lies on top while a better one is in view. In a frame, or when the
+/// page sees no box, the DOM's quads decide.
+async fn click_point(
+  session: &mut WayfernSession,
+  backend_node_id: i64,
+) -> Result<ViewportTarget, AgentError> {
+  let node = session
+    .call(
+      "DOM.resolveNode",
+      serde_json::json!({ "backendNodeId": backend_node_id, "objectGroup": FORM_GROUP }),
+    )
+    .await?;
+  let aim = match node.pointer("/object/objectId").and_then(|v| v.as_str()) {
+    Some(object) => aim_at(session, object).await,
+    None => Ok(Aim::Frame),
+  };
+  let _ = session
+    .call(
+      "Runtime.releaseObjectGroup",
+      serde_json::json!({ "objectGroup": FORM_GROUP }),
+    )
+    .await;
+  match aim? {
+    Aim::At(point) | Aim::Covered(point, _) => Ok(point),
+    Aim::Hidden | Aim::Frame => Ok(wayfern_cdp::viewport_target(session, backend_node_id).await?),
+  }
+}
+
+/// Resolve a locator and click it.
+pub(crate) async fn agent_click_locator(
+  ctx: &AgentContext,
+  request: &AgentClickRequest,
+) -> Result<AgentClick, AgentError> {
+  validate_click(request)?;
+  let locator = canonical_locator(&request.locator);
+  let button = request.button.as_deref();
+
+  if ctx.engine.is_wayfern() {
+    let mut session = WayfernSession::open(&ctx.target).await?;
+    let outcome = async {
+      session.call("Page.enable", serde_json::json!({})).await?;
+      let located = wayfern_locate(&mut session, &locator, None).await?;
+      let point = click_point(&mut session, located.backend_node_id).await?;
+      let (_, navigated) =
+        vellum_click_in(&mut session, point, button, request.click_count).await?;
+      Ok::<_, AgentError>((located, navigated))
+    }
+    .await;
+    let _ = session.call("Page.disable", serde_json::json!({})).await;
+    session.close().await;
+    let (located, navigated) = outcome?;
+    return Ok(AgentClick {
+      clicked: true,
+      matched: located.matched,
+      engine: Engine::Wayfern,
+      navigated,
+    });
+  }
+
+  let (matched, center) =
+    fallback_resolve(&ctx.target, &locator, None, FallbackAct::Scroll).await?;
+  let point = fallback_target(center)?;
+  let mut session = WayfernSession::open(&ctx.target).await?;
+  let outcome = async {
+    session.call("Page.enable", serde_json::json!({})).await?;
+    session
+      .call(
+        "Input.dispatchMouseEvent",
+        serde_json::json!({ "type": "mouseMoved", "x": point.x, "y": point.y }),
+      )
+      .await?;
+    let press = serde_json::json!({
+      "type": "mousePressed",
+      "x": point.x,
+      "y": point.y,
+      "button": button.unwrap_or("left"),
+      "clickCount": request.click_count.unwrap_or(1),
+    });
+    session.call("Input.dispatchMouseEvent", press).await?;
+    let release = serde_json::json!({
+      "type": "mouseReleased",
+      "x": point.x,
+      "y": point.y,
+      "button": button.unwrap_or("left"),
+      "clickCount": request.click_count.unwrap_or(1),
+    });
+    let (_, navigated) = session
+      .call_then_await_navigation("Input.dispatchMouseEvent", release, CLICK_LOAD_TIMEOUT)
+      .await?;
+    Ok::<_, AgentError>(navigated)
+  }
+  .await;
+  let _ = session.call("Page.disable", serde_json::json!({})).await;
+  session.close().await;
+  Ok(AgentClick {
+    clicked: true,
+    matched,
+    engine: Engine::Fallback,
+    navigated: outcome?,
+  })
+}
+
+/// A hold's duration and button, checked: the duration a whole number of
+/// milliseconds in bounds (the default when absent), the button one a hold
+/// can keep down.
+pub(crate) fn hold_settings(
+  duration_ms: Option<f64>,
+  button: Option<&str>,
+) -> Result<(u64, &'static str), AgentError> {
+  use crate::human_hold::{DEFAULT_HOLD_MS, MAX_HOLD_MS, MIN_HOLD_MS};
+  let duration = match duration_ms {
+    None => DEFAULT_HOLD_MS,
+    Some(ms) if ms.fract() == 0.0 && (MIN_HOLD_MS as f64..=MAX_HOLD_MS as f64).contains(&ms) => {
+      ms as u64
+    }
+    Some(_) => {
+      return Err(AgentError::InvalidArgument(format!(
+        "duration_ms must be a whole number from {MIN_HOLD_MS} to {MAX_HOLD_MS}"
+      )))
+    }
+  };
+  let button = match button.unwrap_or("left") {
+    "left" => "left",
+    "middle" => "middle",
+    "right" => "right",
+    _ => {
+      return Err(AgentError::InvalidArgument(
+        "button must be left, middle or right".to_string(),
+      ))
+    }
+  };
+  Ok((duration, button))
+}
+
+/// The Fitts width the held moves glide with: a hand already on its target.
+const HELD_GLIDE_WIDTH: f64 = 40.0;
+
+/// Sleep until `ms` after `since`.
+async fn sleep_until(since: tokio::time::Instant, ms: u64) {
+  tokio::time::sleep_until(since + Duration::from_millis(ms)).await;
+}
+
+/// Where to press a held element: where a hand would click it, as for a
+/// click. With no box in the page, or in a frame, the DOM decides, which
+/// needs the node a locator settled on.
+async fn hold_point(
+  session: &mut WayfernSession,
+  object: &str,
+  backend_node_id: Option<i64>,
+) -> Result<ViewportTarget, AgentError> {
+  match (aim_at(session, object).await?, backend_node_id) {
+    (Aim::At(point) | Aim::Covered(point, _), _) => Ok(point),
+    (Aim::Hidden | Aim::Frame, Some(id)) => Ok(wayfern_cdp::viewport_target(session, id).await?),
+    (Aim::Hidden, None) => Err(not_visible()),
+    (Aim::Frame, None) => Err(AgentError::BadRequest(
+      "The element is inside a frame; name it with a locator.".to_string(),
+    )),
+  }
+}
+
+/// Press at `point`, where the pointer already is, keep the button down as
+/// `plan` says and let go, all as CDP mouse events. A held move that stays on
+/// the pixel of the event before sends nothing, as a still mouse does.
+/// Returns whether a page load followed, and how long the button was down.
+async fn dispatch_hold(
+  session: &mut WayfernSession,
+  point: ViewportTarget,
+  button: &str,
+  plan: &crate::human_hold::HoldPlan,
+) -> Result<(bool, u64), AgentError> {
+  let mask = crate::human_hold::buttons_mask(button);
+  // Trusted events land on the device-pixel grid; whole CSS pixels are on
+  // it at every scale.
+  let mut at = (point.x.round(), point.y.round());
+  session
+    .call(
+      "Input.dispatchMouseEvent",
+      serde_json::json!({
+        "type": "mousePressed", "x": at.0, "y": at.1, "button": button, "buttons": mask, "clickCount": 1,
+      }),
+    )
+    .await?;
+  let pressed = tokio::time::Instant::now();
+  let kept = async {
+    for step in &plan.moves {
+      sleep_until(pressed, step.at_ms).await;
+      let to = ((point.x + step.dx).round(), (point.y + step.dy).round());
+      if to == at {
+        continue;
+      }
+      session
+        .call(
+          "Input.dispatchMouseEvent",
+          serde_json::json!({
+            "type": "mouseMoved", "x": to.0, "y": to.1, "button": button, "buttons": mask,
+          }),
+        )
+        .await?;
+      at = to;
+    }
+    sleep_until(pressed, plan.hold_ms).await;
+    Ok::<(), WayfernError>(())
+  }
+  .await;
+  let held_ms = pressed.elapsed().as_millis() as u64;
+  // Let go on every path: a button left down stays down for the page.
+  let release = serde_json::json!({
+    "type": "mouseReleased", "x": at.0, "y": at.1, "button": button, "buttons": 0, "clickCount": 1,
+  });
+  let let_go = session
+    .call_then_await_navigation("Input.dispatchMouseEvent", release, CLICK_LOAD_TIMEOUT)
+    .await;
+  kept?;
+  let (_, navigated) = let_go?;
+  Ok((navigated, held_ms))
+}
+
+/// Glide to `point`, clasp, glide a little while the button is down as
+/// `plan` says, and unclasp, on an open session with `Page.enable` on. A
+/// browser built before the clasp gets the press, the moves and the release
+/// as CDP mouse events at the point the pointer glided to. Returns the
+/// engine that held the button, whether a page load followed, and how long
+/// the button was down.
+async fn vellum_hold_in(
+  session: &mut WayfernSession,
+  point: ViewportTarget,
+  viewport: (f64, f64),
+  button: &'static str,
+  plan: crate::human_hold::HoldPlan,
+) -> Result<(Engine, bool, u64), AgentError> {
+  let origin = wayfern_cdp::glide_origin(&point, viewport);
+  let width = Some(point.width.min(point.height));
+  vellum::with_pointer(session, origin.0, origin.1, |s, p| {
+    Box::pin(async move {
+      vellum::glide(s, p, point.x, point.y, width).await?;
+      tokio::time::sleep(Duration::from_millis(plan.settle_ms)).await;
+      match vellum::clasp(s, p, Some(button)).await {
+        Ok(()) => {}
+        Err(e) if vellum::is_missing(&e, "Vellum.clasp") => {
+          let (navigated, held_ms) = dispatch_hold(s, point, button, &plan).await?;
+          return Ok((Engine::Fallback, navigated, held_ms));
+        }
+        Err(e) => return Err(e.into()),
+      }
+      let pressed = tokio::time::Instant::now();
+      let kept = async {
+        for step in &plan.moves {
+          sleep_until(pressed, step.at_ms).await;
+          vellum::glide(
+            s,
+            p,
+            point.x + step.dx,
+            point.y + step.dy,
+            Some(HELD_GLIDE_WIDTH),
+          )
+          .await?;
+        }
+        sleep_until(pressed, plan.hold_ms).await;
+        Ok::<(), WayfernError>(())
+      }
+      .await;
+      let held_ms = pressed.elapsed().as_millis() as u64;
+      // Let go on every path: a button left down stays down for the page.
+      let let_go = vellum::unclasp_awaiting_load(s, p, CLICK_LOAD_TIMEOUT).await;
+      kept?;
+      Ok::<_, AgentError>((Engine::Wayfern, let_go?, held_ms))
+    })
+  })
+  .await
+}
+
+/// Press the element `element` names, keep the button down for about
+/// `duration_ms` with the small movements a held hand makes, and let go.
+///
+/// The hold lasts a little longer than asked, never less, and the pointer
+/// never rests perfectly still: press-and-hold checks read both as a script.
+async fn agent_press_and_hold(
+  ctx: &AgentContext,
+  element: &ElementRef,
+  duration_ms: u64,
+  button: &'static str,
+) -> Result<AgentHold, AgentError> {
+  let plan = crate::human_hold::random_plan(duration_ms);
+  let mut session = WayfernSession::open(&ctx.target).await?;
+  let outcome = async {
+    session.call("Page.enable", serde_json::json!({})).await?;
+    let (object, located) = form_element(&mut session, ctx.engine, element).await?;
+    let backend_node_id = located.as_ref().map(|l| l.backend_node_id);
+    let point = hold_point(&mut session, &object, backend_node_id).await?;
+    let viewport = wayfern_cdp::layout_viewport(&mut session).await?;
+    let point = clamp_to_viewport(point, viewport);
+    let held = if ctx.engine.is_wayfern() {
+      vellum_hold_in(&mut session, point, viewport, button, plan).await?
+    } else {
+      session
+        .call(
+          "Input.dispatchMouseEvent",
+          serde_json::json!({ "type": "mouseMoved", "x": point.x.round(), "y": point.y.round() }),
+        )
+        .await?;
+      tokio::time::sleep(Duration::from_millis(plan.settle_ms)).await;
+      let (navigated, held_ms) = dispatch_hold(&mut session, point, button, &plan).await?;
+      (Engine::Fallback, navigated, held_ms)
+    };
+    Ok::<_, AgentError>((located, held))
+  }
+  .await;
+  let _ = session
+    .call(
+      "Runtime.releaseObjectGroup",
+      serde_json::json!({ "objectGroup": FORM_GROUP }),
+    )
+    .await;
+  let _ = session.call("Page.disable", serde_json::json!({})).await;
+  session.close().await;
+  let (located, (engine, navigated, held_ms)) = outcome?;
+  Ok(AgentHold {
+    held: true,
+    matched: located.map(|l| l.matched),
+    engine,
+    navigated,
+    button: button.to_string(),
+    held_ms,
+  })
+}
+
+/// `POST /agent/hold`: the element named one way, by locator or selector,
+/// then [`agent_press_and_hold`].
+pub(crate) async fn agent_hold(
+  ctx: &AgentContext,
+  request: &AgentHoldRequest,
+) -> Result<AgentHold, AgentError> {
+  let (duration_ms, button) = hold_settings(request.duration_ms, request.button.as_deref())?;
+  let element = match (&request.locator, request.selector.as_deref()) {
+    (Some(locator), None) => {
+      validate_locator(locator)?;
+      ElementRef::Locator(canonical_locator(locator))
+    }
+    (None, Some(selector)) if !selector.trim().is_empty() => {
+      ElementRef::Selector(selector.to_string())
+    }
+    _ => {
+      return Err(AgentError::InvalidArgument(
+        "Name the element one way: locator or selector".to_string(),
+      ))
+    }
+  };
+  agent_press_and_hold(ctx, &element, duration_ms, button).await
+}
+
+/// Resolve a locator and type into it.
+///
+/// `max_seconds` is the caller's typing budget; the refusal for a text that
+/// would outlive it comes before anything touches the page.
+pub(crate) async fn agent_type_locator(
+  ctx: &AgentContext,
+  request: &AgentTypeRequest,
+  max_seconds: f64,
+) -> Result<AgentTyping, AgentError> {
+  validate_locator(&request.locator)?;
+  if request.text.is_empty() {
+    return Err(AgentError::InvalidArgument(
+      "text must not be empty".to_string(),
+    ));
+  }
+  let clear_first = request.clear_first.unwrap_or(true);
+  let typos = request.typos.unwrap_or(true);
+  let locator = canonical_locator(&request.locator);
+
+  // Budgeted and planned first, before the field is touched, for the reason
+  // the selector tools plan first: a refusal after the clear is a lie.
+  let wayfern = ctx.engine.is_wayfern();
+  let vellum_timeout = if wayfern {
+    Some(vellum_typing_budget(&request.text, max_seconds)?)
+  } else {
+    None
+  };
+  let plan = if wayfern {
+    None
+  } else {
+    Some(plan_typing(&request.text, request.wpm, max_seconds)?)
+  };
+  let (typed, located) = type_element(
+    &ctx.target,
+    ctx.engine,
+    &ElementRef::Locator(locator),
+    &request.text,
+    clear_first,
+    TypingMethod::chosen(vellum_timeout, plan.as_deref(), typos),
+  )
+  .await?;
+  let matched = located
+    .map(|l| l.matched)
+    .ok_or_else(|| AgentError::Malformed("the locator settled on no element".into()))?;
+  let (characters, corrections, duration_ms) = match typed.inscription {
+    Some(inscription) => (
+      inscription.characters,
+      Some(inscription.corrections),
+      inscription.duration_ms,
+    ),
+    None => (
+      request.text.chars().count() as u64,
+      None,
+      plan
+        .as_deref()
+        .and_then(<[_]>::last)
+        .map_or(0.0, |event| event.time * 1000.0),
+    ),
+  };
+  Ok(AgentTyping {
+    typed: true,
+    characters,
+    corrections,
+    duration_ms,
+    engine: ctx.engine,
+    matched,
+    verified: typed.verified,
+  })
+}
+
+/// Read rows off the page. Wayfern 152 only.
+pub(crate) async fn agent_extract(
+  ctx: &AgentContext,
+  request: &ExtractionRequest,
+) -> Result<Extraction, AgentError> {
+  validate_extraction(request)?;
+  ctx.requires_wayfern_152()?;
+  let mut request = request.clone();
+  request.container = canonical_locator(&request.container);
+  for field in &mut request.field_map {
+    field.locator = canonical_locator(&field.locator);
+  }
+  request.next_page = request.next_page.as_ref().map(canonical_locator);
+  let mut session = WayfernSession::open(&ctx.target).await?;
+  let extraction = wayfern_cdp::extract_structured(&mut session, &request).await;
+  session.close().await;
+  Ok(extraction?)
+}
+
+/// Arm the picker and wait for the user's click. Wayfern 152 only.
+pub(crate) async fn agent_pick_element(
+  ctx: &AgentContext,
+  timeout_ms: u64,
+) -> Result<PickedElement, AgentError> {
+  ctx.requires_wayfern_152()?;
+  let mut session = WayfernSession::open(&ctx.target).await?;
+  let picked =
+    wayfern_cdp::pick_element(&mut session, Duration::from_millis(timeout_ms), true).await;
+  session.close().await;
+  Ok(picked?)
+}
+
+// --- Form tools: options of a select, files of a file input -----------------
+
+/// How a form tool names its element.
+enum ElementRef {
+  Selector(String),
+  /// An entry of the session's last `get_interactive_elements` listing.
+  Index {
+    cache: String,
+    index: u64,
+  },
+  Locator(LocatorDescription),
+}
+
+/// The object group a form tool's element handles live in, released when the
+/// tool is done.
+const FORM_GROUP: &str = "donut-form";
+
+/// The page's handle to the element `element` names, and where the locator
+/// settled when a locator named it.
+async fn form_element(
+  session: &mut WayfernSession,
+  engine: Engine,
+  element: &ElementRef,
+) -> Result<(String, Option<LocatedNode>), AgentError> {
+  let (expression, missing) = match element {
+    ElementRef::Locator(locator) => {
+      let located = if engine.is_wayfern() {
+        wayfern_locate(session, locator, None).await?
+      } else {
+        page_locate(session, locator, None).await?
+      };
+      let node = session
+        .call(
+          "DOM.resolveNode",
+          serde_json::json!({
+            "backendNodeId": located.backend_node_id,
+            "objectGroup": FORM_GROUP,
+          }),
+        )
+        .await?;
+      let object = node
+        .pointer("/object/objectId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AgentError::Malformed("DOM.resolveNode answered no object".into()))?;
+      return Ok((object.to_string(), Some(located)));
+    }
+    ElementRef::Selector(selector) => (
+      format!(
+        "document.querySelector({})",
+        serde_json::Value::from(selector.as_str())
+      ),
+      format!("No element matches selector {selector}"),
+    ),
+    ElementRef::Index { cache, index } => (
+      format!("(() => {{ const arr = window[{cache}]; return (arr && arr[{index}]) || null; }})()"),
+      format!(
+        "No element at index {index}. Call get_interactive_elements first or after navigation."
+      ),
+    ),
+  };
+  let result = session
+    .call(
+      "Runtime.evaluate",
+      serde_json::json!({
+        "expression": expression,
+        "returnByValue": false,
+        "objectGroup": FORM_GROUP,
+      }),
+    )
+    .await?;
+  if let Some(thrown) = script_exception(&result) {
+    return Err(thrown);
+  }
+  match result.pointer("/result/objectId").and_then(|v| v.as_str()) {
+    Some(object) => Ok((object.to_string(), None)),
+    None => Err(AgentError::NoMatch { message: missing }),
+  }
+}
+
+/// Run `function` on `object` and hand back what it returned.
+async fn call_on(
+  session: &mut WayfernSession,
+  object: &str,
+  function: &str,
+  arguments: serde_json::Value,
+) -> Result<serde_json::Value, AgentError> {
+  let reply = session
+    .call(
+      "Runtime.callFunctionOn",
+      serde_json::json!({
+        "objectId": object,
+        "functionDeclaration": function,
+        "arguments": arguments,
+        "returnByValue": true,
+      }),
+    )
+    .await?;
+  if let Some(thrown) = script_exception(&reply) {
+    return Err(thrown);
+  }
+  Ok(reply.pointer("/result/value").cloned().unwrap_or_default())
+}
+
+/// Pick the options a caller named in a `<select>` (or the one `<select>` a
+/// label or a container names), the way a person's pick leaves it: focused,
+/// with `input` and `change` fired when the choice changed. Answers the
+/// choice, or `{ error, ... }`.
+const SELECT_OPTION_FN: &str = r#"function (wanted) {
+  const norm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+  let el = this;
+  if (!(el instanceof HTMLSelectElement)) {
+    const inner = el.control instanceof HTMLSelectElement
+      ? [el.control]
+      : Array.from(el.querySelectorAll ? el.querySelectorAll('select') : []);
+    if (inner.length !== 1) {
+      return { error: 'not_select', tag: String(el.tagName || '').toLowerCase(), found: inner.length };
+    }
+    el = inner[0];
+  }
+  const options = Array.from(el.options);
+  const label = (o) => norm(o.label || o.text);
+  const describe = (o) => ({ value: o.value, label: label(o), disabled: o.disabled });
+  const find = (w) => {
+    const text = norm(w);
+    return options.find((o) => o.value === w)
+      || options.find((o) => label(o) === text)
+      || options.find((o) => label(o).toLowerCase() === text.toLowerCase());
+  };
+  const chosen = wanted.map(find);
+  const missing = wanted.filter((_, i) => !chosen[i]);
+  if (missing.length) {
+    return { error: 'no_option', missing, options: options.slice(0, 50).map(describe), count: options.length };
+  }
+  if (el.disabled) return { error: 'disabled' };
+  const off = chosen.filter((o) => o.disabled || (o.parentElement instanceof HTMLOptGroupElement && o.parentElement.disabled));
+  if (off.length) return { error: 'option_disabled', options: off.map(describe) };
+  if (chosen.length > 1 && !el.multiple) return { error: 'single' };
+  const before = options.map((o) => o.selected);
+  el.scrollIntoView({ block: 'nearest' });
+  el.focus({ preventScroll: true });
+  if (el.multiple) {
+    for (const o of options) o.selected = chosen.includes(o);
+  } else {
+    el.selectedIndex = options.indexOf(chosen[0]);
+  }
+  const changed = options.some((o, i) => o.selected !== before[i]);
+  if (changed) {
+    el.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  return { selected: options.filter((o) => o.selected).map(describe), changed, multiple: el.multiple };
+}"#;
+
+/// What `select_option` did.
+#[derive(Debug, Serialize)]
+struct SelectedOptions {
+  selected: serde_json::Value,
+  changed: bool,
+  navigated: bool,
+  #[serde(rename = "match", skip_serializing_if = "Option::is_none")]
+  matched: Option<LocatorCandidate>,
+}
+
+/// A refusal `SELECT_OPTION_FN` answered, as an error an agent can act on.
+fn select_refusal(answer: &serde_json::Value) -> Option<AgentError> {
+  let error = answer.get("error")?.as_str()?;
+  Some(match error {
+    "not_select" => AgentError::BadRequest(format!(
+      "The element is a <{}>, not a <select>. For a custom dropdown, click it open and click the option.",
+      answer["tag"].as_str().unwrap_or("?")
+    )),
+    "no_option" => AgentError::BadRequest(format!(
+      "No option matches {}. The select has {} options: {}",
+      answer["missing"], answer["count"], answer["options"]
+    )),
+    "disabled" => AgentError::BadRequest("The select is disabled.".to_string()),
+    "option_disabled" => AgentError::BadRequest(format!(
+      "These options are disabled: {}",
+      answer["options"]
+    )),
+    "single" => AgentError::InvalidArgument(
+      "This select takes one option; name one.".to_string(),
+    ),
+    other => AgentError::Malformed(format!("the select script answered {other}")),
+  })
+}
+
+async fn agent_select_option(
+  ctx: &AgentContext,
+  element: &ElementRef,
+  wanted: &[String],
+) -> Result<SelectedOptions, AgentError> {
+  let mut session = WayfernSession::open(&ctx.target).await?;
+  let outcome = async {
+    session.call("Page.enable", serde_json::json!({})).await?;
+    let (object, located) = form_element(&mut session, ctx.engine, element).await?;
+    let matched = located.map(|l| l.matched);
+    let (reply, navigated) = session
+      .call_then_await_navigation(
+        "Runtime.callFunctionOn",
+        serde_json::json!({
+          "objectId": object,
+          "functionDeclaration": SELECT_OPTION_FN,
+          "arguments": [{ "value": wanted }],
+          "returnByValue": true,
+        }),
+        CLICK_LOAD_TIMEOUT,
+      )
+      .await?;
+    if let Some(thrown) = script_exception(&reply) {
+      return Err(thrown);
+    }
+    let answer = reply.pointer("/result/value").cloned().unwrap_or_default();
+    if let Some(refusal) = select_refusal(&answer) {
+      return Err(refusal);
+    }
+    Ok(SelectedOptions {
+      selected: answer["selected"].clone(),
+      changed: answer["changed"].as_bool().unwrap_or(false),
+      navigated,
+      matched,
+    })
+  }
+  .await;
+  let _ = session
+    .call(
+      "Runtime.releaseObjectGroup",
+      serde_json::json!({ "objectGroup": FORM_GROUP }),
+    )
+    .await;
+  let _ = session.call("Page.disable", serde_json::json!({})).await;
+  session.close().await;
+  outcome
+}
+
+/// The file input `this` names: itself, the input a label is for, or the one
+/// file input inside it. Answers the input, or why there is none as a string.
+const FILE_INPUT_FN: &str = r#"function () {
+  const isFile = (n) => n instanceof HTMLInputElement && n.type === 'file';
+  let el = this;
+  if (!isFile(el)) {
+    if (isFile(el.control)) {
+      el = el.control;
+    } else {
+      const inner = el.querySelectorAll ? el.querySelectorAll('input[type=file]') : [];
+      if (inner.length !== 1) return inner.length ? 'many' : 'none:' + String(el.tagName || '').toLowerCase();
+      el = inner[0];
+    }
+  }
+  if (el.disabled) return 'disabled';
+  return el;
+}"#;
+
+/// What a file input holds now.
+const INPUT_FILES_FN: &str =
+  "function () { return Array.from(this.files || []).map((f) => ({ name: f.name, bytes: f.size })); }";
+
+/// What `file_upload` did.
+#[derive(Debug, Serialize)]
+struct UploadedFiles {
+  files: serde_json::Value,
+  #[serde(rename = "match", skip_serializing_if = "Option::is_none")]
+  matched: Option<LocatorCandidate>,
+}
+
+/// The files of a `file_upload` call, checked before anything touches the page.
+fn upload_files(
+  arguments: &serde_json::Value,
+) -> Result<Vec<crate::agent_uploads::UploadFile>, AgentError> {
+  use crate::agent_uploads::{clean_name, UploadFile, MAX_UPLOAD_BYTES, MAX_UPLOAD_FILES};
+  use base64::{engine::general_purpose, Engine as _};
+  let listed = arguments
+    .get("files")
+    .and_then(|v| v.as_array())
+    .filter(|files| !files.is_empty())
+    .ok_or_else(|| AgentError::InvalidArgument("files must list at least one file".into()))?;
+  if listed.len() > MAX_UPLOAD_FILES {
+    return Err(AgentError::InvalidArgument(format!(
+      "At most {MAX_UPLOAD_FILES} files per call"
+    )));
+  }
+  let mut files: Vec<UploadFile> = Vec::with_capacity(listed.len());
+  let mut total = 0usize;
+  for file in listed {
+    let raw_name = file
+      .get("name")
+      .and_then(|v| v.as_str())
+      .unwrap_or_default();
+    let name = clean_name(raw_name).ok_or_else(|| {
+      AgentError::InvalidArgument(format!(
+        "{raw_name:?} is not a usable file name; give a name like report.pdf"
+      ))
+    })?;
+    if files.iter().any(|f| f.name.eq_ignore_ascii_case(&name)) {
+      return Err(AgentError::InvalidArgument(format!(
+        "Two files are named {name}; give each its own name"
+      )));
+    }
+    let bytes = match (
+      file.get("text").and_then(|v| v.as_str()),
+      file.get("content_base64").and_then(|v| v.as_str()),
+    ) {
+      (Some(text), None) => text.as_bytes().to_vec(),
+      (None, Some(encoded)) => {
+        let encoded = encoded
+          .split_once(";base64,")
+          .map_or(encoded, |(_, data)| data);
+        let compact: String = encoded.chars().filter(|c| !c.is_whitespace()).collect();
+        [
+          general_purpose::STANDARD,
+          general_purpose::STANDARD_NO_PAD,
+          general_purpose::URL_SAFE,
+          general_purpose::URL_SAFE_NO_PAD,
+        ]
+        .iter()
+        .find_map(|engine| engine.decode(&compact).ok())
+        .ok_or_else(|| {
+          AgentError::InvalidArgument(format!("content_base64 of {name} is not base64"))
+        })?
+      }
+      _ => {
+        return Err(AgentError::InvalidArgument(format!(
+          "Give {name} exactly one of text or content_base64"
+        )))
+      }
+    };
+    total += bytes.len();
+    if total > MAX_UPLOAD_BYTES {
+      return Err(AgentError::InvalidArgument(format!(
+        "The files come to more than {} KB, the most one call carries",
+        MAX_UPLOAD_BYTES / 1024
+      )));
+    }
+    files.push(UploadFile { name, bytes });
+  }
+  Ok(files)
+}
+
+async fn agent_file_upload(
+  ctx: &AgentContext,
+  element: &ElementRef,
+  files: &[crate::agent_uploads::UploadFile],
+) -> Result<UploadedFiles, AgentError> {
+  let profile_id = ctx.profile.id.to_string();
+  let mut session = WayfernSession::open(&ctx.target).await?;
+  let outcome = async {
+    let (object, located) = form_element(&mut session, ctx.engine, element).await?;
+    let matched = located.map(|l| l.matched);
+    let reply = session
+      .call(
+        "Runtime.callFunctionOn",
+        serde_json::json!({
+          "objectId": object,
+          "functionDeclaration": FILE_INPUT_FN,
+          "returnByValue": false,
+          "objectGroup": FORM_GROUP,
+        }),
+      )
+      .await?;
+    if let Some(thrown) = script_exception(&reply) {
+      return Err(thrown);
+    }
+    let input = match reply.pointer("/result/objectId").and_then(|v| v.as_str()) {
+      Some(input) => input.to_string(),
+      None => {
+        let reason = reply
+          .pointer("/result/value")
+          .and_then(|v| v.as_str())
+          .unwrap_or_default();
+        return Err(AgentError::BadRequest(match reason {
+          "many" => "The element holds more than one file input; name the input itself, e.g. with selector input[type=file].".to_string(),
+          "disabled" => "The file input is disabled.".to_string(),
+          other => format!(
+            "The element is a <{}>, not a file input, and holds none. Name the input itself, e.g. with selector input[type=file]; it may be hidden.",
+            other.trim_start_matches("none:")
+          ),
+        }));
+      }
+    };
+    let multiple = call_on(&mut session, &input, "function () { return this.multiple; }", serde_json::json!([]))
+      .await?
+      .as_bool()
+      .unwrap_or(false);
+    if files.len() > 1 && !multiple {
+      return Err(AgentError::InvalidArgument(
+        "This file input takes one file; send one.".to_string(),
+      ));
+    }
+    let staged = crate::agent_uploads::stage(&profile_id, files)
+      .map_err(|e| AgentError::Browser(format!("Could not write the files: {e}")))?;
+    let staged: Vec<String> = staged
+      .iter()
+      .map(|file| file.to_string_lossy().to_string())
+      .collect();
+    session
+      .call(
+        "DOM.setFileInputFiles",
+        serde_json::json!({ "files": staged, "objectId": input }),
+      )
+      .await?;
+    let held = call_on(&mut session, &input, INPUT_FILES_FN, serde_json::json!([])).await?;
+    Ok(UploadedFiles {
+      files: held,
+      matched,
+    })
+  }
+  .await;
+  let _ = session
+    .call(
+      "Runtime.releaseObjectGroup",
+      serde_json::json!({ "objectGroup": FORM_GROUP }),
+    )
+    .await;
+  session.close().await;
+  outcome
+}
+
+/// The schema of a form tool: the four ways to name its element, and `extra`.
+fn form_tool_schema(what: &str, extra: serde_json::Value, required: &[&str]) -> serde_json::Value {
+  let mut properties = serde_json::json!({
+    "profile_id": {
+      "type": "string",
+      "description": "The UUID of the running profile"
+    },
+    "selector": {
+      "type": "string",
+      "description": format!("CSS selector of the {what}")
+    },
+    "locator": locator_schema(&format!("Instead of selector: how to name the {what}")),
+    "index": {
+      "type": "integer",
+      "description": "Instead of selector: zero-based index from the last get_interactive_elements response"
+    },
+    "element_id": {
+      "type": "string",
+      "description": "Instead of index: the stable id (e12) from the last get_interactive_elements response"
+    }
+  });
+  if let (Some(properties), Some(extra)) = (properties.as_object_mut(), extra.as_object()) {
+    properties.extend(extra.clone());
+  }
+  let mut required_list = vec!["profile_id"];
+  required_list.extend_from_slice(required);
+  serde_json::json!({
+    "type": "object",
+    "properties": properties,
+    "required": required_list
+  })
+}
+
+/// The JSON schema of a locator argument, shared by every tool that takes one.
+fn locator_schema(description: &str) -> serde_json::Value {
+  serde_json::json!({
+    "type": "object",
+    "description": description,
+    "properties": {
+      "role": { "type": "string", "description": "AX role token as the browser reports it (button, link, textField, heading, listItem, checkBox, comboBoxSelect, staticText); matched case- and separator-insensitively, and the ARIA names textbox, radio, img, progressbar, separator, generic and text are accepted as synonyms" },
+      "name": { "type": "string", "description": "Exact accessible name, after whitespace collapse" },
+      "nameContains": { "type": "string", "description": "Substring of the accessible name" },
+      "text": { "type": "string", "description": "Exact visible text, from the live layout" },
+      "textContains": { "type": "string", "description": "Substring of the visible text" },
+      "attributes": {
+        "type": "array",
+        "description": "Attribute pairs that must all match",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "value": { "type": "string" }
+          },
+          "required": ["name", "value"]
+        }
+      }
+    }
+  })
+}
+
+/// Where a profile's browser is, as the browser tools report it.
+async fn resolve_target(profile: &BrowserProfile) -> Result<CdpTarget, McpError> {
+  crate::cdp_target::resolve(profile)
+    .await
+    .map_err(|e| McpError {
+      code: -32000,
+      message: e.to_string(),
+      data: None,
+    })
+}
+
+/// The tail of a page script that answers where `el` is, in viewport pixels.
+const RETURN_RECT_JS: &str = "const r = el.getBoundingClientRect(); return JSON.stringify({x: r.left + r.width / 2, y: r.top + r.height / 2, width: r.width, height: r.height});";
+
+/// A script that scrolls the element behind `selector_escaped` into view and
+/// answers where it is. It clicks nothing.
+fn element_rect_script(selector_escaped: &str) -> String {
+  format!(
+    r#"(() => {{
+      const el = document.querySelector('{selector_escaped}');
+      if (!el) throw new Error('Element not found: {selector_escaped}');
+      el.scrollIntoView({{block: 'center', inline: 'center', behavior: 'instant'}});
+      {RETURN_RECT_JS}
+    }})()"#
+  )
+}
+
+/// The same for the element at `index` of a caller's cached snapshot.
+fn indexed_rect_script(cache: &str, index: u64) -> String {
+  format!(
+    r#"(() => {{
+      const arr = window[{cache}];
+      if (!arr || !arr[{index}]) throw new Error('No element at index {index}. Call get_interactive_elements first or after navigation.');
+      const el = arr[{index}];
+      el.scrollIntoView({{block: 'center', inline: 'center', behavior: 'instant'}});
+      {RETURN_RECT_JS}
+    }})()"#
+  )
+}
+
+/// The strike point a rect script answered with.
+fn rect_from_script_result(result: &serde_json::Value) -> Result<ViewportTarget, McpError> {
+  let rect = parse_json_script_result(result).map_err(AgentError::into_mcp)?;
+  let number = |key: &str| rect.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0);
+  let point = ViewportTarget {
+    x: number("x"),
+    y: number("y"),
+    width: number("width"),
+    height: number("height"),
+  };
+  if !(point.width > 0.0 && point.height > 0.0) {
+    return Err(McpError {
+      code: -32000,
+      message: "The element has no visible box to click; it may be hidden or collapsed".to_string(),
+      data: None,
+    });
+  }
+  Ok(point)
+}
+
+/// Run a rect script and answer the strike point it found.
+async fn locate_by_script(target: &CdpTarget, script: String) -> Result<ViewportTarget, McpError> {
+  let result = crate::cdp_target::run_command(
+    target,
+    "Runtime.evaluate",
+    serde_json::json!({ "expression": script, "returnByValue": true }),
+  )
+  .await
+  .map_err(cdp_error)?;
+  rect_from_script_result(&result)
+}
+
+fn click_report(prefix: &str, navigated: bool) -> String {
+  if navigated {
+    format!("{prefix} (a page load followed)")
+  } else {
+    prefix.to_string()
+  }
+}
+
+/// The tools `run_actions` may run, and how many steps one call may hold.
+const BATCH_TOOLS: &[&str] = &[
+  "navigate",
+  "go_back",
+  "scroll",
+  "press_key",
+  "wait_for",
+  "click_element",
+  "click_by_index",
+  "click_locator",
+  "type_text",
+  "type_by_index",
+  "type_locator",
+  "select_option",
+  "get_page_info",
+];
+const MAX_BATCH_ACTIONS: usize = 20;
+/// How much of each step's answer a batch reports.
+const BATCH_RESULT_CHARS: usize = 2_000;
+/// How much of a captured body `get_network_request` shows when not told, and
+/// at most. The most stays under what one tool answer carries.
+const DEFAULT_BODY_CHARS: u64 = 20_000;
+const MAX_BODY_CHARS: u64 = 90_000;
+
+/// A tab helper's coded refusal as a tool error.
+fn tab_error(message: String) -> McpError {
+  McpError {
+    code: -32000,
+    message,
+    data: None,
+  }
+}
+
+/// Where an action left the page, read in one round trip after it.
+const PAGE_STATE_SCRIPT: &str = "(() => ({ url: location.href, title: document.title, text: (document.body ? document.body.innerText : '').slice(0, 1500) }))()";
+
+#[derive(Debug, Default, Deserialize)]
+struct PageState {
+  #[serde(default)]
+  url: String,
+  #[serde(default)]
+  title: String,
+  /// The start of the visible text, only to recognise a bot check.
+  #[serde(default)]
+  text: String,
+}
+
+/// Titles that a bot check or block page shows instead of the site.
+const WALL_TITLES: &[(&str, &str)] = &[
+  ("just a moment", "a Cloudflare check"),
+  ("attention required", "a Cloudflare block"),
+  ("ddos-guard", "a DDoS-Guard check"),
+  ("pardon our interruption", "a bot check"),
+  ("are you a robot", "a CAPTCHA"),
+  ("captcha", "a CAPTCHA"),
+  ("security check", "a security check"),
+  ("access denied", "an access block"),
+  ("403 forbidden", "an access block"),
+];
+
+/// Phrases specific enough that page text alone says it is a bot check.
+/// A plain mention of a CAPTCHA is not one: many login forms carry it.
+const WALL_PHRASES: &[(&str, &str)] = &[
+  ("verify you are human", "a human check"),
+  ("checking your browser before accessing", "a browser check"),
+  (
+    "checking if the site connection is secure",
+    "a Cloudflare check",
+  ),
+  ("press & hold", "a press-and-hold check"),
+  ("please complete the security check", "a security check"),
+  (
+    "enable javascript and cookies to continue",
+    "a browser check",
+  ),
+];
+
+/// The bot check standing in front of the page, if it looks like one.
+fn bot_wall(title: &str, text: &str) -> Option<&'static str> {
+  let title = title.to_lowercase();
+  let text = text.to_lowercase();
+  WALL_TITLES
+    .iter()
+    .find(|(needle, _)| title.contains(needle))
+    .or_else(|| {
+      WALL_PHRASES
+        .iter()
+        .find(|(needle, _)| text.contains(needle))
+    })
+    .map(|(_, wall)| *wall)
+}
+
+/// The line an action ends with: the page's title and address, and a hint
+/// when a bot check stands in front of the site.
+fn page_report(state: &PageState) -> String {
+  let title = if state.title.trim().is_empty() {
+    "(no title)"
+  } else {
+    state.title.trim()
+  };
+  let mut line = format!("Page: {title} <{}>", state.url);
+  if let Some(wall) = bot_wall(&state.title, &state.text) {
+    line.push_str(&format!(
+      "\nThis looks like {wall}, not the site itself. wait_for the site's content, or ask_human to get past it."
+    ));
+  }
+  line
+}
+
+/// The viewport and page sizes `Page.getLayoutMetrics` reports, in CSS pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LayoutMetrics {
+  x: f64,
+  y: f64,
+  width: f64,
+  height: f64,
+  page_width: f64,
+  page_height: f64,
+  /// Device pixels per CSS pixel.
+  dpr: f64,
+}
+
+impl LayoutMetrics {
+  fn from_reply(reply: &serde_json::Value) -> Self {
+    let number = |path: &str| reply.pointer(path).and_then(|v| v.as_f64());
+    let width = number("/cssVisualViewport/clientWidth")
+      .or_else(|| number("/cssLayoutViewport/clientWidth"))
+      .unwrap_or(1280.0);
+    let height = number("/cssVisualViewport/clientHeight")
+      .or_else(|| number("/cssLayoutViewport/clientHeight"))
+      .unwrap_or(800.0);
+    // The deprecated viewport is in device pixels, so the two give the ratio.
+    let dpr = number("/visualViewport/clientWidth")
+      .map(|device| device / width)
+      .filter(|dpr| dpr.is_finite() && *dpr >= 0.5 && *dpr <= 8.0)
+      .unwrap_or(1.0);
+    Self {
+      x: number("/cssVisualViewport/pageX").unwrap_or(0.0),
+      y: number("/cssVisualViewport/pageY").unwrap_or(0.0),
+      width,
+      height,
+      page_width: number("/cssContentSize/width")
+        .or_else(|| number("/contentSize/width"))
+        .unwrap_or(width),
+      page_height: number("/cssContentSize/height")
+        .or_else(|| number("/contentSize/height"))
+        .unwrap_or(height),
+      dpr,
+    }
+  }
+}
+
+/// The capture scale that keeps an image `css_width` wide at most `max_width`
+/// device pixels across. Never above 1: a capture is never upscaled.
+fn screenshot_scale(css_width: f64, dpr: f64, max_width: f64) -> f64 {
+  let output = css_width * dpr;
+  if !(output.is_finite() && output > 0.0) {
+    return 1.0;
+  }
+  (max_width / output).clamp(0.05, 1.0)
+}
+
+/// The wheel distance for `pages` viewports in `direction`. A page is 85% of
+/// the viewport, so a line of context stays in view.
+fn scroll_delta(direction: &str, pages: f64, width: f64, height: f64) -> Option<(f64, f64)> {
+  let (x, y) = (width * 0.85 * pages, height * 0.85 * pages);
+  match direction {
+    "down" => Some((0.0, y)),
+    "up" => Some((0.0, -y)),
+    "right" => Some((x, 0.0)),
+    "left" => Some((-x, 0.0)),
+    _ => None,
+  }
+}
+
+/// A key as `Input.dispatchKeyEvent` takes it.
+#[derive(Debug, PartialEq)]
+struct KeyStroke {
+  key: String,
+  code: String,
+  key_code: u32,
+  /// What the key types, when it types something.
+  text: Option<String>,
+}
+
+/// The named keys an agent needs most, and any single character.
+fn key_stroke(name: &str) -> Option<KeyStroke> {
+  let named = |key: &str, code: &str, key_code: u32, text: Option<&str>| KeyStroke {
+    key: key.to_string(),
+    code: code.to_string(),
+    key_code,
+    text: text.map(str::to_string),
+  };
+  Some(match name {
+    "Enter" => named("Enter", "Enter", 13, Some("\r")),
+    "Tab" => named("Tab", "Tab", 9, None),
+    "Escape" => named("Escape", "Escape", 27, None),
+    "Backspace" => named("Backspace", "Backspace", 8, None),
+    "Delete" => named("Delete", "Delete", 46, None),
+    "Space" | " " => named(" ", "Space", 32, Some(" ")),
+    "ArrowUp" => named("ArrowUp", "ArrowUp", 38, None),
+    "ArrowDown" => named("ArrowDown", "ArrowDown", 40, None),
+    "ArrowLeft" => named("ArrowLeft", "ArrowLeft", 37, None),
+    "ArrowRight" => named("ArrowRight", "ArrowRight", 39, None),
+    "PageUp" => named("PageUp", "PageUp", 33, None),
+    "PageDown" => named("PageDown", "PageDown", 34, None),
+    "Home" => named("Home", "Home", 36, None),
+    "End" => named("End", "End", 35, None),
+    _ => {
+      let mut chars = name.chars();
+      let c = chars.next()?;
+      if chars.next().is_some() || c.is_control() {
+        return None;
+      }
+      let upper = c.to_ascii_uppercase();
+      let (code, key_code) = if c.is_ascii_alphabetic() {
+        (format!("Key{upper}"), upper as u32)
+      } else if c.is_ascii_digit() {
+        (format!("Digit{c}"), c as u32)
+      } else {
+        (String::new(), 0)
+      };
+      KeyStroke {
+        key: c.to_string(),
+        code,
+        key_code,
+        text: Some(c.to_string()),
+      }
+    }
+  })
+}
+
+/// The `modifiers` bit field `Input.dispatchKeyEvent` takes.
+fn modifier_bits(modifiers: &[&str]) -> Result<u32, String> {
+  modifiers.iter().try_fold(0, |bits, modifier| {
+    Ok(
+      bits
+        | match *modifier {
+          "alt" => 1,
+          "ctrl" => 2,
+          "meta" => 4,
+          "shift" => 8,
+          other => return Err(format!("Unknown modifier: {other}")),
+        },
+    )
+  })
+}
+
+/// What `wait_for` answers: whether the wait was met, and where the page is.
+fn wait_report(met: bool, elapsed: Duration, state: &PageState) -> serde_json::Value {
+  serde_json::json!({
+    "met": met,
+    "elapsed_ms": elapsed.as_millis() as u64,
+    "url": state.url,
+    "title": state.title,
+  })
+}
+
+/// How often `wait_for` looks, and the longest it may wait.
+const WAIT_FOR_POLL: Duration = Duration::from_millis(250);
+const WAIT_FOR_DEFAULT_MS: u64 = 10_000;
+const WAIT_FOR_MAX_MS: u64 = 30_000;
+/// How long a wheel scroll takes to settle before its position is read.
+const SCROLL_SETTLE: Duration = Duration::from_millis(300);
+
+/// The check `wait_for` runs: true while the text or element is on the page.
+fn wait_for_script(text: Option<&str>, selector: Option<&str>) -> Option<String> {
+  match (text, selector) {
+    (Some(text), None) => Some(format!(
+      "(() => ({} || '').includes({}))()",
+      rendered_text_js("document.body"),
+      serde_json::to_string(text).ok()?
+    )),
+    (None, Some(selector)) => Some(format!(
+      "(() => {{ const el = document.querySelector({}); return !!el && el.getClientRects().length > 0; }})()",
+      serde_json::to_string(selector).ok()?
+    )),
+    _ => None,
+  }
+}
+
+fn typing_report(prefix: &str, typed: &FieldTyping) -> String {
+  let mut report = prefix.to_string();
+  if let Some(inscription) = &typed.inscription {
+    report.push_str(&format!(
+      " ({} characters, {} corrected, {:.0} ms)",
+      inscription.characters, inscription.corrections, inscription.duration_ms
+    ));
+  }
+  if typed.verified {
+    report.push_str("; the field holds the text");
+  }
+  report
 }
 
 impl McpServer {
-  fn new() -> Self {
+  pub(crate) fn new() -> Self {
     Self {
       inner: Arc::new(AsyncMutex::new(McpServerInner {
         app_handle: None,
-        token: None,
-        shutdown_tx: None,
         sessions: HashMap::new(),
       })),
-      is_running: AtomicBool::new(false),
-      port: AtomicU16::new(0),
+      engine_ready: AtomicBool::new(false),
     }
   }
 
@@ -172,8 +4406,31 @@ impl McpServer {
     &MCP_SERVER
   }
 
-  pub fn is_running(&self) -> bool {
-    self.is_running.load(Ordering::SeqCst)
+  /// Hand the engine the app handle every tool needs, once, at startup.
+  pub async fn attach_app_handle(&self, app_handle: AppHandle) {
+    let mut inner = self.inner.lock().await;
+    if inner.app_handle.is_none() {
+      inner.app_handle = Some(app_handle);
+    }
+    self.engine_ready.store(true, Ordering::SeqCst);
+  }
+
+  /// Whether the tool engine can answer a JSON-RPC message.
+  pub fn is_engine_ready(&self) -> bool {
+    self.engine_ready.load(Ordering::SeqCst)
+  }
+
+  /// Let a test drive the engine without a Tauri `AppHandle`.
+  ///
+  /// Exists so the bridge's transport can be exercised end to end, a real
+  /// socket carrying a real `tools/list`, instead of only against a mock of
+  /// the thing under test. `attach_app_handle` needs an `AppHandle` no unit
+  /// test has, and the tools this unlocks (`ping`, `tools/list`) read no app
+  /// state; every tool that DOES need the handle still refuses without one, so
+  /// this cannot make a test pass that production would fail.
+  #[cfg(test)]
+  pub(crate) fn mark_engine_ready_for_tests(&self) {
+    self.engine_ready.store(true, Ordering::SeqCst);
   }
 
   /// Gate an MCP tool on a capability the caller already resolved (e.g.
@@ -183,318 +4440,246 @@ impl McpServer {
     if !allowed {
       let summary = match CLOUD_AUTH.get_user().await {
         Some(state) => format!(
-          "logged_in=true plan={} status={} period={:?}",
+          "logged_in=true plan={} subscription_status={} plan_period={:?}",
           state.user.plan, state.user.subscription_status, state.user.plan_period,
         ),
         None => "logged_in=false".to_string(),
       };
-      log::warn!("[mcp] Rejected '{feature}' — plan does not include it ({summary})");
+      log::warn!("MCP tool refused: plan lacks feature feature=\"{feature}\" {summary}");
       return Err(McpError {
         code: -32000,
-        message: format!("{feature} requires a plan that includes this feature"),
+        message: format!("{feature} is not included in this account's plan"),
+        data: Some(serde_json::json!({ "code": "PLAN_REQUIRED", "feature": feature })),
       });
     }
     Ok(())
   }
 
-  pub fn get_port(&self) -> Option<u16> {
-    let port = self.port.load(Ordering::SeqCst);
-    if port > 0 {
-      Some(port)
-    } else {
-      None
-    }
-  }
+  /// Largest JSON-RPC payload the engine will parse.
+  pub(crate) const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
-  pub async fn start(&self, app_handle: AppHandle) -> Result<u16, String> {
-    if self.is_running() {
-      return Err(crate::backend_error("MCP_SERVER_ALREADY_RUNNING"));
-    }
+  /// The longest a session teardown will spend deleting page globals.
+  ///
+  /// Best effort and time-boxed on purpose. `end_session` is awaited by the
+  /// bridge's session teardown, and a browser that has stopped answering can hold a
+  /// single CDP call open for a minute, so an unbounded cleanup turns "forget
+  /// my session" into a hang. Losing a delete costs nothing worth waiting for:
+  /// a browser that cannot answer has no page left to leak, and the page-side
+  /// slot cap reclaims anything a missed delete leaves behind.
+  const CACHE_RELEASE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
-    let settings_manager = SettingsManager::instance();
-    let settings = settings_manager
-      .load_settings()
-      .map_err(|e| crate::backend_error_with_detail("INTERNAL_ERROR", e))?;
-
-    // Get or generate token
-    let existing_token = settings_manager
-      .get_mcp_token(&app_handle)
-      .await
-      .ok()
-      .flatten();
-
-    let token = if let Some(t) = existing_token {
-      t
-    } else {
-      settings_manager
-        .generate_mcp_token(&app_handle)
-        .await
-        .map_err(|e| crate::backend_error_with_detail("INTERNAL_ERROR", e))?
-    };
-
-    // Determine port (use saved port, or try default, or random)
-    let preferred_port = settings.mcp_port.unwrap_or(DEFAULT_MCP_PORT);
-    let listener = self.bind_to_available_port(preferred_port).await?;
-    let actual_port = listener
-      .local_addr()
-      .map_err(|e| crate::backend_error_with_detail("INTERNAL_ERROR", e))?
-      .port();
-
-    // Save port if it changed
-    if settings.mcp_port != Some(actual_port) {
-      let mut new_settings = settings;
-      new_settings.mcp_port = Some(actual_port);
-      settings_manager
-        .save_settings(&new_settings)
-        .map_err(|e| crate::backend_error_with_detail("INTERNAL_ERROR", e))?;
-    }
-
-    // Store state
-    let mut inner = self.inner.lock().await;
-    inner.app_handle = Some(app_handle);
-    inner.token = Some(token.clone());
-
-    // Create shutdown channel
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    inner.shutdown_tx = Some(shutdown_tx);
-
-    self.port.store(actual_port, Ordering::SeqCst);
-    self.is_running.store(true, Ordering::SeqCst);
-
-    // Start HTTP server in background
-    let http_state = McpHttpState {
-      server: McpServer::instance(),
-      token,
-    };
-    tokio::spawn(Self::run_http_server(listener, http_state, shutdown_rx));
-
-    log::info!("[mcp] Server started on port {}", actual_port);
-    Ok(actual_port)
-  }
-
-  async fn bind_to_available_port(&self, preferred: u16) -> Result<TcpListener, String> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], preferred));
-    if let Ok(listener) = TcpListener::bind(addr).await {
-      return Ok(listener);
-    }
-
-    for _ in 0..10 {
-      let port = 51000 + (rand::random::<u16>() % 1000);
-      let addr = SocketAddr::from(([127, 0, 0, 1], port));
-      if let Ok(listener) = TcpListener::bind(addr).await {
-        return Ok(listener);
-      }
-    }
-
-    Err(crate::backend_error("MCP_PORT_UNAVAILABLE"))
-  }
-
-  async fn run_http_server(
-    listener: TcpListener,
-    state: McpHttpState,
-    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
-  ) {
-    let app = Router::new()
-      .route(
-        "/mcp/{token}",
-        post(Self::handle_mcp_post)
-          .get(Self::handle_mcp_get)
-          .delete(Self::handle_mcp_delete),
-      )
-      .route(
-        "/mcp",
-        post(Self::handle_mcp_post)
-          .get(Self::handle_mcp_get)
-          .delete(Self::handle_mcp_delete),
-      )
-      .route("/health", get(Self::handle_health))
-      .layer(middleware::from_fn_with_state(
-        state.clone(),
-        Self::auth_middleware,
-      ))
-      .with_state(state);
-
-    let port = listener.local_addr().map(|addr| addr.port()).unwrap_or(0);
-    let server = async move {
-      log::info!("[mcp] Server listening on http://127.0.0.1:{}/mcp", port);
-      if let Err(e) = axum::serve(listener, app).await {
-        log::error!("[mcp] Server error: {}", e);
-      }
-    };
-
-    tokio::select! {
-      _ = server => {},
-      _ = shutdown_rx => {
-        log::info!("[mcp] Server shutting down");
-      },
-    }
-  }
-
-  async fn auth_middleware(
-    State(state): State<McpHttpState>,
-    req: Request<Body>,
-    next: Next,
-  ) -> Result<Response, StatusCode> {
-    let path = req.uri().path();
-
-    if path == "/health" {
-      return Ok(next.run(req).await);
-    }
-
-    // Check token from URL path: /mcp/{token}
-    let path_token = path
-      .strip_prefix("/mcp/")
-      .filter(|t| !t.is_empty() && !t.contains('/'));
-
-    // Check token from Authorization header
-    let header_token = req
-      .headers()
-      .get(header::AUTHORIZATION)
-      .and_then(|h| h.to_str().ok())
-      .and_then(|h| h.strip_prefix("Bearer "));
-
-    // Constant-time comparison to avoid leaking the token prefix via timing.
-    use subtle::ConstantTimeEq;
-    let expected = state.token.as_bytes();
-    let ct_eq = |t: Option<&str>| {
-      t.is_some_and(|t| {
-        let b = t.as_bytes();
-        b.len() == expected.len() && b.ct_eq(expected).into()
-      })
-    };
-    let valid = ct_eq(path_token) || ct_eq(header_token);
-
-    if !valid {
-      return Err(StatusCode::UNAUTHORIZED);
-    }
-
-    Ok(next.run(req).await)
-  }
-
-  async fn handle_health() -> impl IntoResponse {
-    Json(serde_json::json!({
-      "status": "ok",
-      "server": SERVER_NAME,
-      "version": SERVER_VERSION,
-      "protocolVersion": PROTOCOL_VERSION,
-    }))
-  }
-
-  async fn handle_mcp_get() -> impl IntoResponse {
-    // We don't support server-initiated SSE streams
-    StatusCode::METHOD_NOT_ALLOWED
-  }
-
-  async fn handle_mcp_delete(
-    State(state): State<McpHttpState>,
-    req: Request<Body>,
-  ) -> impl IntoResponse {
-    let session_id = req
-      .headers()
-      .get("mcp-session-id")
-      .and_then(|h| h.to_str().ok())
-      .map(|s| s.to_string());
-
-    if let Some(sid) = session_id {
-      let mut inner = state.server.inner.lock().await;
-      inner.sessions.remove(&sid);
-      log::info!("[mcp] Session terminated: {}", sid);
-    }
-
-    StatusCode::OK
-  }
-
-  async fn handle_mcp_post(State(state): State<McpHttpState>, req: Request<Body>) -> Response {
-    let session_id = req
-      .headers()
-      .get("mcp-session-id")
-      .and_then(|h| h.to_str().ok())
-      .map(|s| s.to_string());
-
-    let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
-      Ok(b) => b,
-      Err(_) => {
-        return (StatusCode::BAD_REQUEST, "Invalid request body").into_response();
-      }
-    };
-
-    let request: McpRequest = match serde_json::from_slice(&body_bytes) {
-      Ok(r) => r,
-      Err(_) => {
-        return (StatusCode::BAD_REQUEST, "Invalid JSON").into_response();
-      }
-    };
-
-    let is_notification = request.id.is_none();
-    let method = request.method.clone();
-
-    // Handle initialize (no session required)
-    if method == "initialize" {
-      let response = state.server.handle_initialize(request).await;
-      match response {
-        Ok((session_id, result)) => {
-          let body = McpResponse {
-            jsonrpc: "2.0".to_string(),
-            id: Some(result.0),
-            result: Some(result.1),
-            error: None,
-          };
-          Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/json")
-            .header("mcp-session-id", &session_id)
-            .body(Body::from(serde_json::to_vec(&body).unwrap()))
-            .unwrap()
+  /// Forget a session, on the server AND in the pages it left snapshots in.
+  /// Idempotent; an unknown id is not an error, because a caller tearing down a
+  /// session it already lost has nothing to fix.
+  pub(crate) async fn end_session(&self, session_id: &str) {
+    let cached_pages = {
+      let mut inner = self.inner.lock().await;
+      match inner.sessions.remove(session_id) {
+        Some(session) => {
+          log::info!("MCP session ended session={}", ShortId(session_id));
+          crate::agent_console::session_ended(session_id);
+          session.cached_pages
         }
-        Err((id, error)) => {
-          let body = McpResponse {
+        None => return,
+      }
+    };
+
+    if cached_pages.is_empty() {
+      return;
+    }
+
+    // Dropping the server-side session is only half of ending it: the other
+    // half is an array of live element references sitting in somebody's still
+    // open tab, which nothing else ever removes.
+    if tokio::time::timeout(
+      Self::CACHE_RELEASE_BUDGET,
+      self.release_cached_pages(cached_pages),
+    )
+    .await
+    .is_err()
+    {
+      log::debug!(
+        "MCP session element caches not cleared in time session={}",
+        ShortId(session_id)
+      );
+    }
+  }
+
+  /// Delete the interactive-element slots a session wrote, page by page.
+  ///
+  /// Every failure here is logged and skipped rather than surfaced: the session
+  /// is already gone, the caller asked to forget it, and a closed browser is
+  /// the commonest reason a delete cannot land, which is also the case where
+  /// there is nothing left to clean.
+  async fn release_cached_pages(&self, cached_pages: HashSet<(String, String)>) {
+    let registry = INTERACTIVE_SLOT_REGISTRY;
+    for (profile_id, slot) in cached_pages {
+      let target = match self.resolve_cdp_target(&profile_id).await {
+        Ok(target) => target,
+        Err(e) => {
+          log::debug!(
+            "MCP element cache clear skipped profile={profile_id} err=\"{}\"",
+            e.message
+          );
+          continue;
+        }
+      };
+
+      let js = format!(
+        r#"(() => {{
+          try {{ delete window[{slot}]; }} catch (e) {{ window[{slot}] = undefined; }}
+          const registry = window[{registry}];
+          if (Array.isArray(registry)) window[{registry}] = registry.filter((s) => s !== {slot});
+          return true;
+        }})()"#
+      );
+
+      if let Err(e) = self
+        .send_cdp(
+          &target,
+          "Runtime.evaluate",
+          serde_json::json!({
+            "expression": js,
+            "returnByValue": true,
+          }),
+        )
+        .await
+      {
+        log::debug!(
+          "MCP element cache clear failed profile={profile_id} err=\"{}\"",
+          e.message
+        );
+      }
+    }
+  }
+
+  /// Remember that this session left a snapshot on this profile's page, so
+  /// `end_session` knows which global to delete and where.
+  ///
+  /// Silently does nothing when the session has already been forgotten: the
+  /// teardown that removed it has already run, and re-adding the entry would
+  /// resurrect a session-shaped record nothing will ever clean up again.
+  async fn remember_cached_page(&self, session_id: &str, profile_id: &str, slot: &str) {
+    let mut inner = self.inner.lock().await;
+    if let Some(session) = inner.sessions.get_mut(session_id) {
+      session
+        .cached_pages
+        .insert((profile_id.to_string(), slot.to_string()));
+    }
+  }
+
+  /// Answer one JSON-RPC message.
+  ///
+  /// This is the whole protocol: parse, route `initialize`, absorb
+  /// notifications, validate the session, meter the automation tools, dispatch.
+  #[cfg(test)]
+  pub(crate) async fn handle_message(&self, session_id: Option<&str>, body: &[u8]) -> McpOutcome {
+    self.handle_message_with(session_id, body, None).await
+  }
+
+  /// `handle_message` for a caller that connected with toolsets
+  /// (`?toolsets=` on the endpoint URL, relayed by the bridge).
+  pub(crate) async fn handle_message_with(
+    &self,
+    session_id: Option<&str>,
+    body: &[u8],
+    toolsets: Option<&str>,
+  ) -> McpOutcome {
+    let toolsets = crate::mcp_toolsets::parse(toolsets);
+    if body.len() > Self::MAX_MESSAGE_BYTES {
+      return McpOutcome::BadRequest;
+    }
+
+    let request: McpRequest = match serde_json::from_slice(body) {
+      Ok(request) => request,
+      Err(_) => return McpOutcome::BadRequest,
+    };
+
+    if request.method == "initialize" {
+      return match self.handle_initialize(request, toolsets.as_ref()).await {
+        Ok((new_session_id, (id, result))) => McpOutcome::Body {
+          body: serde_json::to_value(McpResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Some(id),
+            result: Some(result),
+            error: None,
+          })
+          .unwrap_or_else(|_| serde_json::json!({})),
+          new_session_id: Some(new_session_id),
+        },
+        Err((id, error)) => McpOutcome::Body {
+          body: serde_json::to_value(McpResponse {
             jsonrpc: "2.0".to_string(),
             id: Some(id),
             result: None,
             error: Some(error),
-          };
-          Json(body).into_response()
-        }
-      }
-    } else if is_notification {
-      // Notifications (like notifications/initialized) -> 202 Accepted
-      if method == "notifications/initialized" {
-        if let Some(sid) = &session_id {
-          let mut inner = state.server.inner.lock().await;
+          })
+          .unwrap_or_else(|_| serde_json::json!({})),
+          new_session_id: None,
+        },
+      };
+    }
+
+    // A message with no id is a notification, and JSON-RPC forbids replying to
+    // one. `notifications/initialized` is the only one that carries meaning.
+    if request.id.is_none() {
+      if request.method == "notifications/initialized" {
+        if let Some(sid) = session_id {
+          let mut inner = self.inner.lock().await;
           if let Some(session) = inner.sessions.get_mut(sid) {
             session.initialized = true;
           }
         }
       }
-      StatusCode::ACCEPTED.into_response()
-    } else {
-      // Validate session exists
-      if let Some(sid) = &session_id {
-        let inner = state.server.inner.lock().await;
-        if !inner.sessions.contains_key(sid) {
-          return StatusCode::NOT_FOUND.into_response();
-        }
-      }
+      return McpOutcome::Accepted;
+    }
 
-      if Self::is_automation_tool_call(&request) {
-        if let crate::automation_rate_limiter::RateLimitOutcome::Limited { retry_after_secs } =
-          crate::automation_rate_limiter::check_automation_rate_limit().await
-        {
+    // Validated only when the caller supplied one: a client that never called
+    // `initialize` is still served, exactly as it was over HTTP. That leniency
+    // stops at the tools whose ANSWER depends on which caller is asking, the
+    // index-based ones, because there is no such thing as a correct reply to
+    // "click element 3" from a caller whose snapshot the server cannot name.
+    // They refuse in the handler (`require_indexed_session`); everything else
+    // is a self-contained request that a sessionless caller can safely make.
+    if let Some(sid) = session_id {
+      let mut inner = self.inner.lock().await;
+      // Touched HERE, on the path every id-carrying request takes, so the cap
+      // evicts what is genuinely idle. Doing it in the
+      // `notifications/initialized` branch instead, as the first attempt did -
+      // touches a session exactly once in its life, which is no better than
+      // evicting by creation time.
+      match inner.sessions.get_mut(sid) {
+        Some(session) => session.last_used = std::time::Instant::now(),
+        None => return McpOutcome::UnknownSession,
+      }
+    }
+
+    if Self::is_automation_tool_call(&request) && !Self::refused_by_console(&request) {
+      if let crate::automation_rate_limiter::RateLimitOutcome::Limited { retry_after_secs } =
+        crate::automation_rate_limiter::check_automation_rate_limit().await
+      {
+        if let Some(dropped) = AUTOMATION_QUOTA.allow("limited") {
           log::warn!(
-            "[mcp] Rejected tools/call: automation rate limit exceeded; retry in {}s",
-            retry_after_secs
+            "MCP automation rate limited retry_after_s={retry_after_secs}{}",
+            crate::log_streak::suppressed(dropped)
           );
-          return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::RETRY_AFTER, retry_after_secs.to_string())],
-            "automation request rate limit exceeded",
-          )
-            .into_response();
         }
+        return McpOutcome::RateLimited { retry_after_secs };
       }
+    }
 
-      let response = state.server.handle_request(request).await;
-      Json(response).into_response()
+    let response = self
+      .handle_request(
+        McpCaller {
+          session: session_id,
+          toolsets: toolsets.as_ref(),
+        },
+        request,
+      )
+      .await;
+    McpOutcome::Body {
+      body: serde_json::to_value(response).unwrap_or_else(|_| serde_json::json!({})),
+      new_session_id: None,
     }
   }
 
@@ -512,6 +4697,24 @@ impl McpServer {
       return false;
     };
 
+    Self::is_automation_tool(tool_name)
+  }
+
+  /// A call the person has paused or taken over does not count against the quota.
+  fn refused_by_console(request: &McpRequest) -> bool {
+    let Some(params) = request.params.as_ref() else {
+      return false;
+    };
+    let tool_name = params
+      .get("name")
+      .and_then(serde_json::Value::as_str)
+      .unwrap_or_default();
+    let empty = serde_json::json!({});
+    let arguments = params.get("arguments").unwrap_or(&empty);
+    crate::agent_console::check_call(Self::is_passive_tool(tool_name), arguments).is_err()
+  }
+
+  fn is_automation_tool(tool_name: &str) -> bool {
     matches!(
       tool_name,
       "run_profile"
@@ -529,16 +4732,32 @@ impl McpServer {
         | "get_interactive_elements"
         | "click_by_index"
         | "type_by_index"
+        // The agent surface drives the same browser through the same paid
+        // gate; a native page read is automation exactly as a script one is.
+        | "perceive_page"
+        | "resolve_locator"
+        | "click_locator"
+        | "press_and_hold"
+        | "type_locator"
+        | "extract_structured"
+        | "pick_element"
+        | "select_option"
+        | "file_upload"
+        // A capture reads every request the browser makes, so starting one
+        // and reading it are browser reads like get_page_content, and are
+        // refused while the person has paused agents or holds the profile.
+        | "start_network_capture"
+        | "list_network_requests"
+        | "get_network_request"
         // Starting a bot run leases a remote host for up to two hours and
         // spends the account's pooled remote-hour budget, which makes it the
         // most expensive tool here. Cancelling one reaches the same fleet, and
         // is metered alongside the remote-session stop it mirrors.
         //
         // Deliberately absent: set_cookie_bot_schedule and
-        // delete_cookie_bot_schedule. They write one row in Donut cloud and
-        // lease nothing; metering them would throttle an agent enrolling a
-        // fleet of profiles, while the budget that actually guards the
-        // hardware is spent per RUN and enforced server-side.
+        // delete_cookie_bot_schedule. They are configuration and lease
+        // nothing; metering them would throttle an agent enrolling many
+        // profiles, and they are not what spends the account's hours.
         | "run_cookie_bot_now"
         | "cancel_cookie_bot_run"
         // Leasing a remote host is the single most expensive action here, and
@@ -549,36 +4768,38 @@ impl McpServer {
     )
   }
 
-  pub async fn stop(&self) -> Result<(), String> {
-    if !self.is_running() {
-      return Err(crate::backend_error("MCP_SERVER_NOT_RUNNING"));
-    }
-
-    let mut inner = self.inner.lock().await;
-    inner.app_handle = None;
-    inner.token = None;
-    inner.sessions.clear();
-
-    // Send shutdown signal
-    if let Some(tx) = inner.shutdown_tx.take() {
-      let _ = tx.send(());
-    }
-
-    self.port.store(0, Ordering::SeqCst);
-    self.is_running.store(false, Ordering::SeqCst);
-
-    log::info!("[mcp] Server stopped");
-    Ok(())
-  }
-
   pub fn get_tools(&self) -> Vec<McpTool> {
     vec![
       McpTool {
         name: "list_profiles".to_string(),
-        description: "List all supported browser profiles".to_string(),
+        description: "List Wayfern browser profiles as short summaries: id, name, group, tags, status, route (proxy or VPN, with names), running (local, remote or stopped), last launch and note. Filter with query, group, tag and running; page with limit and cursor. Use get_profile for one profile's settings and get_profile_fingerprint for its device.".to_string(),
         input_schema: serde_json::json!({
           "type": "object",
-          "properties": {},
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Text to find in the name, the note or a tag (any case)"
+            },
+            "group": {
+              "type": "string",
+              "description": "A group name or id; \"none\" for profiles in no group"
+            },
+            "tag": { "type": "string", "description": "Only profiles with this tag" },
+            "running": {
+              "type": "boolean",
+              "description": "true: only running profiles (here or on the remote fleet); false: only stopped ones"
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "description": "Profiles per page, 50 when left out"
+            },
+            "cursor": {
+              "type": "string",
+              "description": "next_cursor from the previous page"
+            }
+          },
           "required": []
         }),
       },
@@ -598,7 +4819,7 @@ impl McpServer {
       },
       McpTool {
         name: "run_profile".to_string(),
-        description: "Launch a browser profile with an optional URL. Requires an active Pro subscription.".to_string(),
+        description: "Launch a browser profile with an optional URL. A profile that is already running is taken over as it is, with no restart. Requires an active Pro subscription.".to_string(),
         input_schema: serde_json::json!({
           "type": "object",
           "properties": {
@@ -720,6 +4941,27 @@ impl McpServer {
               "type": "array",
               "items": { "type": "string" },
               "description": "Optional tags for the profile"
+            },
+            "ephemeral": {
+              "type": "boolean",
+              "description": "Keep this profile's browsing data in memory only, so nothing it browses reaches real disk (default: false)"
+            },
+            "temporary": {
+              "type": "boolean",
+              "description": "Create a profile for one run: implies ephemeral, is deleted when its browser stops, and is swept at startup if it outlived a crash (default: false)"
+            },
+            "status_id": {
+              "type": "string",
+              "description": "Optional status id from list_profile_statuses"
+            },
+            "start_urls": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Optional start pages (at most 20 http(s) URLs) a launch from the app opens instead of the last session"
+            },
+            "dns_server": {
+              "type": "string",
+              "description": "Optional. DNS server the profile resolves names with, through its own proxy or VPN: https://host/path (DNS over HTTPS), tls://host[:port] (DNS over TLS), tcp://host[:port] (plain DNS) or a bare host[:port]. A bare address of a well-known public resolver such as 1.1.1.1 uses its DNS over HTTPS endpoint. If the server does not answer, connections fail instead of falling back to the proxy's resolver. Omit it to let the proxy resolve names."
             }
           },
           "required": ["name"]
@@ -834,6 +5076,19 @@ impl McpServer {
             "clear_on_close": {
               "type": "boolean",
               "description": "Wipe browsing data (keeping extensions and bookmarks) when the browser exits. Not available for ephemeral or password-protected profiles."
+            },
+            "status_id": {
+              "type": "string",
+              "description": "Status id from list_profile_statuses (empty string to remove)"
+            },
+            "start_urls": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Start pages, replacing the current ones (empty array to remove). At most 20 http(s) URLs."
+            },
+            "dns_server": {
+              "type": "string",
+              "description": "DNS server the profile resolves names with, through its own proxy or VPN: https://host/path (DNS over HTTPS), tls://host[:port] (DNS over TLS), tcp://host[:port] (plain DNS) or a bare host[:port]. A bare address of a well-known public resolver such as 1.1.1.1 uses its DNS over HTTPS endpoint. If the server does not answer, connections fail instead of falling back to the proxy's resolver. Empty string to let the proxy resolve names again. Takes effect at the next launch."
             }
           },
           "required": ["profile_id"]
@@ -890,6 +5145,20 @@ impl McpServer {
         }),
       },
       McpTool {
+        name: "rotate_proxy_ip".to_string(),
+        description: "Give a stored proxy a new exit IP by calling its provider's change-IP link. Every profile that uses the proxy moves to the new IP, and their open connections may drop. Fails when the proxy has no change-IP link.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "proxy_id": {
+              "type": "string",
+              "description": "The id of the stored proxy"
+            }
+          },
+          "required": ["proxy_id"]
+        }),
+      },
+      McpTool {
         name: "get_profile_status".to_string(),
         description: "Check whether a browser profile is running and can be driven. Returns is_running (true when the browser can be driven, wherever it is), location ('local', 'remote' or 'stopped'), is_running_locally, and remote_session_id when it is running on the remote fleet.".to_string(),
         input_schema: serde_json::json!({
@@ -901,6 +5170,67 @@ impl McpServer {
             }
           },
           "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "bulk_update_profiles".to_string(),
+        description: "Change the same settings on many profiles at once. Every value is checked and every profile found before anything changes, and a running profile refuses the whole batch. Fields left out stay as they are; null clears a field that can be empty. Returns how many profiles changed.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_ids": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "UUIDs of the profiles to change"
+            },
+            "patch": {
+              "type": "object",
+              "description": "The change. Keys: status_id, tags_add, tags_remove, note, group_id, extension_group_id, dns_blocklist, dns_server, proxy_bypass_rules, start_urls, launch_hook, clear_on_close, randomize_fingerprint_on_launch, webrtc_mode (auto|tcp_only|block), block_images, block_webgl, restore_session, new_device (true makes the next launch generate a new device)."
+            }
+          },
+          "required": ["profile_ids", "patch"]
+        }),
+      },
+      McpTool {
+        name: "list_profile_statuses".to_string(),
+        description: "List the profile statuses (named, colored labels such as Active or Banned) in their order. Set one on a profile with update_profile's status_id.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {},
+          "required": []
+        }),
+      },
+      McpTool {
+        name: "list_profile_templates".to_string(),
+        description: "List the profile templates: saved settings (proxy or VPN, group, tags, status, DNS, start pages, fingerprint OS and options) that new profiles are made from. A template never holds a device; every profile made from it gets its own.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {},
+          "required": []
+        }),
+      },
+      McpTool {
+        name: "create_profiles_from_template".to_string(),
+        description: "Make 1 to 100 profiles from a template with the newest downloaded Wayfern, each with its own new device. Everything is checked first, each proxy once. One profile takes the name as given; several take it followed by numbers that continue after the highest in use. Creation stops at the hourly profile allowance; the result lists what was made and why it stopped early, if it did.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "template_id": {
+              "type": "string",
+              "description": "The template's id, from list_profile_templates"
+            },
+            "count": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "description": "How many profiles to make"
+            },
+            "name": {
+              "type": "string",
+              "description": "Optional. Defaults to the template's name prefix, else its name"
+            }
+          },
+          "required": ["template_id", "count"]
         }),
       },
       // Group management tools
@@ -992,6 +5322,38 @@ impl McpServer {
           "required": ["profile_ids"]
         }),
       },
+      McpTool {
+        name: "distribute_proxies".to_string(),
+        description: "Give each profile its own proxy. Pairs are applied one \
+                      profile at a time and every outcome is reported, so a \
+                      profile whose browser is running is refused by name \
+                      instead of failing the whole request."
+          .to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "pairs": {
+              "type": "array",
+              "description": "Profile/proxy pairs to apply, one proxy per profile",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "profile_id": {
+                    "type": "string",
+                    "description": "The UUID of the profile to move"
+                  },
+                  "proxy_id": {
+                    "type": "string",
+                    "description": "The UUID of the stored proxy to assign"
+                  }
+                },
+                "required": ["profile_id", "proxy_id"]
+              }
+            }
+          },
+          "required": ["pairs"]
+        }),
+      },
       // Full proxy management tools
       McpTool {
         name: "get_proxy".to_string(),
@@ -1019,7 +5381,7 @@ impl McpServer {
             },
             "proxy_type": {
               "type": "string",
-              "enum": ["http", "https", "socks4", "socks5", "vless"],
+              "enum": MCP_PROXY_TYPES,
               "description": "The proxy protocol"
             },
             "host": {
@@ -1040,7 +5402,7 @@ impl McpServer {
             },
             "vless_uri": {
               "type": "string",
-              "description": "VLESS + XTLS Vision + REALITY share URI"
+              "description": "Share link for vless, vmess, trojan and hysteria2 proxies (vless://, vmess://, trojan://, hysteria2:// or hy2://). It holds the whole server configuration, and the link's own scheme decides the stored type."
             }
           },
           "required": ["name", "proxy_type"]
@@ -1062,7 +5424,7 @@ impl McpServer {
             },
             "proxy_type": {
               "type": "string",
-              "enum": ["http", "https", "socks4", "socks5", "vless"],
+              "enum": MCP_PROXY_TYPES,
               "description": "The proxy protocol"
             },
             "host": {
@@ -1083,7 +5445,7 @@ impl McpServer {
             },
             "vless_uri": {
               "type": "string",
-              "description": "VLESS + XTLS Vision + REALITY share URI"
+              "description": "Share link for vless, vmess, trojan and hysteria2 proxies (vless://, vmess://, trojan://, hysteria2:// or hy2://). It holds the whole server configuration, and the link's own scheme decides the stored type."
             }
           },
           "required": ["proxy_id"]
@@ -1232,7 +5594,7 @@ impl McpServer {
       // Fingerprint management tools
       McpTool {
         name: "get_profile_fingerprint".to_string(),
-        description: "Get the fingerprint configuration for a supported profile"
+        description: "Get the fingerprint configuration for a Wayfern profile. `fingerprint` is the device the profile presents, as a JSON string, or null when there is none to show."
           .to_string(),
         input_schema: serde_json::json!({
           "type": "object",
@@ -1265,6 +5627,15 @@ impl McpServer {
               "type": "string",
               "enum": ["windows", "macos", "linux"],
               "description": "Operating system for fingerprint generation"
+            },
+            "restore_session": {
+              "type": "boolean",
+              "description": "Reopen the windows and tabs of the last session on an interactive launch (default: true). Automation runs never restore."
+            },
+            "webrtc_mode": {
+              "type": "string",
+              "enum": ["auto", "tcp_only", "block"],
+              "description": "How WebRTC may reach the network: auto (default), tcp_only (publish only the proxy's exit address), or block (no ICE candidates at all)"
             },
             "randomize_fingerprint_on_launch": {
               "type": "boolean",
@@ -1592,15 +5963,183 @@ impl McpServer {
             "format": {
               "type": "string",
               "enum": ["png", "jpeg", "webp"],
-              "description": "Image format (default: png)"
+              "description": "Image format (default: jpeg)"
             },
             "quality": {
               "type": "integer",
-              "description": "Image quality 0-100 for jpeg/webp (default: 80)"
+              "description": "Image quality 0-100 for jpeg/webp (default: 75)"
             },
             "full_page": {
               "type": "boolean",
               "description": "Capture the full scrollable page (default: false)"
+            },
+            "max_width": {
+              "type": "integer",
+              "description": "Widest the image may be, in pixels, 320 to 4096 (default: 1280). A wider page is scaled down, never up."
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "run_actions".to_string(),
+        description: "Run several browser actions in one call, in order, on one profile: navigate, go_back, scroll, press_key, wait_for, the click and type tools, select_option, get_page_info. Stops at the first failure and, unless stop_on_change is false, as soon as the page address changes, since later steps were planned for the old page. Returns each step's result.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": { "type": "string", "description": "The UUID of the running profile" },
+            "actions": {
+              "type": "array",
+              "maxItems": 20,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "tool": { "type": "string", "description": "The tool to run, e.g. click_by_index" },
+                  "arguments": { "type": "object", "description": "That tool's arguments, without profile_id" }
+                },
+                "required": ["tool"]
+              }
+            },
+            "stop_on_change": {
+              "type": "boolean",
+              "description": "Stop when the page address changes (default: true)"
+            }
+          },
+          "required": ["profile_id", "actions"]
+        }),
+      },
+      McpTool {
+        name: "list_tabs".to_string(),
+        description: "List the open tabs of a running profile: id, title, URL, and which one the browser tools act on (selected).".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": { "type": "string", "description": "The UUID of the running profile" }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "open_tab".to_string(),
+        description: "Open a URL in a new tab of a running profile and make it the tab the browser tools act on.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": { "type": "string", "description": "The UUID of the running profile" },
+            "url": { "type": "string", "description": "The URL to open" }
+          },
+          "required": ["profile_id", "url"]
+        }),
+      },
+      McpTool {
+        name: "switch_tab".to_string(),
+        description: "Bring a tab to the front and make it the tab the browser tools act on. Take the id from list_tabs.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": { "type": "string", "description": "The UUID of the running profile" },
+            "tab_id": { "type": "string", "description": "The tab id from list_tabs" }
+          },
+          "required": ["profile_id", "tab_id"]
+        }),
+      },
+      McpTool {
+        name: "close_tab".to_string(),
+        description: "Close a tab of a running profile. Take the id from list_tabs.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": { "type": "string", "description": "The UUID of the running profile" },
+            "tab_id": { "type": "string", "description": "The tab id from list_tabs" }
+          },
+          "required": ["profile_id", "tab_id"]
+        }),
+      },
+      McpTool {
+        name: "scroll".to_string(),
+        description: "Scroll the page with the mouse wheel at the middle of the viewport, so an inner scroll area under it scrolls too. Returns the window's new position and whether it reached the top or bottom; call get_interactive_elements again for what came into view.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the running profile"
+            },
+            "direction": {
+              "type": "string",
+              "enum": ["down", "up", "left", "right"],
+              "description": "Which way to scroll (default: down)"
+            },
+            "pages": {
+              "type": "number",
+              "description": "How far, in viewports, 0.1 to 10 (default: 1)"
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "press_key".to_string(),
+        description: "Press one key in the focused element: Enter to submit, Tab to move on, Escape to close a dialog, arrows to move in a list. With modifiers it is a shortcut (for example key 'a' with ['ctrl']). Waits for a page load the key starts, and returns where the page is.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the running profile"
+            },
+            "key": {
+              "type": "string",
+              "description": "Enter, Tab, Escape, Backspace, Delete, Space, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, PageUp, PageDown, Home, End, or one character"
+            },
+            "modifiers": {
+              "type": "array",
+              "items": { "type": "string", "enum": ["alt", "ctrl", "meta", "shift"] },
+              "description": "Keys held during the press"
+            }
+          },
+          "required": ["profile_id", "key"]
+        }),
+      },
+      McpTool {
+        name: "go_back".to_string(),
+        description: "Go back one page in the tab's history, as the browser's Back button does, and wait for that page. Returns where the page is.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the running profile"
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "wait_for".to_string(),
+        description: "Wait until a text shows on the page, or an element matching a CSS selector is visible (or, with gone=true, until it is no longer there). Cheaper than polling with screenshots. Returns met=false when the time runs out; that is an answer, not an error.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the running profile"
+            },
+            "text": {
+              "type": "string",
+              "description": "Text to wait for in the page's visible text"
+            },
+            "selector": {
+              "type": "string",
+              "description": "CSS selector of an element to wait for"
+            },
+            "gone": {
+              "type": "boolean",
+              "description": "Wait for the text or element to go away instead (default: false)"
+            },
+            "timeout_ms": {
+              "type": "integer",
+              "description": "Longest wait in milliseconds, 100 to 30000 (default: 10000)"
             }
           },
           "required": ["profile_id"]
@@ -1654,7 +6193,7 @@ impl McpServer {
       },
       McpTool {
         name: "type_text".to_string(),
-        description: "Focus an element by CSS selector and type text into it. By default uses realistic human-like typing with variable speed, natural errors, and self-corrections. Only set instant=true when you are certain the target does not have bot detection (e.g. browser address bars, developer tools, internal apps) — using instant on public websites risks the profile being flagged as a bot.".to_string(),
+        description: "Focus an element by CSS selector and type text into it. By default uses realistic human-like typing with variable speed, natural errors, and self-corrections. A label, or a container with one field in it, types into that field. The field is read back after typing: when it does not hold the text (the page reset it, a mask or length limit refused it, or it never took the focus) the call fails with TYPE_NOT_APPLIED and says what the field holds. Only set instant=true when you are certain the target does not have bot detection (e.g. browser address bars, developer tools, internal apps) — using instant on public websites risks the profile being flagged as a bot.".to_string(),
         input_schema: serde_json::json!({
           "type": "object",
           "properties": {
@@ -1706,6 +6245,10 @@ impl McpServer {
             "selector": {
               "type": "string",
               "description": "Optional CSS selector to get content of a specific element instead of the whole page"
+            },
+            "max_chars": {
+              "type": "integer",
+              "description": "Cap on the returned characters (default: 20000). A longer page says it was cut; pass a larger max_chars, or a selector, for the rest."
             }
           },
           "required": ["profile_id"]
@@ -1728,7 +6271,7 @@ impl McpServer {
       },
       McpTool {
         name: "get_interactive_elements".to_string(),
-        description: "Enumerate visible interactive elements on the page (buttons, links, inputs, etc.) as a compact indexed list. The returned indices are stable for the current page and can be used with click_by_index and type_by_index instead of guessing CSS selectors. Call this before click_by_index / type_by_index, and re-call after any navigation or major DOM change. Far cheaper in tokens than get_page_content for agentic browsing.".to_string(),
+        description: "Enumerate visible interactive elements on the page (buttons, links, inputs, etc.) as a compact indexed list. The returned indices are stable for the current page and can be used with click_by_index and type_by_index instead of guessing CSS selectors. Call this before click_by_index / type_by_index, and re-call after any navigation or major DOM change. Far cheaper in tokens than get_page_content for agentic browsing. Each line starts with [index eN marks]: eN stays the same while the element lives (pass it as element_id), `new` marks an element that appeared since your last listing, `covered` one that something else sits on, `offscreen` one outside the viewport.".to_string(),
         input_schema: serde_json::json!({
           "type": "object",
           "properties": {
@@ -1738,7 +6281,7 @@ impl McpServer {
             },
             "max_chars": {
               "type": "integer",
-              "description": "Cap on the serialized output length (default: 40000). The response carries a `truncated` flag if the list was cut off — narrow the viewport or scroll if you need elements past the cutoff."
+              "description": "Cap on the serialized output length (default: 12000). The response carries a `truncated` flag if the list was cut off: scroll, or pass a larger max_chars, for elements past the cutoff."
             }
           },
           "required": ["profile_id"]
@@ -1754,23 +6297,31 @@ impl McpServer {
               "type": "string",
               "description": "The UUID of the running profile"
             },
+            "element_id": {
+              "type": "string",
+              "description": "Instead of index: the stable id (e12) from the last get_interactive_elements response"
+            },
             "index": {
               "type": "integer",
               "description": "Zero-based index from the last get_interactive_elements response"
             }
           },
-          "required": ["profile_id", "index"]
+          "required": ["profile_id"]
         }),
       },
       McpTool {
         name: "type_by_index".to_string(),
-        description: "Focus the element at the given index from the last get_interactive_elements call and type text into it. Same human-like-typing defaults as type_text; only set instant=true when you're sure the target lacks bot detection.".to_string(),
+        description: "Focus the element at the given index from the last get_interactive_elements call and type text into it. Same human-like-typing defaults and the same read-back as type_text (TYPE_NOT_APPLIED when the field does not hold the text); only set instant=true when you're sure the target lacks bot detection.".to_string(),
         input_schema: serde_json::json!({
           "type": "object",
           "properties": {
             "profile_id": {
               "type": "string",
               "description": "The UUID of the running profile"
+            },
+            "element_id": {
+              "type": "string",
+              "description": "Instead of index: the stable id (e12) from the last get_interactive_elements response"
             },
             "index": {
               "type": "integer",
@@ -1793,7 +6344,7 @@ impl McpServer {
               "description": "Target words per minute for human typing (default: 80)"
             }
           },
-          "required": ["profile_id", "index", "text"]
+          "required": ["profile_id", "text"]
         }),
       },
       // Remote fleet. An agent that could drive a remote profile but not start
@@ -1801,7 +6352,7 @@ impl McpServer {
       // GUI — which is no use to an MCP client running on its own.
       McpTool {
         name: "run_profile_remote".to_string(),
-        description: "Start this profile on a remote host of its own operating system. The profile must have Regular cloud sync enabled. Returns a session id; poll get_remote_session until state is 'live', then drive it with navigate, screenshot, click_element and the rest exactly as you would a local profile.".to_string(),
+        description: "Start this profile on a remote host (Linux for a Wayfern profile, otherwise the profile's own operating system). The profile must have Regular cloud sync enabled. Returns a session id; poll get_remote_session until state is 'live', then drive it with navigate, screenshot, click_element and the rest exactly as you would a local profile.".to_string(),
         input_schema: serde_json::json!({
           "type": "object",
           "properties": {
@@ -1900,7 +6451,7 @@ impl McpServer {
       },
       McpTool {
         name: "set_cookie_bot_schedule".to_string(),
-        description: "Enrol a profile in the nightly cookie bot, or replace its enrolment. The profile must have cloud sync (not end-to-end encrypted), a recorded Windows or macOS operating system, and a proxy or VPN".to_string(),
+        description: "Enrol a profile in the nightly cookie bot, or replace its enrolment. The profile must have cloud sync (not end-to-end encrypted), a recorded Windows, macOS or Linux operating system, and a proxy or VPN".to_string(),
         input_schema: serde_json::json!({
           "type": "object",
           "properties": {
@@ -1914,8 +6465,8 @@ impl McpServer {
             },
             "platform": {
               "type": "string",
-              "enum": ["windows", "macos"],
-              "description": "Must match the profile's own operating system; taken from the profile when omitted"
+              "enum": ["windows", "macos", "linux"],
+              "description": "Must match the platform the profile runs on remotely (linux for a Wayfern profile); taken from the profile when omitted"
             },
             "enabled": {
               "type": "boolean",
@@ -2080,36 +6631,534 @@ impl McpServer {
           "required": []
         }),
       },
+      McpTool {
+        name: "perceive_page".to_string(),
+        description: "Read the page the way an agent needs it: every visible element with its role, accessible name, text, value, state and bounds in viewport coordinates (y is negative above the window), plus the readable text, in one call and with no script injected on Wayfern 152. A capture that uses its whole budget, or that the browser cut short, is answered from the DOM instead (engine: \"fallback\"). Far more complete than get_interactive_elements. On a profile older than Wayfern 152 the same shape is synthesised from the DOM (engine: \"fallback\"). A truncated result carries a cursor; pass it back to continue.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the running profile"
+            },
+            "max_bytes": {
+              "type": "integer",
+              "description": "Total byte cap for nodes and text (default: 1048576, ceiling: 4194304)"
+            },
+            "budget_ms": {
+              "type": "integer",
+              "description": "Capture budget in milliseconds (default: 5000, clamped to 100-60000). A capture that uses all of it is answered from the DOM instead; it is never an error"
+            },
+            "max_nodes": {
+              "type": "integer",
+              "description": "Per-frame node ceiling, counted in document order (default: 100000; 0 for no limit). With viewport_only it bounds the nodes returned instead; a viewport with more is answered from the DOM, cut there, with truncated true"
+            },
+            "include_text": {
+              "type": "boolean",
+              "description": "Include the readable text (default: true)"
+            },
+            "viewport_only": {
+              "type": "boolean",
+              "description": "Drop nodes outside the viewport (default: false)"
+            },
+            "text_order": {
+              "type": "string",
+              "enum": ["reading", "visual"],
+              "description": "Emit text in accessibility reading order (default) or re-sorted by geometry (Wayfern 152; the fallback engine always answers in reading order)"
+            },
+            "cursor": {
+              "type": "string",
+              "description": "Continue a previous capture from the cursor it returned (Wayfern 152 only)"
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "resolve_locator".to_string(),
+        description: "Resolve a locator (role, accessible name, text, attributes) to EXACTLY ONE element and describe it. When several match, the one that stands out is taken: the only visible one, the one whose name or text is exactly a nameContains or textContains, or a control over its own label. Otherwise ambiguity is an error whose data.candidates lists what matched, and a locator that matches nothing is an error too (its message says when only hidden elements match), so a click never lands on the wrong element. Use the result's signature or attributes to refine.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the running profile"
+            },
+            "locator": locator_schema("How to name the element. Every part given must match"),
+            "candidate_limit": {
+              "type": "integer",
+              "description": "How many candidates an ambiguity error lists (default: 10, ceiling: 100)"
+            }
+          },
+          "required": ["profile_id", "locator"]
+        }),
+      },
+      McpTool {
+        name: "click_locator".to_string(),
+        description: "Resolve a locator to exactly one element and click it with a humanized pointer: on Wayfern 152 a real pointer glides to the element along a human path and presses with the profile's own timing (the click is never a script); on older builds a trusted mouse event is dispatched at the element's centre. A radio, checkbox or file input that the page hides behind its label is clicked through the label, and text or name matches the label too. Waits for a page load when the click causes one.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the running profile"
+            },
+            "locator": locator_schema("How to name the element to click"),
+            "button": {
+              "type": "string",
+              "enum": ["left", "middle", "right", "back", "forward"],
+              "description": "Mouse button (default: left)"
+            },
+            "click_count": {
+              "type": "integer",
+              "description": "1 for a click (default), 2 for a double click, 3 for a triple"
+            }
+          },
+          "required": ["profile_id", "locator"]
+        }),
+      },
+      McpTool {
+        name: "press_and_hold".to_string(),
+        description: "Press and hold an element, for a press-and-hold check: the pointer moves onto it as for a click, the button stays down for duration_ms while the pointer makes the small movements of a real hand, then it lets go. Name the element by selector, locator, or index from get_interactive_elements. Returns held_ms, how long the button was down (a little more than asked), and whether a page load followed.".to_string(),
+        input_schema: form_tool_schema(
+          "element to hold",
+          serde_json::json!({
+            "duration_ms": {
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 30000,
+              "description": "How long to keep the button down, in milliseconds (default: 3000)"
+            },
+            "button": {
+              "type": "string",
+              "enum": ["left", "middle", "right"],
+              "description": "Mouse button (default: left)"
+            }
+          }),
+          &[],
+        ),
+      },
+      McpTool {
+        name: "type_locator".to_string(),
+        description: "Resolve a locator to exactly one field, focus it with a real click and type text into it one key at a time. On Wayfern 152 the keys are paced by the profile's own typing rhythm, with a few seed-determined typos corrected along the way when typos is on; on older builds the same human-typing model as type_text is used. The typed text replaces what the field holds unless clear_first is false. The field is read back afterwards: a field that does not hold the text fails with TYPE_NOT_APPLIED (data.reason not_focused or value, data.value what it holds), never a success. An autocomplete keeps the typed text only until you pick an option.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the running profile"
+            },
+            "locator": locator_schema("How to name the field to type into"),
+            "text": {
+              "type": "string",
+              "description": "Text to type"
+            },
+            "clear_first": {
+              "type": "boolean",
+              "description": "Empty the field before typing (default: true)"
+            },
+            "typos": {
+              "type": "boolean",
+              "description": "Mistype and correct a few characters, as a hand does (default: true)"
+            },
+            "wpm": {
+              "type": "number",
+              "description": "Target words per minute for the fallback engine (default: 80). Wayfern 152 types at the profile's own rhythm and ignores this"
+            }
+          },
+          "required": ["profile_id", "locator", "text"]
+        }),
+      },
+      McpTool {
+        name: "select_option".to_string(),
+        description: "Choose options of a native <select>, named by selector, locator, or index from get_interactive_elements; a label or a container that holds one <select> also works. Each option is matched by its value, then by its visible label. The select is focused and the input and change events a pick fires are dispatched in the page. For a custom dropdown that is not a <select>, click it open and click the option instead. Waits for a page load when the choice causes one.".to_string(),
+        input_schema: form_tool_schema(
+          "select element",
+          serde_json::json!({
+            "option": {
+              "type": "string",
+              "description": "The value or visible label of the option to choose"
+            },
+            "options": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Instead of option: every option to choose, for a <select multiple>"
+            }
+          }),
+          &[],
+        ),
+      },
+      McpTool {
+        name: "file_upload".to_string(),
+        description: "Put files into a file input (<input type=file>), named by selector, locator, or index; a label or a container that holds one file input also works, and the input may be hidden. Send each file's content: text for a text file, content_base64 for any file, at most 10 files and 700 KB in all per call. Donut writes them to a private folder on this computer and sets them on the input the way the file chooser does, so the page sees a trusted change; they are deleted when the browser stops. Setting files replaces what the input held. Only for profiles running on this computer.".to_string(),
+        input_schema: form_tool_schema(
+          "file input",
+          serde_json::json!({
+            "files": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 10,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "description": "The file name the page sees, with its extension (report.pdf)"
+                  },
+                  "text": {
+                    "type": "string",
+                    "description": "The content of a text file"
+                  },
+                  "content_base64": {
+                    "type": "string",
+                    "description": "Instead of text: the content as base64 (a data: URL works too)"
+                  }
+                },
+                "required": ["name"]
+              }
+            }
+          }),
+          &["files"],
+        ),
+      },
+      McpTool {
+        name: "start_network_capture".to_string(),
+        description: "Start recording the requests that every tab of a running profile makes, for list_network_requests and get_network_request. Nothing the page can see changes. The record is in memory only: at most 2,000 requests and text response bodies up to 2 MB each and 32 MB in all, the oldest dropped first. Cookie, Set-Cookie, Authorization and Proxy-Authorization values read [redacted]. Requests made while the person has paused agents or taken over the profile are not recorded. The capture and its record end when the browser stops, or with stop_network_capture. Only for profiles running on this computer; a capture already running is kept.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the running profile"
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "stop_network_capture".to_string(),
+        description: "Stop a profile's network capture and delete its record.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the profile"
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "list_network_requests".to_string(),
+        description: "List the requests a profile's network capture recorded, oldest first: id, tab, method, URL, type (Document, XHR, Fetch, Script, Image...), state (pending, done, failed, redirected, incomplete), status, MIME type, bytes, duration and what became of the body (kept, or why not). Filter by URL text, method, type, status, failure or body text. Page with after and limit; last_id is the newest id recorded, so after set to it later shows only new requests.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the profile"
+            },
+            "after": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Only requests with a larger id: next_after or last_id from an earlier call"
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "description": "Requests per page, 50 when left out"
+            },
+            "url_contains": { "type": "string", "description": "Text the URL contains (any case)" },
+            "method": { "type": "string", "description": "GET, POST, ..." },
+            "type": { "type": "string", "description": "Document, XHR, Fetch, Script, Image, ..." },
+            "status": { "type": "integer", "description": "Only this HTTP status" },
+            "failed": { "type": "boolean", "description": "true: only requests that failed; false: none of them" },
+            "body_contains": { "type": "string", "description": "Text a kept response body contains (any case)" }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "get_network_request".to_string(),
+        description: "One request a network capture recorded, in full: request and response headers, the request body (up to 64 KB), status, timing, and the response body when it is text. Read a long body in parts with body_offset and max_body_chars.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the profile"
+            },
+            "request_id": {
+              "type": "integer",
+              "description": "The id from list_network_requests"
+            },
+            "body": {
+              "type": "boolean",
+              "description": "Include the response body (default: true)"
+            },
+            "body_offset": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "The character to start the body at: next_offset from the previous call"
+            },
+            "max_body_chars": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 90000,
+              "description": "The most body characters to show, 20000 when left out"
+            }
+          },
+          "required": ["profile_id", "request_id"]
+        }),
+      },
+      McpTool {
+        name: "extract_structured".to_string(),
+        description: "Read rows off the live page natively, with no script injected: a container locator matches every row, each field locator is evaluated inside a row, and an optional next-page locator is clicked to advance. A missing container is a result (stopReason \"no-container\"), not an error. Every bound is reported through stopReason and truncated. Requires Wayfern 152.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the running profile"
+            },
+            "container": locator_schema("Matches every row container; several matches are the expected case"),
+            "field_map": {
+              "type": "array",
+              "description": "The columns to read from each row",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "key": { "type": "string", "description": "The key this column appears under in each row's values" },
+                  "locator": locator_schema("Evaluated inside each container; the first match wins. A field that matches nothing is an absent key"),
+                  "source": { "type": "string", "enum": ["text", "attribute", "link"], "description": "Visible text, one named attribute, or the resolved href/src" },
+                  "attribute": { "type": "string", "description": "The attribute to read; required when source is attribute" }
+                },
+                "required": ["key", "locator", "source"]
+              }
+            },
+            "next_page": locator_schema("The control clicked to advance a page; absent means one page"),
+            "max_pages": { "type": "integer", "description": "Default 1, ceiling 200" },
+            "max_rows": { "type": "integer", "description": "Default 1000, ceiling 100000" },
+            "max_bytes": { "type": "integer", "description": "Default 262144, ceiling 8388608" },
+            "max_nodes": { "type": "integer", "description": "Node cap for each snapshot (default: 20000, ceiling: 200000)" },
+            "time_budget_ms": { "type": "integer", "description": "Default 8000, ceiling 120000" }
+          },
+          "required": ["profile_id", "container", "field_map"]
+        }),
+      },
+      McpTool {
+        name: "pick_element".to_string(),
+        description: "Arm the browser's element picker and wait for the user to click an element in the page. Returns the smallest locator that resolves to what they clicked, plus its description, so a person can point at something an agent then acts on with click_locator or type_locator. Errors when the user presses Escape, navigates away, or nothing is picked within timeout_ms. Requires Wayfern 152.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "The UUID of the running profile"
+            },
+            "timeout_ms": {
+              "type": "integer",
+              "description": "How long to wait for the click (default: 60000, ceiling: 300000)"
+            }
+          },
+          "required": ["profile_id"]
+        }),
+      },
+      McpTool {
+        name: "ask_human".to_string(),
+        description: "Ask the person at this computer a question and wait for the answer. Use it when you are unsure what they want, need a value only they know (a code, an account choice), or before a step that cannot be undone. Offer choices when you can. Returns {status: \"answered\", answer}, or {status: \"pending\", request_id} when they have not answered within wait_seconds; then call wait_for_human.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "question": { "type": "string", "description": "One short, clear question" },
+            "choices": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Optional answers to pick from (at most 8)"
+            },
+            "profile_id": { "type": "string", "description": "The profile the question is about, if any" },
+            "wait_seconds": { "type": "integer", "description": "How long to wait for the answer (default 45, max 55)" }
+          },
+          "required": ["question"]
+        }),
+      },
+      McpTool {
+        name: "request_human_help".to_string(),
+        description: "Hand a profile to the person at this computer when its page needs a human: a sign-in, a verification challenge, a payment, or anything you cannot do. The profile is held for them, and your calls on it are refused with PROFILE_HELD_BY_HUMAN until they hand it back. Returns {status: \"done\", note} when they hand it back, or {status: \"pending\", request_id}; then call wait_for_human, or work on other profiles meanwhile.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "profile_id": { "type": "string", "description": "The UUID of the profile that needs the person" },
+            "reason": { "type": "string", "description": "What the person should do, in one sentence" },
+            "wait_seconds": { "type": "integer", "description": "How long to wait (default 45, max 55)" }
+          },
+          "required": ["profile_id", "reason"]
+        }),
+      },
+      McpTool {
+        name: "wait_for_human".to_string(),
+        description: "Keep waiting for the outcome of an ask_human or request_human_help request. Returns status answered, done, dismissed, or pending (call again).".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "request_id": { "type": "integer", "description": "The request_id from ask_human or request_human_help" },
+            "wait_seconds": { "type": "integer", "description": "How long to wait (default 45, max 55)" }
+          },
+          "required": ["request_id"]
+        }),
+      },
+      McpTool {
+        name: "get_human_updates".to_string(),
+        description: "Read what the person at this computer wants you to know: their notes to you, the profiles they have taken over, whether agents are paused, and outcomes of your earlier requests. Call it when you start, between steps of a long job, and whenever a tool is refused with AGENT_PAUSED or PROFILE_HELD_BY_HUMAN.".to_string(),
+        input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+      },
+      McpTool {
+        name: "report_progress".to_string(),
+        description: "Tell the person what you are doing, in one short sentence, with done and total counts for a job over many items. It is shown next to your name in Donut. Call it when you start a job and every few items.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "message": { "type": "string", "description": "What you are doing now (at most 280 characters)" },
+            "done": { "type": "integer", "description": "Items finished so far" },
+            "total": { "type": "integer", "description": "Items in the whole job" },
+            "profile_id": { "type": "string", "description": "The profile you are working on, if one" }
+          },
+          "required": ["message"]
+        }),
+      },
+      McpTool {
+        name: "send_feedback".to_string(),
+        description: "Send feedback about Donut Browser to the Donut team: a tool that failed or behaved unexpectedly, a capability you needed and did not find, a confusing result, or something that worked well. Say what you tried, what happened, and what you expected. Set include_logs to attach what get_diagnostics returns: facts about this install and the recent app and proxy worker logs, which help with bugs and never contain profile names, visited URLs or credentials. The feedback is anonymous: it carries nothing about the person's account. The person at this computer sees what you sent. Returns {sent: true, feedback_id}.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "message": { "type": "string", "description": "The feedback (at most 5000 characters)" },
+            "kind": {
+              "type": "string",
+              "enum": ["bug", "idea", "praise", "other"],
+              "description": "bug for something broken, idea for something missing, praise for something that worked well (default: other)"
+            },
+            "include_logs": { "type": "boolean", "description": "Attach the recent app logs (default: false)" },
+            "profile_id": { "type": "string", "description": "The id of the profile the feedback is about, if any. Only the id is sent, never the profile's name or data" }
+          },
+          "required": ["message"]
+        }),
+      },
+      McpTool {
+        name: "get_diagnostics".to_string(),
+        description: "Read what a bug report would attach, to find out why Donut Browser misbehaves: facts about this install (version, OS, install kind, sync, installed Wayfern versions, running browsers and proxy workers, one line per profile) and the newest app and proxy worker log lines. Profiles, proxies, VPNs and groups appear as aliases such as profile-3, the same in the facts and the logs; names, emails, account details, IP addresses, web addresses and secrets are removed. Use it when the person reports a problem: follow the triage playbook at https://raw.githubusercontent.com/donutbrowser/donutbrowser/main/docs/TRIAGE.md, then report with send_feedback (include_logs: true). Returns {diagnostics}.".to_string(),
+        input_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "max_kb": { "type": "integer", "minimum": 8, "maximum": 512, "description": "Most kilobytes to return; the newest lines are kept (default: 64)" }
+          }
+        }),
+      },
     ]
   }
 
   async fn handle_initialize(
     &self,
     request: McpRequest,
+    toolsets: Option<&crate::mcp_toolsets::Selection>,
   ) -> Result<(String, (serde_json::Value, serde_json::Value)), (serde_json::Value, McpError)> {
     let id = request.id.clone().unwrap_or(serde_json::Value::Null);
 
-    if !self.is_running() {
+    if !self.is_engine_ready() {
       return Err((
         id,
         McpError {
           code: -32001,
           message: "MCP server is not running".to_string(),
+          data: None,
         },
       ));
     }
 
+    let negotiated = negotiate_protocol_version(
+      request
+        .params
+        .as_ref()
+        .and_then(|params| params.get("protocolVersion"))
+        .and_then(serde_json::Value::as_str),
+    );
+
+    let client_info = request
+      .params
+      .as_ref()
+      .and_then(|params| params.get("clientInfo"));
+    let client_field = |key: &str| {
+      client_info
+        .and_then(|info| info.get(key))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    };
+    let (client_name, client_version) = (client_field("name"), client_field("version"));
+
     // Create session
     let session_id = Uuid::new_v4().to_string();
+    let mut evicted = Vec::new();
     {
       let mut inner = self.inner.lock().await;
-      inner
-        .sessions
-        .insert(session_id.clone(), McpSession { initialized: false });
+      inner.sessions.insert(
+        session_id.clone(),
+        McpSession {
+          initialized: false,
+          last_used: std::time::Instant::now(),
+          cached_pages: HashSet::new(),
+        },
+      );
+
+      // Evict the oldest rather than refusing the newest: a caller that just
+      // asked for a session is the one actually present, and refusing it would
+      // break a live customer to protect memory that is not under pressure.
+      //
+      // An evicted session's page snapshots are NOT deleted here. Doing it
+      // would hold this lock, and the caller's `initialize`, on CDP round trips
+      // to browsers that may be gone; the page-side slot cap
+      // (MAX_CACHE_SLOTS_PER_PAGE) is what bounds them in exactly this case.
+      while inner.sessions.len() > MAX_SESSIONS {
+        let Some(oldest) = inner
+          .sessions
+          .iter()
+          .min_by_key(|(_, session)| session.last_used)
+          .map(|(id, _)| id.clone())
+        else {
+          break;
+        };
+        log::warn!(
+          "MCP session cap reached, oldest evicted session={}",
+          ShortId(&oldest)
+        );
+        inner.sessions.remove(&oldest);
+        evicted.push(oldest);
+      }
+    }
+    crate::agent_console::session_started(&session_id, client_name, client_version);
+    for oldest in evicted {
+      crate::agent_console::session_ended(&oldest);
     }
 
+    let mut instructions = INITIALIZE_INSTRUCTIONS.to_string();
+    if !CLOUD_AUTH.can_use_browser_automation().await {
+      instructions.push_str(PLAN_WITHOUT_AUTOMATION);
+    }
+    if let Some(selection) = toolsets {
+      let missing = selection.missing();
+      if !missing.is_empty() {
+        instructions.push_str(&format!(
+          " This connection lists the toolsets {}. Not listed: {}. To use them, reconnect with ?toolsets= naming them, or with no toolsets for every tool.",
+          selection.names().join(", "),
+          missing.join(", ")
+        ));
+      }
+    }
     let result = serde_json::json!({
-      "protocolVersion": PROTOCOL_VERSION,
+      "protocolVersion": negotiated,
       "capabilities": {
         "tools": {
           "listChanged": false
@@ -2117,19 +7166,21 @@ impl McpServer {
       },
       "serverInfo": {
         "name": SERVER_NAME,
+        "title": SERVER_TITLE,
         "version": SERVER_VERSION,
+        "websiteUrl": SERVER_WEBSITE,
       },
-      "instructions": "Donut Browser MCP server. Use tools/list to discover available browser automation tools."
+      "instructions": instructions
     });
 
-    log::info!("[mcp] New session initialized: {}", session_id);
+    log::info!("MCP session started session={}", ShortId(&session_id));
     Ok((session_id, (id, result)))
   }
 
-  pub async fn handle_request(&self, request: McpRequest) -> McpResponse {
+  pub async fn handle_request(&self, caller: McpCaller<'_>, request: McpRequest) -> McpResponse {
     let id = request.id.clone().unwrap_or(serde_json::Value::Null);
 
-    if !self.is_running() {
+    if !self.is_engine_ready() {
       return McpResponse {
         jsonrpc: "2.0".to_string(),
         id: Some(id),
@@ -2137,17 +7188,19 @@ impl McpServer {
         error: Some(McpError {
           code: -32001,
           message: "MCP server is not running".to_string(),
+          data: None,
         }),
       };
     }
 
     let result = match request.method.as_str() {
       "ping" => Ok(serde_json::json!({})),
-      "tools/list" => self.handle_tools_list().await,
-      "tools/call" => self.handle_tool_call(request.params).await,
+      "tools/list" => self.handle_tools_list(caller.toolsets).await,
+      "tools/call" => self.handle_tool_call(caller, request.params).await,
       _ => Err(McpError {
         code: -32601,
         message: format!("Method not found: {}", request.method),
+        data: None,
       }),
     };
 
@@ -2167,19 +7220,38 @@ impl McpServer {
     }
   }
 
-  async fn handle_tools_list(&self) -> Result<serde_json::Value, McpError> {
-    Ok(serde_json::json!({
-      "tools": self.get_tools()
-    }))
+  async fn handle_tools_list(
+    &self,
+    toolsets: Option<&crate::mcp_toolsets::Selection>,
+  ) -> Result<serde_json::Value, McpError> {
+    let tools: Vec<serde_json::Value> = self
+      .get_tools()
+      .into_iter()
+      .filter(|tool| toolsets.is_none_or(|selection| selection.includes_tool(&tool.name)))
+      .map(|tool| {
+        let output_schema = crate::mcp_views::output_schema_for(&tool.name);
+        let annotations = tool_annotations(&tool.name);
+        let mut value = serde_json::to_value(tool).unwrap_or_default();
+        if let Some(schema) = output_schema {
+          value["outputSchema"] = schema;
+        }
+        value["title"] = annotations["title"].clone();
+        value["annotations"] = annotations;
+        value
+      })
+      .collect();
+    Ok(serde_json::json!({ "tools": tools }))
   }
 
   async fn handle_tool_call(
     &self,
+    caller: McpCaller<'_>,
     params: Option<serde_json::Value>,
   ) -> Result<serde_json::Value, McpError> {
     let params = params.ok_or_else(|| McpError {
       code: -32602,
       message: "Missing parameters".to_string(),
+      data: None,
     })?;
 
     let tool_name = params
@@ -2188,6 +7260,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing tool name".to_string(),
+        data: None,
       })?;
 
     let arguments = params
@@ -2195,28 +7268,89 @@ impl McpServer {
       .cloned()
       .unwrap_or(serde_json::json!({}));
 
-    // Surface the call in logs so customer reports show which tools the MCP
-    // client is actually invoking (and therefore which gate any subsequent
-    // error came from). Log only the tool name and the profile_id arg —
-    // arbitrary URLs / JS / selectors can be sensitive.
+    // Log only the tool name and the profile_id arg: arbitrary URLs / JS /
+    // selectors can be sensitive.
     let profile_id = arguments
       .get("profile_id")
       .and_then(|v| v.as_str())
       .unwrap_or("<none>");
-    log::info!("[mcp] tools/call name={tool_name} profile_id={profile_id}");
 
     let started = std::time::Instant::now();
-    let result = self.dispatch_tool_call(tool_name, &arguments).await;
+    // Refused here, at the one place every tool call passes, rather than in
+    // each handler: a new path-taking tool added later inherits the rule
+    // instead of having to remember it.
+    if LOCAL_PATH_TOOLS.contains(&tool_name) || SECRET_EXPORT_TOOLS.contains(&tool_name) {
+      log::warn!("MCP tool refused: local paths or secrets tool={tool_name}");
+      return Err(McpError {
+        code: -32000,
+        message: crate::backend_error("TOOL_IS_LOCAL_ONLY"),
+        data: None,
+      });
+    }
+
+    if let Some(refused) = crate::team_roles::tool_refusal(tool_name) {
+      return Err(McpError {
+        code: -32000,
+        message: refused,
+        data: None,
+      });
+    }
+
+    let human_tool = crate::agent_console::HUMAN_TOOLS.contains(&tool_name);
+    if let Err(refusal) =
+      crate::agent_console::check_call(Self::is_passive_tool(tool_name), &arguments)
+    {
+      let error = Self::console_refusal(refusal);
+      crate::agent_console::record_call(crate::agent_console::CallRecord {
+        session_id: caller.session,
+        tool: tool_name,
+        arguments: &arguments,
+        error_code: Some(Self::error_code_of(&error)),
+        duration_ms: 0,
+      })
+      .await;
+      return Err(error);
+    }
+
+    let mut result = self
+      .dispatch_tool_call(caller, tool_name, &arguments)
+      .await
+      .map_err(|error| explain_engine_refusal(error, CLOUD_AUTH.wayfern_device_refusal()));
+    if let Err(error) = &mut result {
+      if error.message.contains("requires a paid Donut Browser plan") {
+        let profile = arguments.get("profile_id").and_then(|v| v.as_str());
+        if let Some(reason) = stale_plan_token_refusal(profile).await {
+          error.message = reason;
+        }
+      }
+    }
     let elapsed_ms = started.elapsed().as_millis();
+    if human_tool {
+      crate::agent_console::touch_session(caller.session);
+    } else {
+      crate::agent_console::record_call(crate::agent_console::CallRecord {
+        session_id: caller.session,
+        tool: tool_name,
+        arguments: &arguments,
+        error_code: result.as_ref().err().map(Self::error_code_of),
+        duration_ms: elapsed_ms as u64,
+      })
+      .await;
+    }
+    if tool_name != "get_human_updates" {
+      if let Ok(value) = result.as_mut() {
+        Self::attach_notes(value, caller.session);
+      }
+    }
     match &result {
       Ok(_) => {
-        log::info!(
-          "[mcp] tools/call name={tool_name} profile_id={profile_id} -> ok ({elapsed_ms} ms)"
+        log::debug!(
+          "MCP tool call ok tool={tool_name} profile={profile_id} elapsed_ms={elapsed_ms}"
         );
       }
       Err(e) => {
         log::warn!(
-          "[mcp] tools/call name={tool_name} profile_id={profile_id} -> error code={} msg={:?} ({elapsed_ms} ms)",
+          "MCP tool call failed tool={tool_name} profile={profile_id} code={} elapsed_ms={elapsed_ms} err={:?}",
           e.code,
           e.message
         );
@@ -2227,11 +7361,21 @@ impl McpServer {
 
   async fn dispatch_tool_call(
     &self,
+    caller: McpCaller<'_>,
     tool_name: &str,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
     match tool_name {
-      "list_profiles" => self.handle_list_profiles().await,
+      "ask_human" => self.handle_ask_human(caller, arguments).await,
+      "request_human_help" => self.handle_request_human_help(caller, arguments).await,
+      "wait_for_human" => self.handle_wait_for_human(arguments).await,
+      "get_human_updates" => {
+        Self::json_content(&crate::agent_console::human_updates(caller.session))
+      }
+      "report_progress" => Self::handle_report_progress(caller, arguments),
+      "send_feedback" => self.handle_send_feedback(caller, arguments).await,
+      "get_diagnostics" => self.handle_get_diagnostics(arguments).await,
+      "list_profiles" => self.handle_list_profiles(arguments).await,
       "get_profile" => self.handle_get_profile(arguments).await,
       "run_profile" => {
         Self::require_capability(
@@ -2286,14 +7430,70 @@ impl McpServer {
       "delete_profile" => self.handle_delete_profile(arguments).await,
       "list_tags" => self.handle_list_tags().await,
       "list_proxies" => self.handle_list_proxies().await,
+      "rotate_proxy_ip" => {
+        let proxy_id = arguments
+          .get("proxy_id")
+          .and_then(|v| v.as_str())
+          .ok_or_else(|| McpError {
+            code: -32602,
+            message: "Missing proxy_id".to_string(),
+            data: None,
+          })?;
+        let result = crate::proxy_rotation::rotate(proxy_id)
+          .await
+          .map_err(|e| McpError {
+            code: -32000,
+            message: format!("Proxy IP change failed: {e}"),
+            data: None,
+          })?;
+        Self::json_content(&result)
+      }
       "get_profile_status" => self.handle_get_profile_status(arguments).await,
       // Group management
       "list_groups" => self.handle_list_groups().await,
+      "bulk_update_profiles" => {
+        let profile_ids: Vec<String> = arguments
+          .get("profile_ids")
+          .and_then(|v| serde_json::from_value(v.clone()).ok())
+          .ok_or_else(|| McpError {
+            code: -32602,
+            message: "Missing profile_ids".to_string(),
+            data: None,
+          })?;
+        let patch: crate::profile::patch::ProfilePatch = arguments
+          .get("patch")
+          .cloned()
+          .map(serde_json::from_value)
+          .transpose()
+          .map_err(|e| McpError {
+            code: -32602,
+            message: format!("Invalid patch: {e}"),
+            data: None,
+          })?
+          .unwrap_or_default();
+        let changed = ProfileManager::instance()
+          .apply_patch(&profile_ids, patch)
+          .map_err(|e| McpError {
+            code: -32000,
+            message: format!("Bulk edit failed: {e}"),
+            data: None,
+          })?;
+        Ok(serde_json::json!({
+          "content": [{
+            "type": "text",
+            "text": format!("{changed} of {} profiles changed", profile_ids.len())
+          }]
+        }))
+      }
+      "list_profile_statuses" => Self::json_content(&crate::profile_statuses::list()),
+      "list_profile_templates" => Self::json_content(&crate::profile_templates::list()),
+      "create_profiles_from_template" => self.handle_create_profiles_from_template(arguments).await,
       "get_group" => self.handle_get_group(arguments).await,
       "create_group" => self.handle_create_group(arguments).await,
       "update_group" => self.handle_update_group(arguments).await,
       "delete_group" => self.handle_delete_group(arguments).await,
       "assign_profiles_to_group" => self.handle_assign_profiles_to_group(arguments).await,
+      "distribute_proxies" => self.handle_distribute_proxies(arguments).await,
       // Full proxy management
       "get_proxy" => self.handle_get_proxy(arguments).await,
       "create_proxy" => self.handle_create_proxy(arguments).await,
@@ -2379,6 +7579,78 @@ impl McpServer {
         .await?;
         self.handle_screenshot(arguments).await
       }
+      "run_actions" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_run_actions(caller, arguments).await
+      }
+      "list_tabs" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_list_tabs(arguments).await
+      }
+      "open_tab" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_open_tab(arguments).await
+      }
+      "switch_tab" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_switch_tab(arguments).await
+      }
+      "close_tab" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_close_tab(arguments).await
+      }
+      "scroll" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_scroll(arguments).await
+      }
+      "press_key" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_press_key(arguments).await
+      }
+      "go_back" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_go_back(arguments).await
+      }
+      "wait_for" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_wait_for(arguments).await
+      }
       "evaluate_javascript" => {
         Self::require_capability(
           "Browser automation",
@@ -2425,7 +7697,9 @@ impl McpServer {
           CLOUD_AUTH.can_use_browser_automation().await,
         )
         .await?;
-        self.handle_get_interactive_elements(arguments).await
+        self
+          .handle_get_interactive_elements(caller, arguments)
+          .await
       }
       "click_by_index" => {
         Self::require_capability(
@@ -2433,7 +7707,7 @@ impl McpServer {
           CLOUD_AUTH.can_use_browser_automation().await,
         )
         .await?;
-        self.handle_click_by_index(arguments).await
+        self.handle_click_by_index(caller, arguments).await
       }
       "type_by_index" => {
         Self::require_capability(
@@ -2441,7 +7715,108 @@ impl McpServer {
           CLOUD_AUTH.can_use_browser_automation().await,
         )
         .await?;
-        self.handle_type_by_index(arguments).await
+        self.handle_type_by_index(caller, arguments).await
+      }
+      // The agent surface: perception, locators, extraction, the picker and
+      // humanized input. Gated exactly like click_element, because every one
+      // of them drives, or reads, the same browser.
+      "perceive_page" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_perceive_page(arguments).await
+      }
+      "resolve_locator" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_resolve_locator(arguments).await
+      }
+      "click_locator" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_click_locator(arguments).await
+      }
+      "press_and_hold" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_press_and_hold(caller, arguments).await
+      }
+      "type_locator" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_type_locator(arguments).await
+      }
+      "select_option" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_select_option(caller, arguments).await
+      }
+      "file_upload" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_file_upload(caller, arguments).await
+      }
+      "start_network_capture" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_start_network_capture(arguments).await
+      }
+      // Stopping only deletes; it works without a plan, like stop_sync_session.
+      "stop_network_capture" => Self::handle_stop_network_capture(arguments),
+      "list_network_requests" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        Self::handle_list_network_requests(arguments)
+      }
+      "get_network_request" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        Self::handle_get_network_request(arguments)
+      }
+      "extract_structured" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_extract_structured(arguments).await
+      }
+      "pick_element" => {
+        Self::require_capability(
+          "Browser automation",
+          CLOUD_AUTH.can_use_browser_automation().await,
+        )
+        .await?;
+        self.handle_pick_element(arguments).await
       }
       // Leasing a host is the most expensive thing this server can do, so it
       // is gated exactly like the local launch it replaces.
@@ -2485,29 +7860,38 @@ impl McpServer {
       _ => Err(McpError {
         code: -32602,
         message: format!("Unknown tool: {tool_name}"),
+        data: None,
       }),
     }
   }
 
-  async fn handle_list_profiles(&self) -> Result<serde_json::Value, McpError> {
+  async fn handle_list_profiles(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let query =
+      crate::mcp_views::ProfileQuery::from_arguments(arguments).map_err(|message| McpError {
+        code: -32602,
+        message,
+        data: None,
+      })?;
     let profiles = ProfileManager::instance()
       .list_profiles()
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to list profiles: {e}"),
+        data: None,
       })?;
-
-    let filtered: Vec<&BrowserProfile> = profiles
-      .iter()
+    let filtered: Vec<BrowserProfile> = profiles
+      .into_iter()
       .filter(|profile| is_mcp_browser(&profile.browser))
       .collect();
 
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": serde_json::to_string_pretty(&filtered).unwrap_or_default()
-      }]
-    }))
+    Self::json_content(&crate::mcp_views::list_profiles(
+      &filtered,
+      &Self::profile_names(),
+      &query,
+    ))
   }
 
   async fn handle_get_profile(
@@ -2520,6 +7904,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
 
     let profiles = ProfileManager::instance()
@@ -2527,6 +7912,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to list profiles: {e}"),
+        data: None,
       })?;
 
     let profile = profiles
@@ -2535,21 +7921,21 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32000,
         message: format!("Profile not found: {profile_id}"),
+        data: None,
       })?;
 
     if !is_mcp_browser(&profile.browser) {
       return Err(McpError {
         code: -32000,
         message: format!("MCP does not support browser '{}'", profile.browser),
+        data: None,
       });
     }
 
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": serde_json::to_string_pretty(&profile).unwrap_or_default()
-      }]
-    }))
+    Self::json_content(&crate::mcp_views::profile_detail(
+      profile,
+      &Self::profile_names(),
+    ))
   }
 
   async fn handle_run_profile(
@@ -2569,9 +7955,13 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
 
     let url = arguments.get("url").and_then(|v| v.as_str());
+    if let Some(url) = url {
+      validate_navigable_url(url)?;
+    }
     let headless = arguments
       .get("headless")
       .and_then(|v| v.as_bool())
@@ -2583,6 +7973,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to list profiles: {e}"),
+        data: None,
       })?;
 
     let profile = profiles
@@ -2591,14 +7982,17 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32000,
         message: format!("Profile not found: {profile_id}"),
+        data: None,
       })?;
 
     if !is_mcp_browser(&profile.browser) {
       return Err(McpError {
         code: -32000,
-        message: format!("MCP does not support browser '{}'", profile.browser),
+        message: "MCP only supports Wayfern profiles".to_string(),
+        data: None,
       });
     }
+
     if profile.browser == "wayfern"
       && !crate::wayfern_terms::WayfernTermsManager::instance().is_terms_accepted()
     {
@@ -2606,7 +8000,31 @@ impl McpServer {
         code: -32000,
         message: "Wayfern Terms and Conditions must be accepted before launching Wayfern"
           .to_string(),
+        data: None,
       });
+    }
+
+    // A browser the person already opened is taken over as it is, never
+    // restarted: the tools reach it on its DevTools port.
+    if let Some(port) = crate::browser_tabs::local_port(profile).await {
+      if let Some(url) = url {
+        crate::browser_tabs::open(profile, url)
+          .await
+          .map_err(tab_error)?;
+      }
+      log::info!(
+        "Running browser taken over profile={} cdp_port={port}",
+        profile.id
+      );
+      return Ok(serde_json::json!({
+        "content": [{
+          "type": "text",
+          "text": format!(
+            "Browser profile '{}' was already running; the tools now drive it. Use list_tabs to see its tabs.",
+            profile.name
+          )
+        }]
+      }));
     }
 
     // Team lock check
@@ -2615,14 +8033,31 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: e,
+        data: None,
       })?;
 
     // Get app handle to launch
-    let inner = self.inner.lock().await;
-    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
-      code: -32000,
-      message: "MCP server not properly initialized".to_string(),
-    })?;
+    // The guard is dropped before the await below. Binding `app_handle` as a
+    // REFERENCE out of `inner` keeps the engine's single global mutex locked
+    // for the whole operation — and `handle_message` needs that same mutex to
+    // validate the session on every request, and to serve `initialize`. So a
+    // launch that takes twenty seconds froze every other MCP message on this
+    // desktop for twenty seconds: the agent's own follow-up calls, a second
+    // agent, the website console, and even a brand-new client trying to open a
+    // session. The batch handlers already clone-and-drop for exactly this
+    // reason; the single-profile ones did not.
+    let app_handle = {
+      let inner = self.inner.lock().await;
+      inner
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| McpError {
+          code: -32000,
+          message: "MCP server not properly initialized".to_string(),
+          data: None,
+        })?
+        .clone()
+    };
 
     // Launch a fresh instance, honoring the requested headless mode. The CDP
     // port is self-allocated and discovered later via get_cdp_port_for_profile.
@@ -2636,6 +8071,7 @@ impl McpServer {
     .map_err(|e| McpError {
       code: -32000,
       message: format!("Failed to launch browser: {e}"),
+      data: None,
     })?;
 
     Ok(serde_json::json!({
@@ -2656,6 +8092,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
     let password = arguments
       .get("password")
@@ -2663,6 +8100,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing password".to_string(),
+        data: None,
       })?;
 
     crate::profile::password::unlock_profile(profile_id.to_string(), password.to_string())
@@ -2670,6 +8108,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to unlock profile: {e}"),
+        data: None,
       })?;
 
     Ok(serde_json::json!({
@@ -2697,6 +8136,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
 
     // Get the profile
@@ -2705,6 +8145,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to list profiles: {e}"),
+        data: None,
       })?;
 
     let profile = profiles
@@ -2713,21 +8154,39 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32000,
         message: format!("Profile not found: {profile_id}"),
+        data: None,
       })?;
 
     if !is_mcp_browser(&profile.browser) {
       return Err(McpError {
         code: -32000,
         message: format!("MCP does not support browser '{}'", profile.browser),
+        data: None,
       });
     }
 
     // Get app handle to kill
-    let inner = self.inner.lock().await;
-    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
-      code: -32000,
-      message: "MCP server not properly initialized".to_string(),
-    })?;
+    // The guard is dropped before the await below. Binding `app_handle` as a
+    // REFERENCE out of `inner` keeps the engine's single global mutex locked
+    // for the whole operation — and `handle_message` needs that same mutex to
+    // validate the session on every request, and to serve `initialize`. So a
+    // launch that takes twenty seconds froze every other MCP message on this
+    // desktop for twenty seconds: the agent's own follow-up calls, a second
+    // agent, the website console, and even a brand-new client trying to open a
+    // session. The batch handlers already clone-and-drop for exactly this
+    // reason; the single-profile ones did not.
+    let app_handle = {
+      let inner = self.inner.lock().await;
+      inner
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| McpError {
+          code: -32000,
+          message: "MCP server not properly initialized".to_string(),
+          data: None,
+        })?
+        .clone()
+    };
 
     // Kill the browser
     crate::browser_runner::BrowserRunner::instance()
@@ -2736,6 +8195,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to kill browser: {e}"),
+        data: None,
       })?;
 
     crate::team_lock::release_team_lock_if_needed(profile).await;
@@ -2769,9 +8229,13 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_ids array".to_string(),
+        data: None,
       })?;
 
     let url = arguments.get("url").and_then(|v| v.as_str());
+    if let Some(url) = url {
+      validate_navigable_url(url)?;
+    }
     let headless = arguments
       .get("headless")
       .and_then(|v| v.as_bool())
@@ -2782,6 +8246,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to list profiles: {e}"),
+        data: None,
       })?;
 
     // Clone the app handle and release the lock before the launch loop so we
@@ -2794,6 +8259,7 @@ impl McpServer {
         .ok_or_else(|| McpError {
           code: -32000,
           message: "MCP server not properly initialized".to_string(),
+          data: None,
         })?
         .clone()
     };
@@ -2869,6 +8335,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_ids array".to_string(),
+        data: None,
       })?;
 
     let profiles = ProfileManager::instance()
@@ -2876,6 +8343,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to list profiles: {e}"),
+        data: None,
       })?;
 
     let app_handle = {
@@ -2886,6 +8354,7 @@ impl McpServer {
         .ok_or_else(|| McpError {
           code: -32000,
           message: "MCP server not properly initialized".to_string(),
+          data: None,
         })?
         .clone()
     };
@@ -2928,6 +8397,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing name".to_string(),
+        data: None,
       })?;
     let browser = arguments
       .get("browser")
@@ -2938,6 +8408,7 @@ impl McpServer {
       return Err(McpError {
         code: -32602,
         message: "browser must be 'fingerprint_chromium' or 'wayfern'".to_string(),
+        data: None,
       });
     }
 
@@ -2964,21 +8435,78 @@ impl McpServer {
 
     // Pick the latest downloaded version for this browser
     let registry = crate::downloaded_browsers_registry::DownloadedBrowsersRegistry::instance();
-    let versions = registry.get_downloaded_versions(browser);
+    let mut versions = registry.get_downloaded_versions(browser);
+    versions.sort_by(|a, b| crate::api_client::compare_versions(b, a));
     let version = versions.first().ok_or_else(|| McpError {
       code: -32000,
       message: format!("No downloaded version found for {browser}. Download it first."),
+      data: None,
     })?;
 
-    let inner = self.inner.lock().await;
-    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
-      code: -32000,
-      message: "MCP server not properly initialized".to_string(),
-    })?;
+    // The guard is dropped before the await below. Binding `app_handle` as a
+    // REFERENCE out of `inner` keeps the engine's single global mutex locked
+    // for the whole operation — and `handle_message` needs that same mutex to
+    // validate the session on every request, and to serve `initialize`. So a
+    // launch that takes twenty seconds froze every other MCP message on this
+    // desktop for twenty seconds: the agent's own follow-up calls, a second
+    // agent, the website console, and even a brand-new client trying to open a
+    // session. The batch handlers already clone-and-drop for exactly this
+    // reason; the single-profile ones did not.
+    let app_handle = {
+      let inner = self.inner.lock().await;
+      inner
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| McpError {
+          code: -32000,
+          message: "MCP server not properly initialized".to_string(),
+          data: None,
+        })?
+        .clone()
+    };
+
+    if let Some(status_id) = arguments
+      .get("status_id")
+      .and_then(|v| v.as_str())
+      .filter(|id| !id.is_empty() && !crate::profile_statuses::exists(id))
+    {
+      return Err(McpError {
+        code: -32602,
+        message: format!("Unknown status id: {status_id}"),
+        data: None,
+      });
+    }
+    let start_urls = arguments
+      .get("start_urls")
+      .and_then(|v| v.as_array())
+      .map(|urls| {
+        crate::profile::manager::checked_start_urls(
+          urls
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        )
+      })
+      .transpose()
+      .map_err(|e| McpError {
+        code: -32602,
+        message: format!("Invalid start pages: {e}"),
+        data: None,
+      })?;
+
+    let temporary = arguments
+      .get("temporary")
+      .and_then(serde_json::Value::as_bool)
+      .unwrap_or(false);
+    let ephemeral = temporary
+      || arguments
+        .get("ephemeral")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
 
     let mut profile = ProfileManager::instance()
       .create_profile_with_group(
-        app_handle,
+        &app_handle,
         name,
         browser,
         version,
@@ -2987,33 +8515,88 @@ impl McpServer {
         None,
         None,
         group_id,
-        false,
+        ephemeral,
         None,
+        arguments
+          .get("dns_server")
+          .and_then(|v| v.as_str())
+          .map(str::to_string),
         launch_hook,
       )
       .await
-      .map_err(|e| McpError {
-        code: -32000,
-        message: format!("Failed to create profile: {e}"),
+      .map_err(|e| {
+        let message = e.to_string();
+        if message.contains("PROFILE_GENERATION_LIMIT_REACHED") {
+          let _ = crate::events::emit_empty("profile-generation-limit-reached");
+        }
+        log::warn!("MCP profile create failed err=\"{message}\"");
+        McpError {
+          code: -32000,
+          message: format!("Failed to create profile: {message}"),
+          data: None,
+        }
       })?;
 
-    if let Some(tags) = tags {
-      let _ =
-        ProfileManager::instance().update_profile_tags(app_handle, &profile.name, tags.clone());
-      profile.tags = tags;
-      if let Ok(profiles) = ProfileManager::instance().list_profiles() {
-        let _ = crate::tag_manager::TAG_MANAGER
-          .lock()
-          .map(|manager| manager.rebuild_from_profiles(&profiles));
+    if temporary {
+      profile = ProfileManager::instance()
+        .mark_profile_temporary(&profile.id.to_string())
+        .map_err(|e| McpError {
+          code: -32000,
+          message: format!("Profile created but could not be marked temporary: {e}"),
+          data: None,
+        })?;
+    }
+
+    let profile_id = profile.id.to_string();
+    let mut not_applied: Vec<(&str, String)> = Vec::new();
+
+    if let Some(start_urls) = start_urls.filter(|urls| !urls.is_empty()) {
+      if let Err(e) = ProfileManager::instance().update_profile_start_urls(&profile_id, start_urls)
+      {
+        not_applied.push(("start_urls", e.to_string()));
       }
     }
 
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": format!("Profile '{}' created (id: {})", profile.name, profile.id)
-      }]
-    }))
+    if let Some(status_id) = arguments
+      .get("status_id")
+      .and_then(|v| v.as_str())
+      .filter(|id| !id.is_empty())
+    {
+      if let Err(e) = ProfileManager::instance().set_profiles_status(
+        std::slice::from_ref(&profile_id),
+        Some(status_id.to_string()),
+      ) {
+        not_applied.push(("status_id", e.to_string()));
+      }
+    }
+
+    if let Some(tags) = tags {
+      match ProfileManager::instance().update_profile_tags(&app_handle, &profile_id, tags) {
+        Ok(updated) => {
+          profile.tags = updated.tags;
+          if let Ok(profiles) = ProfileManager::instance().list_profiles() {
+            let _ = crate::tag_manager::TAG_MANAGER
+              .lock()
+              .map(|manager| manager.rebuild_from_profiles(&profiles));
+          }
+        }
+        Err(e) => not_applied.push(("tags", e.to_string())),
+      }
+    }
+
+    if !not_applied.is_empty() {
+      let fields: Vec<&str> = not_applied.iter().map(|(field, _)| *field).collect();
+      log::warn!(
+        "MCP profile created with settings not applied profile={profile_id} fields={}",
+        fields.join(",")
+      );
+    }
+
+    Ok(created_profile_result(
+      &profile.name,
+      &profile_id,
+      &not_applied,
+    ))
   }
 
   async fn handle_update_profile(
@@ -3026,33 +8609,54 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
-    let inner = self.inner.lock().await;
-    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
-      code: -32000,
-      message: "MCP server not properly initialized".to_string(),
-    })?;
+
+    // The guard is dropped before the await below. Binding `app_handle` as a
+    // REFERENCE out of `inner` keeps the engine's single global mutex locked
+    // for the whole operation — and `handle_message` needs that same mutex to
+    // validate the session on every request, and to serve `initialize`. So a
+    // launch that takes twenty seconds froze every other MCP message on this
+    // desktop for twenty seconds: the agent's own follow-up calls, a second
+    // agent, the website console, and even a brand-new client trying to open a
+    // session. The batch handlers already clone-and-drop for exactly this
+    // reason; the single-profile ones did not.
+    let app_handle = {
+      let inner = self.inner.lock().await;
+      inner
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| McpError {
+          code: -32000,
+          message: "MCP server not properly initialized".to_string(),
+          data: None,
+        })?
+        .clone()
+    };
     let pm = ProfileManager::instance();
 
-    if let Some(new_name) = arguments.get("name").and_then(|v| v.as_str()) {
-      pm.rename_profile(app_handle, profile_id, new_name)
+    // Agents often send every optional field; an empty name means "unchanged".
+    if let Some(new_name) = arguments
+      .get("name")
+      .and_then(|v| v.as_str())
+      .filter(|name| !name.trim().is_empty())
+    {
+      pm.rename_profile(&app_handle, profile_id, new_name)
         .map_err(|e| McpError {
           code: -32000,
           message: format!("Failed to rename profile: {e}"),
+          data: None,
         })?;
     }
 
     if let Some(proxy_id) = arguments.get("proxy_id").and_then(|v| v.as_str()) {
-      let pid = if proxy_id.is_empty() {
-        None
-      } else {
-        Some(proxy_id.to_string())
-      };
-      pm.update_profile_proxy(app_handle.clone(), profile_id, pid)
+      // An empty id detaches the proxy; the manager normalizes it.
+      pm.update_profile_proxy(app_handle.clone(), profile_id, Some(proxy_id.to_string()))
         .await
         .map_err(|e| McpError {
           code: -32000,
           message: format!("Failed to update proxy: {e}"),
+          data: None,
         })?;
     }
 
@@ -3062,10 +8666,11 @@ impl McpServer {
       } else {
         Some(launch_hook.to_string())
       };
-      pm.update_profile_launch_hook(app_handle, profile_id, normalized)
+      pm.update_profile_launch_hook(&app_handle, profile_id, normalized)
         .map_err(|e| McpError {
           code: -32000,
           message: format!("Failed to update launch hook: {e}"),
+          data: None,
         })?;
     }
 
@@ -3075,10 +8680,11 @@ impl McpServer {
       } else {
         Some(group_id.to_string())
       };
-      pm.assign_profiles_to_group(app_handle, vec![profile_id.to_string()], gid)
+      pm.assign_profiles_to_group(&app_handle, vec![profile_id.to_string()], gid)
         .map_err(|e| McpError {
           code: -32000,
           message: format!("Failed to update group: {e}"),
+          data: None,
         })?;
     }
 
@@ -3087,10 +8693,11 @@ impl McpServer {
         .iter()
         .filter_map(|item| item.as_str().map(|s| s.to_string()))
         .collect();
-      pm.update_profile_tags(app_handle, profile_id, tag_list)
+      pm.update_profile_tags(&app_handle, profile_id, tag_list)
         .map_err(|e| McpError {
           code: -32000,
           message: format!("Failed to update tags: {e}"),
+          data: None,
         })?;
       if let Ok(profiles) = pm.list_profiles() {
         let _ = crate::tag_manager::TAG_MANAGER
@@ -3109,6 +8716,7 @@ impl McpServer {
         .map_err(|e| McpError {
           code: -32000,
           message: format!("Failed to update extension group: {e}"),
+          data: None,
         })?;
     }
 
@@ -3120,18 +8728,62 @@ impl McpServer {
         .iter()
         .filter_map(|item| item.as_str().map(|s| s.to_string()))
         .collect();
-      pm.update_profile_proxy_bypass_rules(app_handle, profile_id, rule_list)
+      pm.update_profile_proxy_bypass_rules(&app_handle, profile_id, rule_list)
         .map_err(|e| McpError {
           code: -32000,
           message: format!("Failed to update proxy bypass rules: {e}"),
+          data: None,
         })?;
     }
 
     if let Some(clear_on_close) = arguments.get("clear_on_close").and_then(|v| v.as_bool()) {
-      pm.update_profile_clear_on_close(app_handle, profile_id, clear_on_close)
+      pm.update_profile_clear_on_close(&app_handle, profile_id, clear_on_close)
         .map_err(|e| McpError {
           code: -32000,
           message: format!("Failed to update clear-on-close: {e}"),
+          data: None,
+        })?;
+    }
+
+    if let Some(urls) = arguments.get("start_urls").and_then(|v| v.as_array()) {
+      let urls = urls
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+      pm.update_profile_start_urls(profile_id, urls)
+        .map_err(|e| McpError {
+          code: -32602,
+          message: format!("Failed to update start pages: {e}"),
+          data: None,
+        })?;
+    }
+
+    if let Some(status_id) = arguments.get("status_id").and_then(|v| v.as_str()) {
+      let status_id = Some(status_id.to_string()).filter(|id| !id.is_empty());
+      if status_id
+        .as_deref()
+        .is_some_and(|id| !crate::profile_statuses::exists(id))
+      {
+        return Err(McpError {
+          code: -32602,
+          message: format!("Unknown status id: {}", status_id.unwrap_or_default()),
+          data: None,
+        });
+      }
+      pm.set_profiles_status(&[profile_id.to_string()], status_id)
+        .map_err(|e| McpError {
+          code: -32000,
+          message: format!("Failed to update status: {e}"),
+          data: None,
+        })?;
+    }
+
+    if let Some(dns_server) = arguments.get("dns_server").and_then(|v| v.as_str()) {
+      pm.update_profile_dns_server(profile_id, Some(dns_server.to_string()))
+        .map_err(|e| McpError {
+          code: -32602,
+          message: format!("Failed to update DNS server: {e}"),
+          data: None,
         })?;
     }
 
@@ -3153,18 +8805,37 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
-    let inner = self.inner.lock().await;
-    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
-      code: -32000,
-      message: "MCP server not properly initialized".to_string(),
-    })?;
+
+    // The guard is dropped before the await below. Binding `app_handle` as a
+    // REFERENCE out of `inner` keeps the engine's single global mutex locked
+    // for the whole operation — and `handle_message` needs that same mutex to
+    // validate the session on every request, and to serve `initialize`. So a
+    // launch that takes twenty seconds froze every other MCP message on this
+    // desktop for twenty seconds: the agent's own follow-up calls, a second
+    // agent, the website console, and even a brand-new client trying to open a
+    // session. The batch handlers already clone-and-drop for exactly this
+    // reason; the single-profile ones did not.
+    let app_handle = {
+      let inner = self.inner.lock().await;
+      inner
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| McpError {
+          code: -32000,
+          message: "MCP server not properly initialized".to_string(),
+          data: None,
+        })?
+        .clone()
+    };
 
     ProfileManager::instance()
-      .delete_profile(app_handle, profile_id)
+      .delete_profile(&app_handle, profile_id)
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to delete profile: {e}"),
+        data: None,
       })?;
 
     Ok(serde_json::json!({
@@ -3185,37 +8856,49 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
     let password = arguments.get("password").and_then(|value| value.as_str());
 
-    let inner = self.inner.lock().await;
-    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
-      code: -32000,
-      message: "MCP server not properly initialized".to_string(),
-    })?;
+    let app_handle = {
+      let inner = self.inner.lock().await;
+      inner
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| McpError {
+          code: -32000,
+          message: "MCP server not properly initialized".to_string(),
+          data: None,
+        })?
+        .clone()
+    };
     let profile = ProfileManager::instance()
-      .migrate_profile_to_fingerprint_chromium(app_handle.clone(), profile_id)
+      .migrate_profile_to_fingerprint_chromium(app_handle, profile_id)
       .await
       .map_err(|error| McpError {
         code: -32000,
         message: format!("Failed to migrate profile: {error}"),
+        data: None,
       })?;
 
     let data_migrated = if profile.password_protected {
       let password = password.ok_or_else(|| McpError {
         code: -32602,
         message: "Password is required to migrate this profile's browser data".to_string(),
+        data: None,
       })?;
       crate::profile::password::unlock_profile(profile_id.to_string(), password.to_string())
         .await
         .map_err(|error| McpError {
           code: -32000,
           message: format!("Failed to unlock profile for migration: {error}"),
+          data: None,
         })?;
       let profile_path =
         crate::profile::password::prepare_for_launch(&profile).map_err(|error| McpError {
           code: -32000,
           message: format!("Failed to prepare profile data for migration: {error}"),
+          data: None,
         })?;
       match crate::fingerprint_chromium::migrate_wayfern_user_data(&profile_path) {
         Ok(migrated) => {
@@ -3224,6 +8907,7 @@ impl McpServer {
             .ok_or_else(|| McpError {
               code: -32000,
               message: "Failed to re-encrypt migrated profile data".to_string(),
+              data: None,
             })?;
           migrated
         }
@@ -3232,6 +8916,7 @@ impl McpServer {
           return Err(McpError {
             code: -32000,
             message: format!("Failed to migrate profile browser data: {error}"),
+            data: None,
           });
         }
       }
@@ -3242,6 +8927,7 @@ impl McpServer {
         McpError {
           code: -32000,
           message: format!("Failed to migrate profile browser data: {error}"),
+          data: None,
         }
       })?
     };
@@ -3263,30 +8949,30 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to access tag manager: {e}"),
+        data: None,
       })?
       .get_all_tags()
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to get tags: {e}"),
+        data: None,
       })?;
 
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": serde_json::to_string_pretty(&tags).unwrap_or_default()
-      }]
-    }))
+    Self::json_content(&tags)
   }
 
   async fn handle_list_proxies(&self) -> Result<serde_json::Value, McpError> {
-    let proxies = PROXY_MANAGER.get_stored_proxies();
+    let mut proxies =
+      serde_json::to_value(PROXY_MANAGER.get_stored_proxies()).map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to serialize proxies: {e}"),
+        data: None,
+      })?;
+    for proxy in proxies.as_array_mut().into_iter().flatten() {
+      redact_proxy_secrets(proxy);
+    }
 
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": serde_json::to_string_pretty(&proxies).unwrap_or_default()
-      }]
-    }))
+    Self::json_content(&proxies)
   }
 
   async fn handle_get_profile_status(
@@ -3299,6 +8985,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
 
     // Get the profile
@@ -3307,6 +8994,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to list profiles: {e}"),
+        data: None,
       })?;
 
     let profile = profiles
@@ -3315,12 +9003,14 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32000,
         message: format!("Profile not found: {profile_id}"),
+        data: None,
       })?;
 
     if !is_mcp_browser(&profile.browser) {
       return Err(McpError {
         code: -32000,
         message: format!("MCP does not support browser '{}'", profile.browser),
+        data: None,
       });
     }
 
@@ -3378,18 +9068,66 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to lock group manager: {e}"),
+        data: None,
       })?
       .get_all_groups()
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to list groups: {e}"),
+        data: None,
       })?;
 
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": serde_json::to_string_pretty(&groups).unwrap_or_default()
-      }]
+    Self::json_content(&groups)
+  }
+
+  async fn handle_create_profiles_from_template(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let invalid = |message: &str| McpError {
+      code: -32602,
+      message: message.to_string(),
+      data: None,
+    };
+    let template_id = arguments
+      .get("template_id")
+      .and_then(|v| v.as_str())
+      .ok_or_else(|| invalid("Missing template_id"))?;
+    let count = arguments
+      .get("count")
+      .and_then(serde_json::Value::as_u64)
+      .and_then(|count| u32::try_from(count).ok())
+      .ok_or_else(|| invalid("count must be a whole number from 1 to 100"))?;
+    let name = arguments.get("name").and_then(|v| v.as_str());
+    // Cloned out of the lock before the long await, as in create_profile.
+    let app_handle = {
+      let inner = self.inner.lock().await;
+      inner
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| McpError {
+          code: -32000,
+          message: "MCP server not properly initialized".to_string(),
+          data: None,
+        })?
+        .clone()
+    };
+    let result =
+      crate::profile_templates::create_from_template(&app_handle, template_id, name, count)
+        .await
+        .map_err(|e| McpError {
+          code: -32000,
+          message: format!("Creating profiles failed: {e}"),
+          data: None,
+        })?;
+    let profiles: Vec<serde_json::Value> = result
+      .created
+      .iter()
+      .map(|profile| serde_json::json!({ "id": profile.id, "name": profile.name }))
+      .collect();
+    Self::json_content(&serde_json::json!({
+      "created": profiles,
+      "stopped_early": result.error,
     }))
   }
 
@@ -3403,6 +9141,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing group_id".to_string(),
+        data: None,
       })?;
 
     let groups = GROUP_MANAGER
@@ -3410,11 +9149,13 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to lock group manager: {e}"),
+        data: None,
       })?
       .get_all_groups()
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to list groups: {e}"),
+        data: None,
       })?;
 
     let group = groups
@@ -3423,14 +9164,10 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32000,
         message: format!("Group not found: {group_id}"),
+        data: None,
       })?;
 
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": serde_json::to_string_pretty(&group).unwrap_or_default()
-      }]
-    }))
+    Self::json_content(&group)
   }
 
   async fn handle_create_group(
@@ -3443,24 +9180,43 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing name".to_string(),
+        data: None,
       })?;
 
-    let inner = self.inner.lock().await;
-    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
-      code: -32000,
-      message: "MCP server not properly initialized".to_string(),
-    })?;
+    // The guard is dropped before the await below. Binding `app_handle` as a
+    // REFERENCE out of `inner` keeps the engine's single global mutex locked
+    // for the whole operation — and `handle_message` needs that same mutex to
+    // validate the session on every request, and to serve `initialize`. So a
+    // launch that takes twenty seconds froze every other MCP message on this
+    // desktop for twenty seconds: the agent's own follow-up calls, a second
+    // agent, the website console, and even a brand-new client trying to open a
+    // session. The batch handlers already clone-and-drop for exactly this
+    // reason; the single-profile ones did not.
+    let app_handle = {
+      let inner = self.inner.lock().await;
+      inner
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| McpError {
+          code: -32000,
+          message: "MCP server not properly initialized".to_string(),
+          data: None,
+        })?
+        .clone()
+    };
 
     let group = GROUP_MANAGER
       .lock()
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to lock group manager: {e}"),
+        data: None,
       })?
-      .create_group(app_handle, name.to_string())
+      .create_group(&app_handle, name.to_string())
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to create group: {e}"),
+        data: None,
       })?;
 
     Ok(serde_json::json!({
@@ -3481,6 +9237,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing group_id".to_string(),
+        data: None,
       })?;
 
     let name = arguments
@@ -3489,24 +9246,43 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing name".to_string(),
+        data: None,
       })?;
 
-    let inner = self.inner.lock().await;
-    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
-      code: -32000,
-      message: "MCP server not properly initialized".to_string(),
-    })?;
+    // The guard is dropped before the await below. Binding `app_handle` as a
+    // REFERENCE out of `inner` keeps the engine's single global mutex locked
+    // for the whole operation — and `handle_message` needs that same mutex to
+    // validate the session on every request, and to serve `initialize`. So a
+    // launch that takes twenty seconds froze every other MCP message on this
+    // desktop for twenty seconds: the agent's own follow-up calls, a second
+    // agent, the website console, and even a brand-new client trying to open a
+    // session. The batch handlers already clone-and-drop for exactly this
+    // reason; the single-profile ones did not.
+    let app_handle = {
+      let inner = self.inner.lock().await;
+      inner
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| McpError {
+          code: -32000,
+          message: "MCP server not properly initialized".to_string(),
+          data: None,
+        })?
+        .clone()
+    };
 
     let group = GROUP_MANAGER
       .lock()
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to lock group manager: {e}"),
+        data: None,
       })?
-      .update_group(app_handle, group_id.to_string(), name.to_string())
+      .update_group(&app_handle, group_id.to_string(), name.to_string())
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to update group: {e}"),
+        data: None,
       })?;
 
     Ok(serde_json::json!({
@@ -3527,24 +9303,43 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing group_id".to_string(),
+        data: None,
       })?;
 
-    let inner = self.inner.lock().await;
-    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
-      code: -32000,
-      message: "MCP server not properly initialized".to_string(),
-    })?;
+    // The guard is dropped before the await below. Binding `app_handle` as a
+    // REFERENCE out of `inner` keeps the engine's single global mutex locked
+    // for the whole operation — and `handle_message` needs that same mutex to
+    // validate the session on every request, and to serve `initialize`. So a
+    // launch that takes twenty seconds froze every other MCP message on this
+    // desktop for twenty seconds: the agent's own follow-up calls, a second
+    // agent, the website console, and even a brand-new client trying to open a
+    // session. The batch handlers already clone-and-drop for exactly this
+    // reason; the single-profile ones did not.
+    let app_handle = {
+      let inner = self.inner.lock().await;
+      inner
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| McpError {
+          code: -32000,
+          message: "MCP server not properly initialized".to_string(),
+          data: None,
+        })?
+        .clone()
+    };
 
     GROUP_MANAGER
       .lock()
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to lock group manager: {e}"),
+        data: None,
       })?
-      .delete_group(app_handle, group_id.to_string())
+      .delete_group(&app_handle, group_id.to_string())
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to delete group: {e}"),
+        data: None,
       })?;
 
     Ok(serde_json::json!({
@@ -3565,6 +9360,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_ids".to_string(),
+        data: None,
       })?
       .iter()
       .filter_map(|v| v.as_str().map(|s| s.to_string()))
@@ -3575,17 +9371,34 @@ impl McpServer {
       .and_then(|v| v.as_str())
       .map(|s| s.to_string());
 
-    let inner = self.inner.lock().await;
-    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
-      code: -32000,
-      message: "MCP server not properly initialized".to_string(),
-    })?;
+    // The guard is dropped before the await below. Binding `app_handle` as a
+    // REFERENCE out of `inner` keeps the engine's single global mutex locked
+    // for the whole operation — and `handle_message` needs that same mutex to
+    // validate the session on every request, and to serve `initialize`. So a
+    // launch that takes twenty seconds froze every other MCP message on this
+    // desktop for twenty seconds: the agent's own follow-up calls, a second
+    // agent, the website console, and even a brand-new client trying to open a
+    // session. The batch handlers already clone-and-drop for exactly this
+    // reason; the single-profile ones did not.
+    let app_handle = {
+      let inner = self.inner.lock().await;
+      inner
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| McpError {
+          code: -32000,
+          message: "MCP server not properly initialized".to_string(),
+          data: None,
+        })?
+        .clone()
+    };
 
     ProfileManager::instance()
-      .assign_profiles_to_group(app_handle, profile_ids.clone(), group_id.clone())
+      .assign_profiles_to_group(&app_handle, profile_ids.clone(), group_id.clone())
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to assign profiles to group: {e}"),
+        data: None,
       })?;
 
     let group_name = group_id.as_deref().unwrap_or("default");
@@ -3593,6 +9406,56 @@ impl McpServer {
       "content": [{
         "type": "text",
         "text": format!("{} profile(s) assigned to group '{}'", profile_ids.len(), group_name)
+      }]
+    }))
+  }
+
+  async fn handle_distribute_proxies(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let pairs: Vec<crate::proxy_distribution::ProxyPair> = arguments
+      .get("pairs")
+      .cloned()
+      .map(serde_json::from_value)
+      .transpose()
+      .map_err(|e| McpError {
+        code: -32602,
+        message: format!("Invalid pairs: {e}"),
+        data: None,
+      })?
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing pairs".to_string(),
+        data: None,
+      })?;
+
+    // Same reason the batch handlers clone and drop: the engine's single global
+    // mutex serves every other MCP message, and fifty profile writes must not
+    // hold it.
+    let app_handle = {
+      let inner = self.inner.lock().await;
+      inner
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| McpError {
+          code: -32000,
+          message: "MCP server not properly initialized".to_string(),
+          data: None,
+        })?
+        .clone()
+    };
+
+    let results = crate::proxy_distribution::apply_pairs(app_handle, &pairs).await;
+    let assigned = results.iter().filter(|result| result.ok).count();
+    Ok(serde_json::json!({
+      "content": [{
+        "type": "text",
+        "text": format!(
+          "{assigned} of {} profile(s) assigned a proxy:\n{}",
+          results.len(),
+          serde_json::to_string(&results).unwrap_or_default()
+        )
       }]
     }))
   }
@@ -3608,6 +9471,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing proxy_id".to_string(),
+        data: None,
       })?;
 
     let proxies = PROXY_MANAGER.get_stored_proxies();
@@ -3617,14 +9481,17 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32000,
         message: format!("Proxy not found: {proxy_id}"),
+        data: None,
       })?;
 
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": serde_json::to_string_pretty(&proxy).unwrap_or_default()
-      }]
-    }))
+    let mut proxy = serde_json::to_value(proxy).map_err(|e| McpError {
+      code: -32000,
+      message: format!("Failed to serialize proxy: {e}"),
+      data: None,
+    })?;
+    redact_proxy_secrets(&mut proxy);
+
+    Self::json_content(&proxy)
   }
 
   async fn handle_create_proxy(
@@ -3637,13 +9504,30 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing name".to_string(),
+        data: None,
       })?;
 
-    let inner = self.inner.lock().await;
-    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
-      code: -32000,
-      message: "MCP server not properly initialized".to_string(),
-    })?;
+    // The guard is dropped before the await below. Binding `app_handle` as a
+    // REFERENCE out of `inner` keeps the engine's single global mutex locked
+    // for the whole operation — and `handle_message` needs that same mutex to
+    // validate the session on every request, and to serve `initialize`. So a
+    // launch that takes twenty seconds froze every other MCP message on this
+    // desktop for twenty seconds: the agent's own follow-up calls, a second
+    // agent, the website console, and even a brand-new client trying to open a
+    // session. The batch handlers already clone-and-drop for exactly this
+    // reason; the single-profile ones did not.
+    let app_handle = {
+      let inner = self.inner.lock().await;
+      inner
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| McpError {
+          code: -32000,
+          message: "MCP server not properly initialized".to_string(),
+          data: None,
+        })?
+        .clone()
+    };
 
     let proxy_type = arguments
       .get("proxy_type")
@@ -3651,14 +9535,16 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing proxy_type".to_string(),
+        data: None,
       })?;
 
     // The tool schema declares an enum, but JSON-Schema enums are advisory only;
     // enforce it here so a bad value can't produce a non-functional proxy.
-    if !matches!(proxy_type, "http" | "https" | "socks4" | "socks5" | "vless") {
+    if !MCP_PROXY_TYPES.contains(&proxy_type) {
       return Err(McpError {
         code: -32602,
-        message: "proxy_type must be one of: http, https, socks4, socks5, vless".to_string(),
+        message: format!("proxy_type must be one of: {}", MCP_PROXY_TYPES.join(", ")),
+        data: None,
       });
     }
 
@@ -3666,11 +9552,12 @@ impl McpServer {
       .get("vless_uri")
       .and_then(|value| value.as_str())
       .map(str::to_string);
-    let (host, port) = if proxy_type == "vless" {
+    let (host, port) = if crate::xray::is_xray_proxy_type(proxy_type) {
       if vless_uri.is_none() {
         return Err(McpError {
           code: -32602,
           message: "Missing vless_uri".to_string(),
+          data: None,
         });
       }
       (String::new(), 1)
@@ -3681,6 +9568,7 @@ impl McpServer {
         .ok_or_else(|| McpError {
           code: -32602,
           message: "Missing host".to_string(),
+          data: None,
         })?
         .to_string();
       let port = arguments
@@ -3691,6 +9579,7 @@ impl McpServer {
         .ok_or_else(|| McpError {
           code: -32602,
           message: "Missing or invalid port".to_string(),
+          data: None,
         })?;
       (host, port)
     };
@@ -3714,10 +9603,11 @@ impl McpServer {
     };
 
     let proxy = PROXY_MANAGER
-      .create_stored_proxy(app_handle, name.to_string(), proxy_settings)
+      .create_stored_proxy(&app_handle, name.to_string(), proxy_settings)
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to create proxy: {e}"),
+        data: None,
       })?;
 
     Ok(serde_json::json!({
@@ -3738,6 +9628,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing proxy_id".to_string(),
+        data: None,
       })?;
 
     let name = arguments
@@ -3762,6 +9653,7 @@ impl McpServer {
         .ok_or_else(|| McpError {
           code: -32000,
           message: format!("Proxy not found: {proxy_id}"),
+          data: None,
         })?;
 
       let proxy_type = arguments
@@ -3769,13 +9661,11 @@ impl McpServer {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| existing.proxy_settings.proxy_type.clone());
-      if !matches!(
-        proxy_type.as_str(),
-        "http" | "https" | "socks4" | "socks5" | "vless"
-      ) {
+      if !MCP_PROXY_TYPES.contains(&proxy_type.as_str()) {
         return Err(McpError {
           code: -32602,
-          message: "proxy_type must be one of: http, https, socks4, socks5, vless".to_string(),
+          message: format!("proxy_type must be one of: {}", MCP_PROXY_TYPES.join(", ")),
+          data: None,
         });
       }
 
@@ -3793,6 +9683,7 @@ impl McpServer {
           .ok_or_else(|| McpError {
             code: -32602,
             message: "Invalid port".to_string(),
+            data: None,
           })?,
         None => existing.proxy_settings.port,
       };
@@ -3826,17 +9717,34 @@ impl McpServer {
       None
     };
 
-    let inner = self.inner.lock().await;
-    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
-      code: -32000,
-      message: "MCP server not properly initialized".to_string(),
-    })?;
+    // The guard is dropped before the await below. Binding `app_handle` as a
+    // REFERENCE out of `inner` keeps the engine's single global mutex locked
+    // for the whole operation — and `handle_message` needs that same mutex to
+    // validate the session on every request, and to serve `initialize`. So a
+    // launch that takes twenty seconds froze every other MCP message on this
+    // desktop for twenty seconds: the agent's own follow-up calls, a second
+    // agent, the website console, and even a brand-new client trying to open a
+    // session. The batch handlers already clone-and-drop for exactly this
+    // reason; the single-profile ones did not.
+    let app_handle = {
+      let inner = self.inner.lock().await;
+      inner
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| McpError {
+          code: -32000,
+          message: "MCP server not properly initialized".to_string(),
+          data: None,
+        })?
+        .clone()
+    };
 
     let proxy = PROXY_MANAGER
-      .update_stored_proxy(app_handle, proxy_id, name, proxy_settings)
+      .update_stored_proxy(&app_handle, proxy_id, name, proxy_settings)
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to update proxy: {e}"),
+        data: None,
       })?;
 
     Ok(serde_json::json!({
@@ -3857,19 +9765,37 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing proxy_id".to_string(),
+        data: None,
       })?;
 
-    let inner = self.inner.lock().await;
-    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
-      code: -32000,
-      message: "MCP server not properly initialized".to_string(),
-    })?;
+    // The guard is dropped before the await below. Binding `app_handle` as a
+    // REFERENCE out of `inner` keeps the engine's single global mutex locked
+    // for the whole operation — and `handle_message` needs that same mutex to
+    // validate the session on every request, and to serve `initialize`. So a
+    // launch that takes twenty seconds froze every other MCP message on this
+    // desktop for twenty seconds: the agent's own follow-up calls, a second
+    // agent, the website console, and even a brand-new client trying to open a
+    // session. The batch handlers already clone-and-drop for exactly this
+    // reason; the single-profile ones did not.
+    let app_handle = {
+      let inner = self.inner.lock().await;
+      inner
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| McpError {
+          code: -32000,
+          message: "MCP server not properly initialized".to_string(),
+          data: None,
+        })?
+        .clone()
+    };
 
     PROXY_MANAGER
-      .delete_stored_proxy(app_handle, proxy_id)
+      .delete_stored_proxy(&app_handle, proxy_id)
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to delete proxy: {e}"),
+        data: None,
       })?;
 
     Ok(serde_json::json!({
@@ -3890,18 +9816,21 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing format".to_string(),
+        data: None,
       })?;
 
     let content = match format {
       "json" => PROXY_MANAGER.export_proxies_json().map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to export proxies: {e}"),
+        data: None,
       })?,
       "txt" => PROXY_MANAGER.export_proxies_txt(),
       _ => {
         return Err(McpError {
           code: -32602,
           message: format!("Invalid format '{}', must be 'json' or 'txt'", format),
+          data: None,
         })
       }
     };
@@ -3924,6 +9853,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing content".to_string(),
+        data: None,
       })?;
 
     let format = arguments
@@ -3932,6 +9862,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing format".to_string(),
+        data: None,
       })?;
 
     let name_prefix = arguments
@@ -3939,18 +9870,35 @@ impl McpServer {
       .and_then(|v| v.as_str())
       .map(|s| s.to_string());
 
-    let inner = self.inner.lock().await;
-    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
-      code: -32000,
-      message: "MCP server not properly initialized".to_string(),
-    })?;
+    // The guard is dropped before the await below. Binding `app_handle` as a
+    // REFERENCE out of `inner` keeps the engine's single global mutex locked
+    // for the whole operation — and `handle_message` needs that same mutex to
+    // validate the session on every request, and to serve `initialize`. So a
+    // launch that takes twenty seconds froze every other MCP message on this
+    // desktop for twenty seconds: the agent's own follow-up calls, a second
+    // agent, the website console, and even a brand-new client trying to open a
+    // session. The batch handlers already clone-and-drop for exactly this
+    // reason; the single-profile ones did not.
+    let app_handle = {
+      let inner = self.inner.lock().await;
+      inner
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| McpError {
+          code: -32000,
+          message: "MCP server not properly initialized".to_string(),
+          data: None,
+        })?
+        .clone()
+    };
 
     let result = match format {
       "json" => PROXY_MANAGER
-        .import_proxies_json(app_handle, content)
+        .import_proxies_json(&app_handle, content)
         .map_err(|e| McpError {
           code: -32000,
           message: format!("Failed to import proxies: {e}"),
+          data: None,
         })?,
       "txt" => {
         use crate::proxy_manager::{ProxyManager, ProxyParseResult};
@@ -3971,20 +9919,23 @@ impl McpServer {
           return Err(McpError {
             code: -32000,
             message: "No valid proxies found in content".to_string(),
+            data: None,
           });
         }
 
         PROXY_MANAGER
-          .import_proxies_from_parsed(app_handle, parsed, name_prefix)
+          .import_proxies_from_parsed(&app_handle, parsed, name_prefix)
           .map_err(|e| McpError {
             code: -32000,
             message: format!("Failed to import proxies: {e}"),
+            data: None,
           })?
       }
       _ => {
         return Err(McpError {
           code: -32602,
           message: format!("Invalid format '{}', must be 'json' or 'txt'", format),
+          data: None,
         })
       }
     };
@@ -4015,14 +9966,10 @@ impl McpServer {
     .map_err(|e| McpError {
       code: -32000,
       message: format!("Failed to detect profiles: {e}"),
+      data: None,
     })?;
 
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": serde_json::to_string_pretty(&profiles).unwrap_or_else(|_| "[]".to_string())
-      }]
-    }))
+    Self::json_content(&profiles)
   }
 
   async fn handle_import_browser_profiles(
@@ -4035,11 +9982,13 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing items".to_string(),
+        data: None,
       })
       .and_then(|v| {
         serde_json::from_value(v).map_err(|e| McpError {
           code: -32602,
           message: format!("Invalid items: {e}"),
+          data: None,
         })
       })?;
 
@@ -4056,6 +10005,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32602,
         message: format!("Invalid duplicate_strategy: {e}"),
+        data: None,
       })?
       .unwrap_or_default();
 
@@ -4066,6 +10016,7 @@ impl McpServer {
       inner.app_handle.clone().ok_or_else(|| McpError {
         code: -32000,
         message: "MCP server not properly initialized".to_string(),
+        data: None,
       })?
     };
 
@@ -4075,6 +10026,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to import profiles: {e}"),
+        data: None,
       })?;
 
     Ok(serde_json::json!({
@@ -4085,7 +10037,7 @@ impl McpServer {
           result.imported_count,
           result.skipped_count,
           result.failed_count,
-          serde_json::to_string_pretty(&result.results).unwrap_or_default()
+          serde_json::to_string(&result.results).unwrap_or_default()
         )
       }]
     }))
@@ -4102,6 +10054,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
 
     let content = arguments
@@ -4110,6 +10063,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing content".to_string(),
+        data: None,
       })?;
 
     let app_handle = {
@@ -4120,6 +10074,7 @@ impl McpServer {
         .ok_or_else(|| McpError {
           code: -32000,
           message: "MCP server not properly initialized".to_string(),
+          data: None,
         })?
         .clone()
     };
@@ -4130,6 +10085,7 @@ impl McpServer {
         .map_err(|e| McpError {
           code: -32000,
           message: format!("Failed to import cookies: {e}"),
+          data: None,
         })?;
 
     if let Some(scheduler) = crate::sync::get_global_scheduler() {
@@ -4170,6 +10126,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing content".to_string(),
+        data: None,
       })?;
 
     let filename = arguments
@@ -4178,6 +10135,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing filename".to_string(),
+        data: None,
       })?;
 
     let name = arguments
@@ -4188,6 +10146,7 @@ impl McpServer {
     let storage = crate::vpn::VPN_STORAGE.lock().map_err(|e| McpError {
       code: -32000,
       message: format!("Failed to lock VPN storage: {e}"),
+      data: None,
     })?;
 
     let config = storage
@@ -4195,6 +10154,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to import VPN config: {e}"),
+        data: None,
       })?;
 
     Ok(serde_json::json!({
@@ -4214,19 +10174,16 @@ impl McpServer {
     let storage = crate::vpn::VPN_STORAGE.lock().map_err(|e| McpError {
       code: -32000,
       message: format!("Failed to lock VPN storage: {e}"),
+      data: None,
     })?;
 
     let configs = storage.list_configs().map_err(|e| McpError {
       code: -32000,
       message: format!("Failed to list VPN configs: {e}"),
+      data: None,
     })?;
 
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": serde_json::to_string_pretty(&configs).unwrap_or_default()
-      }]
-    }))
+    Self::json_content(&configs)
   }
 
   async fn handle_delete_vpn(
@@ -4239,6 +10196,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing vpn_id".to_string(),
+        data: None,
       })?;
 
     // First disconnect if connected (stop VPN worker)
@@ -4247,11 +10205,13 @@ impl McpServer {
     let storage = crate::vpn::VPN_STORAGE.lock().map_err(|e| McpError {
       code: -32000,
       message: format!("Failed to lock VPN storage: {e}"),
+      data: None,
     })?;
 
     storage.delete_config(vpn_id).map_err(|e| McpError {
       code: -32000,
       message: format!("Failed to delete VPN config: {e}"),
+      data: None,
     })?;
 
     Ok(serde_json::json!({
@@ -4272,6 +10232,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing vpn_id".to_string(),
+        data: None,
       })?;
 
     // Start VPN worker process
@@ -4280,6 +10241,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to connect VPN: {e}"),
+        data: None,
       })?;
 
     // Update last_used timestamp
@@ -4287,6 +10249,7 @@ impl McpServer {
       let storage = crate::vpn::VPN_STORAGE.lock().map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to lock VPN storage: {e}"),
+        data: None,
       })?;
       let _ = storage.update_last_used(vpn_id);
     }
@@ -4309,6 +10272,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing vpn_id".to_string(),
+        data: None,
       })?;
 
     crate::vpn_worker_runner::stop_vpn_worker_by_vpn_id(vpn_id)
@@ -4316,6 +10280,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to disconnect VPN: {e}"),
+        data: None,
       })?;
 
     Ok(serde_json::json!({
@@ -4336,6 +10301,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing vpn_id".to_string(),
+        data: None,
       })?;
 
     let connected =
@@ -4357,12 +10323,7 @@ impl McpServer {
       last_handshake: None,
     };
 
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": serde_json::to_string_pretty(&status).unwrap_or_default()
-      }]
-    }))
+    Self::json_content(&status)
   }
 
   // Fingerprint management handlers
@@ -4376,6 +10337,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
 
     let profiles = ProfileManager::instance()
@@ -4383,6 +10345,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to list profiles: {e}"),
+        data: None,
       })?;
 
     let profile = profiles
@@ -4391,20 +10354,39 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32000,
         message: format!("Profile not found: {profile_id}"),
+        data: None,
       })?;
 
     let fingerprint_info = match profile.browser.as_str() {
       "wayfern" => {
         let config = profile.wayfern_config.as_ref().cloned().unwrap_or_default();
+        let fingerprint = crate::wayfern_manager::WayfernManager::instance()
+          .profile_fingerprint(profile)
+          .await
+          .map_err(|e| McpError {
+            code: -32000,
+            message: format!("Failed to read the fingerprint: {e}"),
+            data: None,
+          })?;
         serde_json::json!({
           "browser": "wayfern",
-          "fingerprint": config.fingerprint,
+          "fingerprint": fingerprint,
+          "identity_id": config.identity_id,
+          "identity_overrides": config.identity_overrides,
+          "location": config.location,
           "os": config.os,
           "randomize_fingerprint_on_launch": config.randomize_fingerprint_on_launch,
           "screen_max_width": config.screen_max_width,
           "screen_max_height": config.screen_max_height,
           "screen_min_width": config.screen_min_width,
           "screen_min_height": config.screen_min_height,
+          // The launch behaviour an agent can also set through
+          // `update_profile_fingerprint`, reported here so it never has to
+          // guess what a profile will do when it starts.
+          "restore_session": config.restore_session,
+          "webrtc_mode": config.webrtc_mode,
+          "camera_file": config.camera_file,
+          "camera_crop": config.camera_crop,
         })
       }
       crate::fingerprint_chromium::BROWSER_ID => serde_json::json!({
@@ -4420,16 +10402,12 @@ impl McpServer {
         return Err(McpError {
           code: -32000,
           message: format!("MCP does not support browser '{}'", profile.browser),
+          data: None,
         })
       }
     };
 
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": serde_json::to_string_pretty(&fingerprint_info).unwrap_or_default()
-      }]
-    }))
+    Self::json_content(&fingerprint_info)
   }
 
   async fn handle_update_profile_fingerprint(
@@ -4440,6 +10418,7 @@ impl McpServer {
       return Err(McpError {
         code: -32000,
         message: "Fingerprint editing requires a plan that includes it".to_string(),
+        data: None,
       });
     }
 
@@ -4449,10 +10428,27 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
 
     let fingerprint = arguments.get("fingerprint").and_then(|v| v.as_str());
     let os = arguments.get("os").and_then(|v| v.as_str());
+    let restore_session = arguments
+      .get("restore_session")
+      .and_then(serde_json::Value::as_bool);
+    let webrtc_mode = match arguments.get("webrtc_mode").and_then(|v| v.as_str()) {
+      Some(mode) if crate::wayfern_manager::WebRtcMode::parse(mode).is_some() => {
+        Some(mode.to_string())
+      }
+      Some(mode) => {
+        return Err(McpError {
+          code: -32602,
+          message: format!("Unknown webrtc_mode {mode:?}; expected auto, tcp_only or block"),
+          data: None,
+        })
+      }
+      None => None,
+    };
     let randomize = arguments
       .get("randomize_fingerprint_on_launch")
       .and_then(|v| v.as_bool());
@@ -4465,6 +10461,7 @@ impl McpServer {
             "OS spoofing to '{}' requires an active Pro subscription",
             os_val
           ),
+          data: None,
         });
       }
     }
@@ -4474,6 +10471,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to list profiles: {e}"),
+        data: None,
       })?;
 
     let profile = profiles
@@ -4482,13 +10480,30 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32000,
         message: format!("Profile not found: {profile_id}"),
+        data: None,
       })?;
 
-    let inner = self.inner.lock().await;
-    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
-      code: -32000,
-      message: "MCP server not properly initialized".to_string(),
-    })?;
+    // The guard is dropped before the await below. Binding `app_handle` as a
+    // REFERENCE out of `inner` keeps the engine's single global mutex locked
+    // for the whole operation — and `handle_message` needs that same mutex to
+    // validate the session on every request, and to serve `initialize`. So a
+    // launch that takes twenty seconds froze every other MCP message on this
+    // desktop for twenty seconds: the agent's own follow-up calls, a second
+    // agent, the website console, and even a brand-new client trying to open a
+    // session. The batch handlers already clone-and-drop for exactly this
+    // reason; the single-profile ones did not.
+    let app_handle = {
+      let inner = self.inner.lock().await;
+      inner
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| McpError {
+          code: -32000,
+          message: "MCP server not properly initialized".to_string(),
+          data: None,
+        })?
+        .clone()
+    };
 
     match profile.browser.as_str() {
       "wayfern" => {
@@ -4502,18 +10517,26 @@ impl McpServer {
         if let Some(r) = randomize {
           config.randomize_fingerprint_on_launch = Some(r);
         }
+        if let Some(restore) = restore_session {
+          config.restore_session = Some(restore);
+        }
+        if let Some(mode) = webrtc_mode {
+          config.webrtc_mode = Some(mode);
+        }
         ProfileManager::instance()
           .update_wayfern_config(app_handle.clone(), profile_id, config)
           .await
           .map_err(|e| McpError {
             code: -32000,
             message: format!("Failed to update wayfern config: {e}"),
+            data: None,
           })?;
       }
       _ => {
         return Err(McpError {
           code: -32000,
-          message: "MCP only supports Wayfern profiles".to_string(),
+          message: format!("MCP does not support browser '{}'", profile.browser),
+          data: None,
         })
       }
     }
@@ -4536,6 +10559,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
 
     let rules: Vec<String> = arguments
@@ -4544,22 +10568,40 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing rules array".to_string(),
+        data: None,
       })?
       .iter()
       .filter_map(|v| v.as_str().map(|s| s.to_string()))
       .collect();
 
-    let inner = self.inner.lock().await;
-    let app_handle = inner.app_handle.as_ref().ok_or_else(|| McpError {
-      code: -32000,
-      message: "MCP server not properly initialized".to_string(),
-    })?;
+    // The guard is dropped before the await below. Binding `app_handle` as a
+    // REFERENCE out of `inner` keeps the engine's single global mutex locked
+    // for the whole operation — and `handle_message` needs that same mutex to
+    // validate the session on every request, and to serve `initialize`. So a
+    // launch that takes twenty seconds froze every other MCP message on this
+    // desktop for twenty seconds: the agent's own follow-up calls, a second
+    // agent, the website console, and even a brand-new client trying to open a
+    // session. The batch handlers already clone-and-drop for exactly this
+    // reason; the single-profile ones did not.
+    let app_handle = {
+      let inner = self.inner.lock().await;
+      inner
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| McpError {
+          code: -32000,
+          message: "MCP server not properly initialized".to_string(),
+          data: None,
+        })?
+        .clone()
+    };
 
     let profile = ProfileManager::instance()
-      .update_profile_proxy_bypass_rules(app_handle, profile_id, rules.clone())
+      .update_profile_proxy_bypass_rules(&app_handle, profile_id, rules.clone())
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to update proxy bypass rules: {e}"),
+        data: None,
       })?;
 
     Ok(serde_json::json!({
@@ -4584,6 +10626,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
 
     let level = arguments
@@ -4592,6 +10635,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing level".to_string(),
+        data: None,
       })?;
 
     let dns_blocklist = if level == "none" {
@@ -4605,6 +10649,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to update DNS blocklist: {e}"),
+        data: None,
       })?;
 
     Ok(serde_json::json!({
@@ -4621,12 +10666,7 @@ impl McpServer {
 
   async fn handle_get_dns_blocklist_status(&self) -> Result<serde_json::Value, McpError> {
     let statuses = crate::dns_blocklist::BlocklistManager::get_cache_status();
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": serde_json::to_string_pretty(&statuses).unwrap_or_default()
-      }]
-    }))
+    Self::json_content(&statuses)
   }
 
   async fn handle_list_extensions(&self) -> Result<serde_json::Value, McpError> {
@@ -4634,12 +10674,14 @@ impl McpServer {
       return Err(McpError {
         code: -32000,
         message: "Extension management requires an active Pro subscription".to_string(),
+        data: None,
       });
     }
     let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
     let extensions = mgr.list_extensions().map_err(|e| McpError {
       code: -32000,
       message: format!("Failed to list extensions: {e}"),
+      data: None,
     })?;
     Ok(serde_json::to_value(extensions).unwrap())
   }
@@ -4649,12 +10691,14 @@ impl McpServer {
       return Err(McpError {
         code: -32000,
         message: "Extension management requires an active Pro subscription".to_string(),
+        data: None,
       });
     }
     let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
     let groups = mgr.list_groups().map_err(|e| McpError {
       code: -32000,
       message: format!("Failed to list extension groups: {e}"),
+      data: None,
     })?;
     Ok(serde_json::to_value(groups).unwrap())
   }
@@ -4667,6 +10711,7 @@ impl McpServer {
       return Err(McpError {
         code: -32000,
         message: "Extension management requires an active Pro subscription".to_string(),
+        data: None,
       });
     }
     let path = arguments
@@ -4675,6 +10720,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing required parameter: path".to_string(),
+        data: None,
       })?;
     let name = arguments
       .get("name")
@@ -4685,12 +10731,18 @@ impl McpServer {
       .get("link")
       .and_then(|v| v.as_bool())
       .unwrap_or(false);
+    let path = crate::extension_manager::client_named_path(path).map_err(|e| McpError {
+      code: -32602,
+      message: format!("Invalid path: {e}"),
+      data: None,
+    })?;
     let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
     let extension = mgr
-      .add_extension_from_path(name, std::path::Path::new(path), link)
+      .add_extension_from_path(name, &path, link)
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to add extension: {e}"),
+        data: None,
       })?;
     Ok(serde_json::to_value(extension).unwrap())
   }
@@ -4703,6 +10755,7 @@ impl McpServer {
       return Err(McpError {
         code: -32000,
         message: "Extension management requires an active Pro subscription".to_string(),
+        data: None,
       });
     }
     let extension_id = arguments
@@ -4711,6 +10764,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing required parameter: extension_id".to_string(),
+        data: None,
       })?;
     let name = arguments
       .get("name")
@@ -4721,22 +10775,31 @@ impl McpServer {
       return Err(McpError {
         code: -32602,
         message: "Provide at least one of: name, path".to_string(),
+        data: None,
       });
     }
     let link = arguments
       .get("link")
       .and_then(|v| v.as_bool())
       .unwrap_or(false);
+    let path = path
+      .map(|path| {
+        crate::extension_manager::client_named_path(path).map_err(|e| McpError {
+          code: -32602,
+          message: format!("Invalid path: {e}"),
+          data: None,
+        })
+      })
+      .transpose()?;
     let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
     let extension = match path {
-      Some(path) => {
-        mgr.update_extension_from_path(extension_id, name, std::path::Path::new(path), link)
-      }
+      Some(path) => mgr.update_extension_from_path(extension_id, name, &path, link),
       None => mgr.update_extension(extension_id, name, None, None),
     }
     .map_err(|e| McpError {
       code: -32000,
       message: format!("Failed to update extension: {e}"),
+      data: None,
     })?;
     Ok(serde_json::to_value(extension).unwrap())
   }
@@ -4749,6 +10812,7 @@ impl McpServer {
       return Err(McpError {
         code: -32000,
         message: "Extension management requires an active Pro subscription".to_string(),
+        data: None,
       });
     }
     let name = arguments
@@ -4757,11 +10821,13 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing required parameter: name".to_string(),
+        data: None,
       })?;
     let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
     let group = mgr.create_group(name.to_string()).map_err(|e| McpError {
       code: -32000,
       message: format!("Failed to create extension group: {e}"),
+      data: None,
     })?;
     Ok(serde_json::to_value(group).unwrap())
   }
@@ -4774,6 +10840,7 @@ impl McpServer {
       return Err(McpError {
         code: -32000,
         message: "Extension management requires an active Pro subscription".to_string(),
+        data: None,
       });
     }
     let group_id = arguments
@@ -4782,6 +10849,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing required parameter: group_id".to_string(),
+        data: None,
       })?;
     let name = arguments
       .get("name")
@@ -4802,6 +10870,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to update extension group: {e}"),
+        data: None,
       })?;
     Ok(serde_json::to_value(group).unwrap())
   }
@@ -4814,6 +10883,7 @@ impl McpServer {
       return Err(McpError {
         code: -32000,
         message: "Extension management requires an active Pro subscription".to_string(),
+        data: None,
       });
     }
     let (group_id, extension_id) = Self::group_and_extension_ids(arguments)?;
@@ -4823,6 +10893,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to add extension to group: {e}"),
+        data: None,
       })?;
     Ok(serde_json::to_value(group).unwrap())
   }
@@ -4835,6 +10906,7 @@ impl McpServer {
       return Err(McpError {
         code: -32000,
         message: "Extension management requires an active Pro subscription".to_string(),
+        data: None,
       });
     }
     let (group_id, extension_id) = Self::group_and_extension_ids(arguments)?;
@@ -4844,6 +10916,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to remove extension from group: {e}"),
+        data: None,
       })?;
     Ok(serde_json::to_value(group).unwrap())
   }
@@ -4855,6 +10928,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing required parameter: group_id".to_string(),
+        data: None,
       })?;
     let extension_id = arguments
       .get("extension_id")
@@ -4862,6 +10936,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing required parameter: extension_id".to_string(),
+        data: None,
       })?;
     Ok((group_id, extension_id))
   }
@@ -4874,6 +10949,7 @@ impl McpServer {
       return Err(McpError {
         code: -32000,
         message: "Extension management requires an active Pro subscription".to_string(),
+        data: None,
       });
     }
     let extension_id = arguments
@@ -4882,6 +10958,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing required parameter: extension_id".to_string(),
+        data: None,
       })?;
     let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
     mgr
@@ -4889,6 +10966,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to delete extension: {e}"),
+        data: None,
       })?;
     Ok(serde_json::json!({"success": true}))
   }
@@ -4901,6 +10979,7 @@ impl McpServer {
       return Err(McpError {
         code: -32000,
         message: "Extension management requires an active Pro subscription".to_string(),
+        data: None,
       });
     }
     let group_id = arguments
@@ -4909,6 +10988,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing required parameter: group_id".to_string(),
+        data: None,
       })?;
     let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
     // For MCP, we don't have an app_handle, but we need one for sync deletion.
@@ -4916,9 +10996,10 @@ impl McpServer {
     mgr.delete_group_internal(group_id).map_err(|e| McpError {
       code: -32000,
       message: format!("Failed to delete extension group: {e}"),
+      data: None,
     })?;
     if let Err(e) = crate::events::emit_empty("extensions-changed") {
-      log::error!("Failed to emit extensions-changed event: {e}");
+      log::warn!("Event not emitted event=extensions-changed err=\"{e}\"");
     }
     Ok(serde_json::json!({"success": true}))
   }
@@ -4931,6 +11012,7 @@ impl McpServer {
       return Err(McpError {
         code: -32000,
         message: "Extension management requires an active Pro subscription".to_string(),
+        data: None,
       });
     }
     let profile_id = arguments
@@ -4939,6 +11021,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing required parameter: profile_id".to_string(),
+        data: None,
       })?;
     let extension_group_id = arguments
       .get("extension_group_id")
@@ -4958,6 +11041,7 @@ impl McpServer {
       let profiles = profile_manager.list_profiles().map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to list profiles: {e}"),
+        data: None,
       })?;
       let profile = profiles
         .iter()
@@ -4965,6 +11049,7 @@ impl McpServer {
         .ok_or_else(|| McpError {
           code: -32000,
           message: format!("Profile '{profile_id}' not found"),
+          data: None,
         })?;
       let mgr = crate::extension_manager::EXTENSION_MANAGER.lock().unwrap();
       mgr
@@ -4972,6 +11057,7 @@ impl McpServer {
         .map_err(|e| McpError {
           code: -32000,
           message: format!("{e}"),
+          data: None,
         })?;
     }
 
@@ -4981,6 +11067,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to assign extension group: {e}"),
+        data: None,
       })?;
     Ok(serde_json::to_value(profile).unwrap())
   }
@@ -4990,15 +11077,11 @@ impl McpServer {
       return Err(McpError {
         code: -32000,
         message: "Team features require an active team plan".to_string(),
+        data: None,
       });
     }
     let locks = crate::team_lock::TEAM_LOCK.get_locks().await;
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": serde_json::to_string_pretty(&locks).unwrap_or_default()
-      }]
-    }))
+    Self::json_content(&locks)
   }
 
   async fn handle_get_team_lock_status(
@@ -5009,6 +11092,7 @@ impl McpServer {
       return Err(McpError {
         code: -32000,
         message: "Team features require an active team plan".to_string(),
+        data: None,
       });
     }
     let profile_id = arguments
@@ -5017,16 +11101,12 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
     let lock_status = crate::team_lock::TEAM_LOCK
       .get_lock_status(profile_id)
       .await;
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": serde_json::to_string_pretty(&lock_status).unwrap_or_default()
-      }]
-    }))
+    Self::json_content(&lock_status)
   }
 
   // --- CDP utility methods for browser interaction ---
@@ -5044,6 +11124,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: e.to_string(),
+        data: None,
       })
   }
 
@@ -5058,93 +11139,25 @@ impl McpServer {
       .map_err(cdp_error)
   }
 
-  async fn send_human_keystrokes(
-    &self,
-    target: &CdpTarget,
-    text: &str,
-    wpm: Option<f64>,
-  ) -> Result<(), McpError> {
-    use crate::human_typing::{MarkovTyper, TypingAction};
-
-    let events = MarkovTyper::new(text, wpm).run();
-    let mut connection = target.connect().await.map_err(cdp_error)?;
-
-    let mut cmd_id = 1u64;
-    let mut last_time = 0.0;
-
-    for event in &events {
-      let delay = event.time - last_time;
-      if delay > 0.0 {
-        tokio::time::sleep(std::time::Duration::from_secs_f64(delay)).await;
-      }
-      last_time = event.time;
-
-      let (down, up) = match &event.action {
-        TypingAction::Char(ch) => {
-          let ch = ch.to_string();
-          (
-            serde_json::json!({
-              "type": "keyDown",
-              "text": ch,
-              "key": ch,
-              "unmodifiedText": ch,
-            }),
-            serde_json::json!({ "type": "keyUp", "key": ch }),
-          )
-        }
-        TypingAction::Backspace => (
-          serde_json::json!({
-            "type": "keyDown",
-            "key": "Backspace",
-            "code": "Backspace",
-            "windowsVirtualKeyCode": 8,
-            "nativeVirtualKeyCode": 8,
-          }),
-          serde_json::json!({
-            "type": "keyUp",
-            "key": "Backspace",
-            "code": "Backspace",
-            "windowsVirtualKeyCode": 8,
-            "nativeVirtualKeyCode": 8,
-          }),
-        ),
-      };
-
-      for params in [down, up] {
-        if let Err(e) = connection
-          .send_command(cmd_id, "Input.dispatchKeyEvent", params)
-          .await
-        {
-          return Err(cdp_error(e));
-        }
-        // Drained rather than matched: the point is to keep reading so the
-        // browser is never writing into a full socket while the next keystroke
-        // is being timed. Bounded, because a reply that never comes must not
-        // freeze typing forever — the keystroke itself was already delivered.
-        let _ = tokio::time::timeout(KEYSTROKE_ACK_TIMEOUT, connection.next_text()).await;
-        cmd_id += 1;
-      }
-    }
-
-    connection.close().await;
-    Ok(())
-  }
-
-  /// Send a CDP command and wait for the page to finish loading.
-  ///
-  /// Thin over the shared runner so a local and a remote profile take exactly
-  /// the same path: one implementation of "navigate then wait", not two that
-  /// drift.
+  /// `expect_navigation`: the command is a navigation, so the page's load is
+  /// always awaited; otherwise only a navigation that starts is.
   async fn send_cdp_and_wait_for_load(
     &self,
     target: &CdpTarget,
     method: &str,
     params: serde_json::Value,
     timeout_secs: u64,
+    expect_navigation: bool,
   ) -> Result<serde_json::Value, McpError> {
-    crate::cdp_target::run_command_awaiting_load(target, method, params, timeout_secs)
-      .await
-      .map_err(cdp_error)
+    crate::cdp_target::run_command_awaiting_load(
+      target,
+      method,
+      params,
+      timeout_secs,
+      expect_navigation,
+    )
+    .await
+    .map_err(cdp_error)
   }
 
   /// The profile a browser-interaction tool refers to.
@@ -5160,6 +11173,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to list profiles: {e}"),
+        data: None,
       })?;
 
     let profile = profiles
@@ -5168,12 +11182,14 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32000,
         message: format!("Profile not found: {profile_id}"),
+        data: None,
       })?;
 
     if !is_mcp_browser(&profile.browser) {
       return Err(McpError {
         code: -32000,
         message: format!("MCP does not support browser '{}'", profile.browser),
+        data: None,
       });
     }
 
@@ -5181,6 +11197,479 @@ impl McpServer {
   }
 
   // --- Browser interaction handlers ---
+
+  /// Where the page is now, or `None` when it cannot be read.
+  async fn page_state(&self, target: &CdpTarget) -> Option<PageState> {
+    let reply = self
+      .send_cdp(
+        target,
+        "Runtime.evaluate",
+        serde_json::json!({ "expression": PAGE_STATE_SCRIPT, "returnByValue": true }),
+      )
+      .await
+      .ok()?;
+    serde_json::from_value(reply.pointer("/result/value")?.clone()).ok()
+  }
+
+  /// `report` as the tool's text, followed by where the page is now.
+  async fn with_page_line(&self, target: &CdpTarget, report: String) -> serde_json::Value {
+    let text = match self.page_state(target).await {
+      Some(state) => format!("{report}\n{}", page_report(&state)),
+      None => report,
+    };
+    serde_json::json!({ "content": [{ "type": "text", "text": text }] })
+  }
+
+  async fn layout_metrics(&self, target: &CdpTarget) -> Result<LayoutMetrics, McpError> {
+    let reply = self
+      .send_cdp(target, "Page.getLayoutMetrics", serde_json::json!({}))
+      .await?;
+    Ok(LayoutMetrics::from_reply(&reply))
+  }
+
+  /// The running profile a tab tool names.
+  fn tab_profile(arguments: &serde_json::Value) -> Result<BrowserProfile, McpError> {
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    ProfileManager::instance()
+      .list_profiles()
+      .map_err(|e| McpError {
+        code: -32000,
+        message: format!("Failed to list profiles: {e}"),
+        data: None,
+      })?
+      .into_iter()
+      .find(|p| p.id.to_string() == profile_id)
+      .ok_or_else(|| McpError {
+        code: -32000,
+        message: format!("Profile not found: {profile_id}"),
+        data: None,
+      })
+  }
+
+  async fn handle_list_tabs(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile = Self::tab_profile(arguments)?;
+    let tabs = crate::browser_tabs::list(&profile)
+      .await
+      .map_err(tab_error)?;
+    Self::json_content(&serde_json::json!({ "tabs": tabs }))
+  }
+
+  async fn handle_open_tab(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile = Self::tab_profile(arguments)?;
+    let url = Self::require_navigable_url(arguments, "url")?;
+    let tab = crate::browser_tabs::open(&profile, url)
+      .await
+      .map_err(tab_error)?;
+    Self::json_content(&tab)
+  }
+
+  async fn handle_switch_tab(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile = Self::tab_profile(arguments)?;
+    let tab_id = Self::require_str(arguments, "tab_id")?;
+    let tab = crate::browser_tabs::switch(&profile, tab_id)
+      .await
+      .map_err(tab_error)?;
+    Self::json_content(&tab)
+  }
+
+  async fn handle_close_tab(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile = Self::tab_profile(arguments)?;
+    let tab_id = Self::require_str(arguments, "tab_id")?;
+    crate::browser_tabs::close(&profile, tab_id)
+      .await
+      .map_err(tab_error)?;
+    Ok(serde_json::json!({ "content": [{ "type": "text", "text": "Tab closed" }] }))
+  }
+
+  /// The index the caller named, directly or as a stable element id (`e12`)
+  /// from the last listing.
+  async fn element_index(
+    &self,
+    profile_id: &str,
+    cache: &str,
+    arguments: &serde_json::Value,
+  ) -> Result<u64, McpError> {
+    if let Some(index) = arguments.get("index").and_then(|v| v.as_u64()) {
+      return Ok(index);
+    }
+    let raw = arguments.get("element_id").ok_or_else(|| McpError {
+      code: -32602,
+      message: "Missing index or element_id".to_string(),
+      data: None,
+    })?;
+    let id = raw
+      .as_u64()
+      .or_else(|| {
+        raw
+          .as_str()
+          .and_then(|s| s.trim_start_matches('e').parse().ok())
+      })
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "element_id is an id like e12 from get_interactive_elements".to_string(),
+        data: None,
+      })?;
+    let target = self.resolve_cdp_target(profile_id).await?;
+    let reply = self
+      .send_cdp(
+        &target,
+        "Runtime.evaluate",
+        serde_json::json!({
+          "expression": format!(
+            "(() => {{ const arr = window[{cache}]; const ids = window.__donut_element_ids; if (!arr || !ids) return -1; return arr.findIndex((el) => ids.map.get(el) === {id}); }})()"
+          ),
+          "returnByValue": true,
+        }),
+      )
+      .await?;
+    match reply.pointer("/result/value").and_then(|v| v.as_i64()) {
+      Some(index) if index >= 0 => Ok(index as u64),
+      _ => Err(McpError {
+        code: -32000,
+        message: format!(
+          "No element e{id} in the last listing. Call get_interactive_elements again."
+        ),
+        data: None,
+      }),
+    }
+  }
+
+  /// Several browser actions in one call, in order, on one profile. Stops at
+  /// the first failure, and by default once the page's address changes, since
+  /// what follows was planned against the page before it.
+  async fn handle_run_actions(
+    &self,
+    caller: McpCaller<'_>,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    let actions = arguments
+      .get("actions")
+      .and_then(|v| v.as_array())
+      .filter(|list| !list.is_empty() && list.len() <= MAX_BATCH_ACTIONS)
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: format!("actions is a list of 1 to {MAX_BATCH_ACTIONS} steps"),
+        data: None,
+      })?;
+    let mut steps = Vec::with_capacity(actions.len());
+    for action in actions {
+      let tool = action
+        .get("tool")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+      if !BATCH_TOOLS.contains(&tool) {
+        return Err(McpError {
+          code: -32602,
+          message: format!(
+            "{tool:?} cannot run in a batch. Batchable tools: {}",
+            BATCH_TOOLS.join(", ")
+          ),
+          data: None,
+        });
+      }
+      let mut step_arguments = action
+        .get("arguments")
+        .cloned()
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+      step_arguments["profile_id"] = serde_json::json!(profile_id);
+      steps.push((tool, step_arguments));
+    }
+    let stop_on_change = arguments
+      .get("stop_on_change")
+      .and_then(|v| v.as_bool())
+      .unwrap_or(true);
+
+    let target = self.resolve_cdp_target(profile_id).await?;
+    let mut url = self.page_state(&target).await.map(|state| state.url);
+    let mut results = Vec::new();
+    let mut stopped: Option<String> = None;
+    for (position, (tool, step_arguments)) in steps.iter().enumerate() {
+      if let Err(refusal) = crate::agent_console::check_call(false, step_arguments) {
+        let error = Self::console_refusal(refusal);
+        results.push(serde_json::json!({ "tool": tool, "ok": false, "error": error.message }));
+        stopped = Some("the person paused or took over".to_string());
+        break;
+      }
+      match Box::pin(self.dispatch_tool_call(caller, tool, step_arguments)).await {
+        Ok(value) => {
+          let text: String = value
+            .pointer("/content/0/text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .chars()
+            .take(BATCH_RESULT_CHARS)
+            .collect();
+          results.push(serde_json::json!({ "tool": tool, "ok": true, "result": text }));
+        }
+        Err(error) => {
+          results.push(serde_json::json!({ "tool": tool, "ok": false, "error": error.message }));
+          stopped = Some("a step failed".to_string());
+          break;
+        }
+      }
+      if stop_on_change && position + 1 < steps.len() {
+        let now = self.page_state(&target).await.map(|state| state.url);
+        if now.is_some() && url.is_some() && now != url {
+          stopped = Some(format!(
+            "the page changed to {}",
+            now.clone().unwrap_or_default()
+          ));
+          break;
+        }
+        url = now;
+      }
+    }
+    let done = results.len();
+    Self::json_content(&serde_json::json!({
+      "results": results,
+      "completed": done,
+      "remaining": steps.len() - done,
+      "stopped": stopped,
+    }))
+  }
+
+  async fn handle_scroll(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    let direction = arguments
+      .get("direction")
+      .and_then(|v| v.as_str())
+      .unwrap_or("down");
+    let pages = arguments
+      .get("pages")
+      .and_then(|v| v.as_f64())
+      .unwrap_or(1.0)
+      .clamp(0.1, 10.0);
+
+    let ctx = self.agent_context(profile_id).await?;
+    let before = self.layout_metrics(&ctx.target).await?;
+    let (delta_x, delta_y) = scroll_delta(direction, pages, before.width, before.height)
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "direction must be up, down, left or right".to_string(),
+        data: None,
+      })?;
+
+    if ctx.engine.is_wayfern() {
+      vellum_wheel(&ctx.target, delta_x, delta_y)
+        .await
+        .map_err(AgentError::into_mcp)?;
+    } else {
+      self
+        .send_cdp(
+          &ctx.target,
+          "Input.dispatchMouseEvent",
+          serde_json::json!({
+            "type": "mouseWheel",
+            "x": before.width / 2.0,
+            "y": before.height / 2.0,
+            "deltaX": delta_x,
+            "deltaY": delta_y,
+          }),
+        )
+        .await?;
+    }
+    tokio::time::sleep(SCROLL_SETTLE).await;
+
+    let after = self.layout_metrics(&ctx.target).await?;
+    Self::json_content(&serde_json::json!({
+      "moved": (after.y - before.y).abs() > 1.0 || (after.x - before.x).abs() > 1.0,
+      "scroll_x": after.x.round(),
+      "scroll_y": after.y.round(),
+      "viewport_height": after.height.round(),
+      "page_height": after.page_height.round(),
+      "at_top": after.y <= 1.0,
+      "at_bottom": after.y + after.height >= after.page_height - 2.0,
+    }))
+  }
+
+  async fn handle_press_key(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    let name = Self::require_str(arguments, "key")?;
+    let stroke = key_stroke(name).ok_or_else(|| McpError {
+      code: -32602,
+      message: format!("Unknown key: {name}. Use a key name such as Enter, Tab, Escape or ArrowDown, or one character."),
+      data: None,
+    })?;
+    let modifiers: Vec<&str> = arguments
+      .get("modifiers")
+      .and_then(|v| v.as_array())
+      .map(|list| list.iter().filter_map(|m| m.as_str()).collect())
+      .unwrap_or_default();
+    let bits = modifier_bits(&modifiers).map_err(|message| McpError {
+      code: -32602,
+      message,
+      data: None,
+    })?;
+
+    let target = self.resolve_cdp_target(profile_id).await?;
+    // A shortcut (Ctrl or Meta held) types nothing.
+    let types = stroke.text.is_some() && bits & 0b0110 == 0;
+    let kind = if types { "keyDown" } else { "rawKeyDown" };
+    let mut down = serde_json::json!({
+      "type": kind,
+      "key": stroke.key,
+      "code": stroke.code,
+      "windowsVirtualKeyCode": stroke.key_code,
+      "nativeVirtualKeyCode": stroke.key_code,
+      "modifiers": bits,
+    });
+    if let Some(text) = stroke.text.as_ref().filter(|_| types) {
+      down["text"] = serde_json::json!(text);
+      down["unmodifiedText"] = serde_json::json!(text);
+    }
+    let before = self.page_state(&target).await.map(|state| state.url);
+    // The press is the step that may submit a form, so the wait watches it.
+    self
+      .send_cdp_and_wait_for_load(&target, "Input.dispatchKeyEvent", down, 10, false)
+      .await?;
+    self
+      .send_cdp(
+        &target,
+        "Input.dispatchKeyEvent",
+        serde_json::json!({
+          "type": "keyUp",
+          "key": stroke.key,
+          "code": stroke.code,
+          "windowsVirtualKeyCode": stroke.key_code,
+          "nativeVirtualKeyCode": stroke.key_code,
+          "modifiers": bits,
+        }),
+      )
+      .await?;
+
+    let state = self.page_state(&target).await;
+    let mut text = format!("Pressed {name}");
+    if let Some(state) = state {
+      if before.is_some_and(|url| url != state.url) {
+        text.push_str(" (the page changed)");
+      }
+      text.push('\n');
+      text.push_str(&page_report(&state));
+    }
+    Ok(serde_json::json!({ "content": [{ "type": "text", "text": text }] }))
+  }
+
+  async fn handle_go_back(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    let target = self.resolve_cdp_target(profile_id).await?;
+    let history = self
+      .send_cdp(&target, "Page.getNavigationHistory", serde_json::json!({}))
+      .await?;
+    let current = history
+      .get("currentIndex")
+      .and_then(|v| v.as_u64())
+      .unwrap_or(0) as usize;
+    let previous = current
+      .checked_sub(1)
+      .and_then(|index| history.pointer(&format!("/entries/{index}/id")))
+      .and_then(|id| id.as_u64());
+    let Some(entry_id) = previous else {
+      return Ok(serde_json::json!({
+        "content": [{ "type": "text", "text": "There is no earlier page in this tab." }]
+      }));
+    };
+    self
+      .send_cdp_and_wait_for_load(
+        &target,
+        "Page.navigateToHistoryEntry",
+        serde_json::json!({ "entryId": entry_id }),
+        30,
+        true,
+      )
+      .await?;
+    Ok(self.with_page_line(&target, "Went back".to_string()).await)
+  }
+
+  async fn handle_wait_for(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    let text = arguments
+      .get("text")
+      .and_then(|v| v.as_str())
+      .filter(|t| !t.is_empty());
+    let selector = arguments
+      .get("selector")
+      .and_then(|v| v.as_str())
+      .filter(|s| !s.is_empty());
+    let script = wait_for_script(text, selector).ok_or_else(|| McpError {
+      code: -32602,
+      message: "Pass text or selector, not both".to_string(),
+      data: None,
+    })?;
+    let gone = arguments
+      .get("gone")
+      .and_then(|v| v.as_bool())
+      .unwrap_or(false);
+    let timeout_ms = arguments
+      .get("timeout_ms")
+      .and_then(|v| v.as_u64())
+      .unwrap_or(WAIT_FOR_DEFAULT_MS)
+      .clamp(100, WAIT_FOR_MAX_MS);
+
+    let target = self.resolve_cdp_target(profile_id).await?;
+    let started = std::time::Instant::now();
+    let deadline = started + Duration::from_millis(timeout_ms);
+    let met = loop {
+      let reply = self
+        .send_cdp(
+          &target,
+          "Runtime.evaluate",
+          serde_json::json!({ "expression": script, "returnByValue": true }),
+        )
+        .await;
+      match reply {
+        Ok(reply) if reply.get("exceptionDetails").is_some() => {
+          return Err(McpError {
+            code: -32602,
+            message: "The selector is not valid CSS".to_string(),
+            data: None,
+          });
+        }
+        Ok(reply) => {
+          let present = reply
+            .pointer("/result/value")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+          if present != gone {
+            break true;
+          }
+        }
+        // A navigation in progress has no page to ask; the next look will.
+        Err(_) => {}
+      }
+      if std::time::Instant::now() >= deadline {
+        break false;
+      }
+      tokio::time::sleep(WAIT_FOR_POLL).await;
+    };
+    let state = self.page_state(&target).await.unwrap_or_default();
+    Self::json_content(&wait_report(met, started.elapsed(), &state))
+  }
 
   async fn handle_navigate(
     &self,
@@ -5192,14 +11681,10 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
-    let url = arguments
-      .get("url")
-      .and_then(|v| v.as_str())
-      .ok_or_else(|| McpError {
-        code: -32602,
-        message: "Missing url".to_string(),
-      })?;
+    // Read and validated in one step, so the safe path is the short one.
+    let url = Self::require_navigable_url(arguments, "url")?;
 
     let target = self.resolve_cdp_target(profile_id).await?;
 
@@ -5209,15 +11694,15 @@ impl McpServer {
         "Page.navigate",
         serde_json::json!({ "url": url }),
         30,
+        true,
       )
       .await?;
 
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": format!("Navigated to {url}")
-      }]
-    }))
+    Ok(
+      self
+        .with_page_line(&target, format!("Navigated to {url}"))
+        .await,
+    )
   }
 
   async fn handle_screenshot(
@@ -5230,40 +11715,51 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
+    // JPEG by default: an agent reads a screenshot, it does not archive one,
+    // and a JPEG is a fraction of the PNG's size in the context it fills.
     let format = arguments
       .get("format")
       .and_then(|v| v.as_str())
-      .unwrap_or("png");
-    let quality = arguments.get("quality").and_then(|v| v.as_i64());
+      .unwrap_or("jpeg");
+    let quality = arguments
+      .get("quality")
+      .and_then(|v| v.as_i64())
+      .or((format != "png").then_some(75));
     let full_page = arguments
       .get("full_page")
       .and_then(|v| v.as_bool())
       .unwrap_or(false);
+    let max_width = arguments
+      .get("max_width")
+      .and_then(|v| v.as_u64())
+      .unwrap_or(1280)
+      .clamp(320, 4096) as f64;
 
     let target = self.resolve_cdp_target(profile_id).await?;
 
     let mut params = serde_json::json!({ "format": format });
 
-    if let Some(q) = quality {
-      params["quality"] = serde_json::json!(q);
+    if let Some(q) = quality.filter(|_| format != "png") {
+      params["quality"] = serde_json::json!(q.clamp(0, 100));
     }
 
+    let layout = self.layout_metrics(&target).await?;
+    let (x, y, width, height) = if full_page {
+      (0.0, 0.0, layout.page_width, layout.page_height)
+    } else {
+      (layout.x, layout.y, layout.width, layout.height)
+    };
+    params["clip"] = serde_json::json!({
+      "x": x,
+      "y": y,
+      "width": width,
+      "height": height,
+      "scale": screenshot_scale(width, layout.dpr, max_width),
+    });
     if full_page {
-      let layout = self
-        .send_cdp(&target, "Page.getLayoutMetrics", serde_json::json!({}))
-        .await?;
-
-      if let Some(content_size) = layout.get("contentSize") {
-        params["clip"] = serde_json::json!({
-          "x": 0,
-          "y": 0,
-          "width": content_size.get("width").and_then(|v| v.as_f64()).unwrap_or(1920.0),
-          "height": content_size.get("height").and_then(|v| v.as_f64()).unwrap_or(1080.0),
-          "scale": 1
-        });
-        params["captureBeyondViewport"] = serde_json::json!(true);
-      }
+      params["captureBeyondViewport"] = serde_json::json!(true);
     }
 
     let result = self
@@ -5294,6 +11790,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
     let expression = arguments
       .get("expression")
@@ -5301,6 +11798,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing expression".to_string(),
+        data: None,
       })?;
     let await_promise = arguments
       .get("await_promise")
@@ -5321,7 +11819,7 @@ impl McpServer {
 
     let result = if wait_for_load {
       self
-        .send_cdp_and_wait_for_load(&target, "Runtime.evaluate", cdp_params, 30)
+        .send_cdp_and_wait_for_load(&target, "Runtime.evaluate", cdp_params, 30, false)
         .await?
     } else {
       self
@@ -5347,12 +11845,7 @@ impl McpServer {
       serde_json::json!({ "value": null })
     };
 
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": serde_json::to_string_pretty(&value).unwrap_or_default()
-      }]
-    }))
+    Self::json_content(&value)
   }
 
   async fn handle_click_element(
@@ -5365,6 +11858,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
     let selector = arguments
       .get("selector")
@@ -5372,11 +11866,31 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing selector".to_string(),
+        data: None,
       })?;
 
-    let target = self.resolve_cdp_target(profile_id).await?;
-
+    let ctx = self.agent_context(profile_id).await?;
     let selector_escaped = selector.replace('\\', "\\\\").replace('\'', "\\'");
+
+    if ctx.engine.is_wayfern() {
+      // On 152 no script clicks anything. The page only says where the
+      // element is; the click comes from a real pointer that glides there
+      // and presses with the profile's own timing, through the same input
+      // path a mouse uses.
+      let point = locate_by_script(&ctx.target, element_rect_script(&selector_escaped)).await?;
+      let (_, navigated) = vellum_click(&ctx.target, point, None, None)
+        .await
+        .map_err(AgentError::into_mcp)?;
+      return Ok(
+        self
+          .with_page_line(
+            &ctx.target,
+            click_report(&format!("Clicked element: {selector}"), navigated),
+          )
+          .await,
+      );
+    }
+
     let js = format!(
       r#"(() => {{
         const el = document.querySelector('{}');
@@ -5389,17 +11903,18 @@ impl McpServer {
     );
 
     // Use send_cdp_and_wait_for_load: if the click triggers navigation,
-    // we wait for the new page to load. If not, the 10s timeout expires
-    // and we return immediately.
+    // we wait for the new page to load; if no navigation starts, the wait
+    // ends a moment after the click.
     let result = self
       .send_cdp_and_wait_for_load(
-        &target,
+        &ctx.target,
         "Runtime.evaluate",
         serde_json::json!({
           "expression": js,
           "returnByValue": true,
         }),
         10,
+        false,
       )
       .await?;
 
@@ -5413,15 +11928,15 @@ impl McpServer {
       return Err(McpError {
         code: -32000,
         message: msg.to_string(),
+        data: None,
       });
     }
 
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": format!("Clicked element: {selector}")
-      }]
-    }))
+    Ok(
+      self
+        .with_page_line(&ctx.target, format!("Clicked element: {selector}"))
+        .await,
+    )
   }
 
   async fn handle_type_text(
@@ -5434,6 +11949,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
     let selector = arguments
       .get("selector")
@@ -5441,6 +11957,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing selector".to_string(),
+        data: None,
       })?;
     let text = arguments
       .get("text")
@@ -5448,6 +11965,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing text".to_string(),
+        data: None,
       })?;
     let clear_first = arguments
       .get("clear_first")
@@ -5458,76 +11976,50 @@ impl McpServer {
       .and_then(|v| v.as_bool())
       .unwrap_or(false);
     let wpm = arguments.get("wpm").and_then(|v| v.as_f64());
+    let typos = arguments
+      .get("typos")
+      .and_then(|v| v.as_bool())
+      .unwrap_or(true);
 
-    let target = self.resolve_cdp_target(profile_id).await?;
+    // The engine is read off the profile before any budget is decided. A 152
+    // browser types through Vellum, which paces the keys itself, so the plan
+    // below is only built for the fallback engine.
+    let profile = self.get_wayfern_profile(profile_id)?;
+    let engine = Engine::for_version(&profile.version);
+    let humanized = engine.is_wayfern() && !instant;
 
-    let selector_escaped = selector.replace('\\', "\\\\").replace('\'', "\\'");
-    let focus_js = if clear_first {
-      format!(
-        r#"(() => {{
-          const el = document.querySelector('{}');
-          if (!el) throw new Error('Element not found: {}');
-          el.scrollIntoView({{block: 'center'}});
-          el.focus();
-          el.value = '';
-          el.dispatchEvent(new Event('input', {{bubbles: true}}));
-          return true;
-        }})()"#,
-        selector_escaped, selector_escaped
-      )
+    // PLANNED FIRST, before anything touches the page. The planner can refuse
+    // (TYPING_TOO_LONG), and the typing below replaces what the field holds
+    // when `clear_first` is set — so planning after it meant the server answered
+    // "refused, nothing happened" having already wiped the customer's form
+    // field. The refusal now precedes every mutation on every branch,
+    // including the Vellum budget, which is decided in the same place.
+    let plan = if instant || humanized {
+      None
     } else {
-      format!(
-        r#"(() => {{
-          const el = document.querySelector('{}');
-          if (!el) throw new Error('Element not found: {}');
-          el.scrollIntoView({{block: 'center'}});
-          el.focus();
-          return true;
-        }})()"#,
-        selector_escaped, selector_escaped
-      )
+      Some(plan_typing(text, wpm, MAX_BRIDGE_TYPING_SECONDS)?)
+    };
+    let inscribe_timeout = if humanized {
+      Some(vellum_typing_budget(text, MAX_BRIDGE_TYPING_SECONDS)?)
+    } else {
+      None
     };
 
-    let focus_result = self
-      .send_cdp(
-        &target,
-        "Runtime.evaluate",
-        serde_json::json!({
-          "expression": focus_js,
-          "returnByValue": true,
-        }),
-      )
-      .await?;
-
-    if let Some(exception) = focus_result.get("exceptionDetails") {
-      let msg = exception
-        .get("exception")
-        .and_then(|e| e.get("description"))
-        .or_else(|| exception.get("text"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("Focus failed");
-      return Err(McpError {
-        code: -32000,
-        message: msg.to_string(),
-      });
-    }
-
-    if instant {
-      self
-        .send_cdp(
-          &target,
-          "Input.insertText",
-          serde_json::json!({ "text": text }),
-        )
-        .await?;
-    } else {
-      self.send_human_keystrokes(&target, text, wpm).await?;
-    }
-
+    let target = resolve_target(&profile).await?;
+    let (typed, _) = type_element(
+      &target,
+      engine,
+      &ElementRef::Selector(selector.to_string()),
+      text,
+      clear_first,
+      TypingMethod::chosen(inscribe_timeout, plan.as_deref(), typos),
+    )
+    .await
+    .map_err(AgentError::into_mcp)?;
     Ok(serde_json::json!({
       "content": [{
         "type": "text",
-        "text": format!("Typed text into element: {selector}")
+        "text": typing_report(&format!("Typed text into element: {selector}"), &typed)
       }]
     }))
   }
@@ -5542,6 +12034,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
     let format = arguments
       .get("format")
@@ -5552,7 +12045,7 @@ impl McpServer {
       .get("max_chars")
       .and_then(|v| v.as_u64())
       .map(|n| n as usize)
-      .unwrap_or(40_000);
+      .unwrap_or(20_000);
 
     let target = self.resolve_cdp_target(profile_id).await?;
 
@@ -5567,18 +12060,12 @@ impl McpServer {
           sel_escaped
         )
       } else {
-        format!(
-          r#"(() => {{
-            const el = document.querySelector('{}');
-            return el ? el.innerText : null;
-          }})()"#,
-          sel_escaped
-        )
+        rendered_text_js(&format!("document.querySelector('{sel_escaped}')"))
       }
     } else if format == "html" {
       "document.documentElement.outerHTML".to_string()
     } else {
-      "document.body.innerText".to_string()
+      rendered_text_js("document.body")
     };
 
     let result = self
@@ -5634,6 +12121,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
 
     let target = self.resolve_cdp_target(profile_id).await?;
@@ -5657,38 +12145,52 @@ impl McpServer {
 
     let info: serde_json::Value = serde_json::from_str(info_str).unwrap_or(serde_json::json!({}));
 
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": serde_json::to_string_pretty(&info).unwrap_or_default()
-      }]
-    }))
+    Self::json_content(&info)
   }
 
   async fn handle_get_interactive_elements(
     &self,
+    caller: McpCaller<'_>,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
+    // FIRST, before the page is touched. The indices this hands back are only
+    // usable by a session, and a sessionless caller would otherwise write a
+    // snapshot into a slot it shares with every other sessionless caller, the
+    // exact array-mixing that makes click_by_index click the wrong element.
+    let session = require_indexed_session(caller)?;
     let profile_id = arguments
       .get("profile_id")
       .and_then(|v| v.as_str())
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
     let max_chars = arguments
       .get("max_chars")
       .and_then(|v| v.as_u64())
       .map(|n| n as usize)
-      .unwrap_or(40_000);
+      .unwrap_or(12_000);
 
     let target = self.resolve_cdp_target(profile_id).await?;
 
     // Walk the DOM for visible, non-disabled interactive elements, label them
-    // with a zero-based index, and cache the live references on
-    // `window.__donut_interactive` so click_by_index / type_by_index can
-    // resolve the index → Element without round-tripping a selector.
-    let js = INTERACTIVE_ELEMENTS_JS.replace("__MAX_CHARS__", &max_chars.to_string());
+    // with a zero-based index, and cache the live references on THIS CALLER'S
+    // slot so click_by_index / type_by_index can resolve the index → Element
+    // without round-tripping a selector.
+    //
+    // Per session, because the slot used to be one shared `__donut_interactive`
+    // array on the page, and then one per transport. Either way a second client
+    // listing elements overwrote the array the first had just built, so that
+    // client's next `click_by_index(3)` clicked whatever happened to be third
+    // in the OTHER caller's snapshot, a wrong click reported as a successful
+    // one, which is the worst shape a failure can take on somebody's browser.
+    let slot = interactive_cache_slot(session);
+    let js = INTERACTIVE_ELEMENTS_JS
+      .replace("__MAX_CHARS__", &max_chars.to_string())
+      .replace("__CACHE__", &slot)
+      .replace("__REGISTRY__", INTERACTIVE_SLOT_REGISTRY)
+      .replace("__MAX_SLOTS__", &MAX_CACHE_SLOTS_PER_PAGE.to_string());
 
     let result = self
       .send_cdp(
@@ -5711,8 +12213,14 @@ impl McpServer {
       return Err(McpError {
         code: -32000,
         message: msg.to_string(),
+        data: None,
       });
     }
+
+    // Recorded only once the write has actually landed, so `end_session` cleans
+    // up pages this session really wrote to rather than every page it asked
+    // about.
+    self.remember_cached_page(session, profile_id, &slot).await;
 
     let payload_str = result
       .get("result")
@@ -5748,28 +12256,45 @@ impl McpServer {
 
   async fn handle_click_by_index(
     &self,
+    caller: McpCaller<'_>,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
+    // Refused before anything else runs: an index names a position in an array
+    // a PREVIOUS call left on the page, and without a session there is no
+    // answer to whose array that is, only a shared slot to guess against.
+    let cache = interactive_cache_slot(require_indexed_session(caller)?);
     let profile_id = arguments
       .get("profile_id")
       .and_then(|v| v.as_str())
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
-    let index = arguments
-      .get("index")
-      .and_then(|v| v.as_u64())
-      .ok_or_else(|| McpError {
-        code: -32602,
-        message: "Missing index".to_string(),
-      })?;
+    let index = self.element_index(profile_id, &cache, arguments).await?;
 
-    let target = self.resolve_cdp_target(profile_id).await?;
+    let ctx = self.agent_context(profile_id).await?;
+
+    if ctx.engine.is_wayfern() {
+      // As for click_element: the cached reference only says where the
+      // element is, and a real pointer does the clicking.
+      let point = locate_by_script(&ctx.target, indexed_rect_script(&cache, index)).await?;
+      let (_, navigated) = vellum_click(&ctx.target, point, None, None)
+        .await
+        .map_err(AgentError::into_mcp)?;
+      return Ok(
+        self
+          .with_page_line(
+            &ctx.target,
+            click_report(&format!("Clicked element at index {index}"), navigated),
+          )
+          .await,
+      );
+    }
 
     let js = format!(
       r#"(() => {{
-        const arr = window.__donut_interactive;
+        const arr = window[{cache}];
         if (!arr || !arr[{index}]) throw new Error('No element at index {index}. Call get_interactive_elements first or after navigation.');
         const el = arr[{index}];
         el.scrollIntoView({{block: 'center'}});
@@ -5780,13 +12305,14 @@ impl McpServer {
 
     let result = self
       .send_cdp_and_wait_for_load(
-        &target,
+        &ctx.target,
         "Runtime.evaluate",
         serde_json::json!({
           "expression": js,
           "returnByValue": true,
         }),
         10,
+        false,
       )
       .await?;
 
@@ -5800,41 +12326,42 @@ impl McpServer {
       return Err(McpError {
         code: -32000,
         message: msg.to_string(),
+        data: None,
       });
     }
 
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": format!("Clicked element at index {index}")
-      }]
-    }))
+    Ok(
+      self
+        .with_page_line(&ctx.target, format!("Clicked element at index {index}"))
+        .await,
+    )
   }
 
   async fn handle_type_by_index(
     &self,
+    caller: McpCaller<'_>,
     arguments: &serde_json::Value,
   ) -> Result<serde_json::Value, McpError> {
+    // Same refusal as click_by_index, and for the same reason: typing into
+    // whatever happens to sit at index 3 of somebody else's snapshot is a
+    // wrong action reported as a successful one.
+    let cache = interactive_cache_slot(require_indexed_session(caller)?);
     let profile_id = arguments
       .get("profile_id")
       .and_then(|v| v.as_str())
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing profile_id".to_string(),
+        data: None,
       })?;
-    let index = arguments
-      .get("index")
-      .and_then(|v| v.as_u64())
-      .ok_or_else(|| McpError {
-        code: -32602,
-        message: "Missing index".to_string(),
-      })?;
+    let index = self.element_index(profile_id, &cache, arguments).await?;
     let text = arguments
       .get("text")
       .and_then(|v| v.as_str())
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing text".to_string(),
+        data: None,
       })?;
     let clear_first = arguments
       .get("clear_first")
@@ -5845,79 +12372,789 @@ impl McpServer {
       .and_then(|v| v.as_bool())
       .unwrap_or(false);
     let wpm = arguments.get("wpm").and_then(|v| v.as_f64());
+    let typos = arguments
+      .get("typos")
+      .and_then(|v| v.as_bool())
+      .unwrap_or(true);
 
-    let target = self.resolve_cdp_target(profile_id).await?;
+    // Engine first, then budgets, then the page: see handle_type_text.
+    let profile = self.get_wayfern_profile(profile_id)?;
+    let engine = Engine::for_version(&profile.version);
+    let humanized = engine.is_wayfern() && !instant;
 
-    // Mirrors handle_type_text's focus step but resolves the element via the
-    // cached index instead of a CSS selector.
-    let focus_js = if clear_first {
-      format!(
-        r#"(() => {{
-          const arr = window.__donut_interactive;
-          if (!arr || !arr[{index}]) throw new Error('No element at index {index}. Call get_interactive_elements first or after navigation.');
-          const el = arr[{index}];
-          el.scrollIntoView({{block: 'center'}});
-          el.focus();
-          el.value = '';
-          el.dispatchEvent(new Event('input', {{bubbles: true}}));
-          return true;
-        }})()"#
-      )
+    // PLANNED FIRST, before anything touches the page. The planner can refuse
+    // (TYPING_TOO_LONG), and the typing below replaces what the field holds
+    // when `clear_first` is set — so planning after it meant the server answered
+    // "refused, nothing happened" having already wiped the customer's form
+    // field. The refusal now precedes every mutation on every branch.
+    let plan = if instant || humanized {
+      None
     } else {
-      format!(
-        r#"(() => {{
-          const arr = window.__donut_interactive;
-          if (!arr || !arr[{index}]) throw new Error('No element at index {index}. Call get_interactive_elements first or after navigation.');
-          const el = arr[{index}];
-          el.scrollIntoView({{block: 'center'}});
-          el.focus();
-          return true;
-        }})()"#
-      )
+      Some(plan_typing(text, wpm, MAX_BRIDGE_TYPING_SECONDS)?)
+    };
+    let inscribe_timeout = if humanized {
+      Some(vellum_typing_budget(text, MAX_BRIDGE_TYPING_SECONDS)?)
+    } else {
+      None
     };
 
-    let focus_result = self
-      .send_cdp(
-        &target,
-        "Runtime.evaluate",
-        serde_json::json!({
-          "expression": focus_js,
-          "returnByValue": true,
-        }),
-      )
-      .await?;
-
-    if let Some(exception) = focus_result.get("exceptionDetails") {
-      let msg = exception
-        .get("exception")
-        .and_then(|e| e.get("description"))
-        .or_else(|| exception.get("text"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("Focus failed");
-      return Err(McpError {
-        code: -32000,
-        message: msg.to_string(),
-      });
-    }
-
-    if instant {
-      self
-        .send_cdp(
-          &target,
-          "Input.insertText",
-          serde_json::json!({ "text": text }),
-        )
-        .await?;
-    } else {
-      self.send_human_keystrokes(&target, text, wpm).await?;
-    }
-
+    let target = resolve_target(&profile).await?;
+    let (typed, _) = type_element(
+      &target,
+      engine,
+      &ElementRef::Index { cache, index },
+      text,
+      clear_first,
+      TypingMethod::chosen(inscribe_timeout, plan.as_deref(), typos),
+    )
+    .await
+    .map_err(AgentError::into_mcp)?;
     Ok(serde_json::json!({
       "content": [{
         "type": "text",
-        "text": format!("Typed text into element at index {index}")
+        "text": typing_report(&format!("Typed text into element at index {index}"), &typed)
       }]
     }))
+  }
+
+  // --- Agent handlers: perception, locators, extraction, picker ---
+
+  /// The running browser behind `profile_id`, and the engine its version gets.
+  async fn agent_context(&self, profile_id: &str) -> Result<AgentContext, McpError> {
+    let profile = self.get_wayfern_profile(profile_id)?;
+    let target = resolve_target(&profile).await?;
+    Ok(AgentContext::new(profile, target))
+  }
+
+  /// Read a tool's arguments into the request type the shared operation takes.
+  ///
+  /// `profile_id` and any other argument the type does not name are ignored,
+  /// which is what lets one struct serve both the MCP arguments and the REST
+  /// body.
+  fn agent_arguments<T: serde::de::DeserializeOwned>(
+    arguments: &serde_json::Value,
+  ) -> Result<T, McpError> {
+    serde_json::from_value(arguments.clone()).map_err(|e| McpError {
+      code: -32602,
+      message: format!("Invalid arguments: {e}"),
+      data: None,
+    })
+  }
+
+  async fn handle_perceive_page(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    let request: PerceptionRequest = Self::agent_arguments(arguments)?;
+    let ctx = self.agent_context(profile_id).await?;
+    let page = agent_perceive(&ctx, &request)
+      .await
+      .map_err(AgentError::into_mcp)?;
+    Self::json_content(&page)
+  }
+
+  async fn handle_resolve_locator(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    let request: AgentResolveRequest = Self::agent_arguments(arguments)?;
+    let ctx = self.agent_context(profile_id).await?;
+    let resolved = agent_resolve_locator(&ctx, &request)
+      .await
+      .map_err(AgentError::into_mcp)?;
+    Self::json_content(&resolved)
+  }
+
+  async fn handle_click_locator(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    let request: AgentClickRequest = Self::agent_arguments(arguments)?;
+    let ctx = self.agent_context(profile_id).await?;
+    let clicked = agent_click_locator(&ctx, &request)
+      .await
+      .map_err(AgentError::into_mcp)?;
+    Self::json_content(&clicked)
+  }
+
+  async fn handle_press_and_hold(
+    &self,
+    caller: McpCaller<'_>,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    let duration_ms = match arguments.get("duration_ms") {
+      None | Some(serde_json::Value::Null) => None,
+      // Anything but a number fails the bounds check with the same words.
+      Some(value) => Some(value.as_f64().unwrap_or(f64::NAN)),
+    };
+    let (duration_ms, button) = hold_settings(
+      duration_ms,
+      arguments.get("button").and_then(|v| v.as_str()),
+    )
+    .map_err(AgentError::into_mcp)?;
+    let element = self.form_element_ref(caller, profile_id, arguments).await?;
+    let ctx = self.agent_context(profile_id).await?;
+    let held = agent_press_and_hold(&ctx, &element, duration_ms, button)
+      .await
+      .map_err(AgentError::into_mcp)?;
+    Self::json_content(&held)
+  }
+
+  async fn handle_type_locator(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    let request: AgentTypeRequest = Self::agent_arguments(arguments)?;
+    let ctx = self.agent_context(profile_id).await?;
+    let typed = agent_type_locator(&ctx, &request, MAX_BRIDGE_TYPING_SECONDS)
+      .await
+      .map_err(AgentError::into_mcp)?;
+    Self::json_content(&typed)
+  }
+
+  /// The element a form tool names: one of selector, locator, index or
+  /// element_id.
+  async fn form_element_ref(
+    &self,
+    caller: McpCaller<'_>,
+    profile_id: &str,
+    arguments: &serde_json::Value,
+  ) -> Result<ElementRef, McpError> {
+    let given = |key: &str| arguments.get(key).is_some_and(|v| !v.is_null());
+    let named = ["selector", "locator", "index", "element_id"]
+      .into_iter()
+      .filter(|key| given(key))
+      .count();
+    if named != 1 {
+      return Err(McpError {
+        code: -32602,
+        message: "Name the element one way: selector, locator, index or element_id".to_string(),
+        data: None,
+      });
+    }
+    if given("locator") {
+      let locator: LocatorDescription = Self::agent_arguments(&arguments["locator"])?;
+      validate_locator(&locator).map_err(AgentError::into_mcp)?;
+      return Ok(ElementRef::Locator(canonical_locator(&locator)));
+    }
+    if given("selector") {
+      return Ok(ElementRef::Selector(
+        Self::require_str(arguments, "selector")?.to_string(),
+      ));
+    }
+    let cache = interactive_cache_slot(require_indexed_session(caller)?);
+    let index = self.element_index(profile_id, &cache, arguments).await?;
+    Ok(ElementRef::Index { cache, index })
+  }
+
+  async fn handle_select_option(
+    &self,
+    caller: McpCaller<'_>,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    let wanted: Option<Vec<String>> = match (arguments.get("option"), arguments.get("options")) {
+      (Some(serde_json::Value::String(one)), None) => Some(vec![one.clone()]),
+      (None, Some(serde_json::Value::Array(many))) if !many.is_empty() => many
+        .iter()
+        .map(|v| v.as_str().map(str::to_string))
+        .collect(),
+      _ => None,
+    };
+    let wanted = wanted.ok_or_else(|| McpError {
+      code: -32602,
+      message: "Give option (one value or label) or options (a list of them)".to_string(),
+      data: None,
+    })?;
+    let element = self.form_element_ref(caller, profile_id, arguments).await?;
+    let ctx = self.agent_context(profile_id).await?;
+    let selected = agent_select_option(&ctx, &element, &wanted)
+      .await
+      .map_err(AgentError::into_mcp)?;
+    Self::json_content(&selected)
+  }
+
+  async fn handle_file_upload(
+    &self,
+    caller: McpCaller<'_>,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    let files = upload_files(arguments).map_err(AgentError::into_mcp)?;
+    let element = self.form_element_ref(caller, profile_id, arguments).await?;
+    let ctx = self.agent_context(profile_id).await?;
+    if ctx.target.is_remote() {
+      return Err(McpError {
+        code: -32000,
+        message: "file_upload works only for a profile whose browser runs on this computer."
+          .to_string(),
+        data: Some(serde_json::json!({ "code": "FILE_UPLOAD_LOCAL_ONLY" })),
+      });
+    }
+    // A browser that exited by itself left its files; nothing reads them now.
+    if let Ok(profiles) = ProfileManager::instance().list_profiles() {
+      let running: HashSet<String> = profiles
+        .iter()
+        .filter(|p| p.process_id.is_some())
+        .map(|p| p.id.to_string())
+        .collect();
+      crate::agent_uploads::sweep(|id| running.contains(id));
+    }
+    let uploaded = agent_file_upload(&ctx, &element, &files)
+      .await
+      .map_err(AgentError::into_mcp)?;
+    Self::json_content(&uploaded)
+  }
+
+  async fn handle_start_network_capture(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    use crate::network_capture::StartError;
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    let profile = self.get_wayfern_profile(profile_id)?;
+    match crate::network_capture::start(&profile).await {
+      Ok(answer) => Self::json_content(&answer),
+      Err(StartError::NotLocal) => Err(McpError {
+        code: -32000,
+        message: "No browser of this profile runs on this computer. Network capture works for a profile launched here with run_profile, not on the remote fleet.".to_string(),
+        data: Some(serde_json::json!({ "code": "NETWORK_CAPTURE_LOCAL_ONLY" })),
+      }),
+      Err(StartError::Refused(reason)) => Err(McpError {
+        code: -32000,
+        message: format!("The browser did not accept the capture: {reason}"),
+        data: Some(serde_json::json!({ "code": "NETWORK_CAPTURE_FAILED" })),
+      }),
+    }
+  }
+
+  fn handle_stop_network_capture(
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    let answer = match crate::network_capture::stop(profile_id) {
+      Some(requests) => serde_json::json!({ "stopped": true, "requests": requests }),
+      None => serde_json::json!({ "stopped": false }),
+    };
+    Self::json_content(&answer)
+  }
+
+  fn capture_not_running() -> McpError {
+    McpError {
+      code: -32000,
+      message: "No network capture runs for this profile. Call start_network_capture first; a capture ends when its browser stops.".to_string(),
+      data: Some(serde_json::json!({ "code": "NETWORK_CAPTURE_NOT_RUNNING" })),
+    }
+  }
+
+  fn handle_list_network_requests(
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    use crate::mcp_views::{DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT};
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    let text = |key: &str| {
+      arguments
+        .get(key)
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+    };
+    let limit = match arguments.get("limit") {
+      None | Some(serde_json::Value::Null) => DEFAULT_LIST_LIMIT,
+      Some(value) => value
+        .as_u64()
+        .filter(|n| (1..=MAX_LIST_LIMIT as u64).contains(n))
+        .ok_or_else(|| McpError {
+          code: -32602,
+          message: format!("limit is a whole number from 1 to {MAX_LIST_LIMIT}"),
+          data: None,
+        })? as usize,
+    };
+    let query = crate::network_capture::ListQuery {
+      after: arguments.get("after").and_then(|v| v.as_u64()).unwrap_or(0),
+      limit,
+      url_contains: text("url_contains"),
+      method: text("method"),
+      resource_type: text("type"),
+      status: arguments.get("status").and_then(|v| v.as_u64()),
+      failed: arguments.get("failed").and_then(|v| v.as_bool()),
+      body_contains: text("body_contains"),
+    };
+    let answer = crate::network_capture::read(profile_id, |log| log.list(&query))
+      .ok_or_else(Self::capture_not_running)?;
+    Self::json_content(&answer)
+  }
+
+  fn handle_get_network_request(
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    let id = arguments
+      .get("request_id")
+      .and_then(|v| v.as_u64())
+      .ok_or_else(|| McpError {
+        code: -32602,
+        message: "Missing request_id".to_string(),
+        data: None,
+      })?;
+    let with_body = arguments
+      .get("body")
+      .and_then(|v| v.as_bool())
+      .unwrap_or(true);
+    let offset = arguments
+      .get("body_offset")
+      .and_then(|v| v.as_u64())
+      .unwrap_or(0) as usize;
+    let max_chars = arguments
+      .get("max_body_chars")
+      .and_then(|v| v.as_u64())
+      .unwrap_or(DEFAULT_BODY_CHARS)
+      .clamp(1, MAX_BODY_CHARS) as usize;
+    match crate::network_capture::read(profile_id, |log| {
+      log.detail(id, with_body, offset, max_chars)
+    }) {
+      None => Err(Self::capture_not_running()),
+      Some(None) => Err(McpError {
+        code: -32000,
+        message: format!(
+          "No request {id} in the capture. Ids come from list_network_requests; the oldest are dropped past 2,000."
+        ),
+        data: Some(serde_json::json!({ "code": "NETWORK_REQUEST_NOT_FOUND" })),
+      }),
+      Some(Some(answer)) => Self::json_content(&answer),
+    }
+  }
+
+  async fn handle_extract_structured(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    let mut request: ExtractionRequest = Self::agent_arguments(arguments)?;
+    // Clamped to what the transport can carry, like the picker's wait.
+    request.time_budget_ms = Some(
+      request
+        .time_budget_ms
+        .unwrap_or(8_000)
+        .min(MAX_BRIDGE_PICK_TIMEOUT_MS),
+    );
+    let ctx = self.agent_context(profile_id).await?;
+    let extraction = agent_extract(&ctx, &request)
+      .await
+      .map_err(AgentError::into_mcp)?;
+    Self::json_content(&extraction)
+  }
+
+  /// Reads and the human channel keep working while agents are paused.
+  fn is_passive_tool(tool_name: &str) -> bool {
+    crate::agent_console::HUMAN_TOOLS.contains(&tool_name)
+      || tool_name == "send_feedback"
+      || ((tool_name.starts_with("list_") || tool_name.starts_with("get_"))
+        && !Self::is_automation_tool(tool_name))
+  }
+
+  fn error_code_of(error: &McpError) -> String {
+    if let Some(code) = error
+      .data
+      .as_ref()
+      .and_then(|data| data.get("code"))
+      .and_then(serde_json::Value::as_str)
+    {
+      return code.to_string();
+    }
+    if let Some(code) = serde_json::from_str::<serde_json::Value>(&error.message)
+      .ok()
+      .and_then(|value| {
+        value
+          .get("code")
+          .and_then(serde_json::Value::as_str)
+          .map(str::to_string)
+      })
+    {
+      return code;
+    }
+    match error.code {
+      -32602 => "INVALID_ARGUMENT".to_string(),
+      _ => "TOOL_ERROR".to_string(),
+    }
+  }
+
+  fn console_refusal(refusal: crate::agent_console::Refusal) -> McpError {
+    match refusal {
+      crate::agent_console::Refusal::Paused { note } => McpError {
+        code: -32000,
+        message: match &note {
+          Some(note) => format!("The person at this computer paused all agents: {note}. Wait, then call get_human_updates before you continue."),
+          None => "The person at this computer paused all agents. Wait, then call get_human_updates before you continue.".to_string(),
+        },
+        data: Some(serde_json::json!({ "code": "AGENT_PAUSED", "note": note })),
+      },
+      crate::agent_console::Refusal::ProfileHeld { profile_id, note } => McpError {
+        code: -32000,
+        message: match &note {
+          Some(note) => format!("The person at this computer has taken over profile {profile_id}: {note}. Work on other profiles; get_human_updates shows when it is handed back."),
+          None => format!("The person at this computer has taken over profile {profile_id}. Work on other profiles; get_human_updates shows when it is handed back."),
+        },
+        data: Some(serde_json::json!({ "code": "PROFILE_HELD_BY_HUMAN", "profileId": profile_id, "note": note })),
+      },
+    }
+  }
+
+  fn attach_notes(value: &mut serde_json::Value, session: Option<&str>) {
+    let Some(content) = value
+      .get_mut("content")
+      .and_then(serde_json::Value::as_array_mut)
+    else {
+      return;
+    };
+    for note in crate::agent_console::take_notes(session) {
+      content.push(serde_json::json!({
+        "type": "text",
+        "text": crate::agent_console::note_text(&note),
+      }));
+    }
+  }
+
+  fn wait_seconds(arguments: &serde_json::Value) -> u64 {
+    arguments
+      .get("wait_seconds")
+      .and_then(serde_json::Value::as_u64)
+      .unwrap_or(crate::agent_console::DEFAULT_WAIT_SECS)
+      .min(crate::agent_console::MAX_WAIT_SECS)
+  }
+
+  fn invalid_argument(message: impl Into<String>) -> McpError {
+    McpError {
+      code: -32602,
+      message: message.into(),
+      data: Some(serde_json::json!({ "code": "INVALID_ARGUMENT" })),
+    }
+  }
+
+  fn optional_profile(&self, arguments: &serde_json::Value) -> Result<Option<String>, McpError> {
+    let Some(profile_id) = arguments
+      .get("profile_id")
+      .and_then(serde_json::Value::as_str)
+      .map(str::trim)
+      .filter(|id| !id.is_empty())
+    else {
+      return Ok(None);
+    };
+    let known = crate::profile::manager::ProfileManager::instance()
+      .list_profiles()
+      .map(|profiles| profiles.iter().any(|p| p.id.to_string() == profile_id))
+      .unwrap_or(false);
+    if !known {
+      return Err(Self::invalid_argument(format!(
+        "Unknown profile_id {profile_id}"
+      )));
+    }
+    Ok(Some(profile_id.to_string()))
+  }
+
+  async fn handle_ask_human(
+    &self,
+    caller: McpCaller<'_>,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let question = arguments
+      .get("question")
+      .and_then(serde_json::Value::as_str)
+      .unwrap_or_default();
+    let choices: Vec<String> = arguments
+      .get("choices")
+      .and_then(serde_json::Value::as_array)
+      .map(|list| {
+        list
+          .iter()
+          .filter_map(|v| v.as_str().map(str::to_string))
+          .collect()
+      })
+      .unwrap_or_default();
+    let (question, choices) = crate::agent_console::validate_question(question, &choices)
+      .map_err(Self::invalid_argument)?;
+    let profile_id = self.optional_profile(arguments)?;
+    let request_id = crate::agent_console::open_request(crate::agent_console::NewRequest {
+      session_id: caller.session.map(str::to_string),
+      kind: crate::agent_console::ThreadKind::Question,
+      text: question,
+      profile_id,
+      choices,
+    })
+    .await;
+    let outcome = crate::agent_console::wait_for(request_id, Self::wait_seconds(arguments))
+      .await
+      .unwrap_or(crate::agent_console::RequestOutcome::Pending);
+    Self::json_content(&crate::agent_console::outcome_json(request_id, &outcome))
+  }
+
+  async fn handle_request_human_help(
+    &self,
+    caller: McpCaller<'_>,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = self
+      .optional_profile(arguments)?
+      .ok_or_else(|| Self::invalid_argument("profile_id is required"))?;
+    let reason = arguments
+      .get("reason")
+      .and_then(serde_json::Value::as_str)
+      .unwrap_or_default();
+    let (reason, _) = crate::agent_console::validate_question(reason, &[]).map_err(|_| {
+      Self::invalid_argument(format!(
+        "reason must be 1 to {} characters",
+        crate::agent_console::MAX_TEXT_CHARS
+      ))
+    })?;
+    let request_id = crate::agent_console::open_request(crate::agent_console::NewRequest {
+      session_id: caller.session.map(str::to_string),
+      kind: crate::agent_console::ThreadKind::Help,
+      text: reason,
+      profile_id: Some(profile_id),
+      choices: Vec::new(),
+    })
+    .await;
+    let outcome = crate::agent_console::wait_for(request_id, Self::wait_seconds(arguments))
+      .await
+      .unwrap_or(crate::agent_console::RequestOutcome::Pending);
+    Self::json_content(&crate::agent_console::outcome_json(request_id, &outcome))
+  }
+
+  async fn handle_wait_for_human(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let request_id = arguments
+      .get("request_id")
+      .and_then(serde_json::Value::as_u64)
+      .ok_or_else(|| Self::invalid_argument("request_id is required"))?;
+    if !crate::agent_console::request_exists(request_id) {
+      return Err(McpError {
+        code: -32602,
+        message: format!("No request {request_id}; it may be from before Donut restarted"),
+        data: Some(serde_json::json!({ "code": "AGENT_REQUEST_NOT_FOUND" })),
+      });
+    }
+    let outcome = crate::agent_console::wait_for(request_id, Self::wait_seconds(arguments))
+      .await
+      .unwrap_or(crate::agent_console::RequestOutcome::Pending);
+    Self::json_content(&crate::agent_console::outcome_json(request_id, &outcome))
+  }
+
+  fn handle_report_progress(
+    caller: McpCaller<'_>,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let message = arguments
+      .get("message")
+      .and_then(serde_json::Value::as_str)
+      .map(str::trim)
+      .filter(|message| !message.is_empty())
+      .ok_or_else(|| Self::invalid_argument("message is required"))?;
+    let done = arguments.get("done").and_then(serde_json::Value::as_u64);
+    let total = arguments.get("total").and_then(serde_json::Value::as_u64);
+    let profile_id = arguments
+      .get("profile_id")
+      .and_then(serde_json::Value::as_str)
+      .map(str::trim)
+      .filter(|id| !id.is_empty())
+      .map(str::to_string);
+    crate::agent_console::report_progress(caller.session, message, done, total, profile_id);
+    Self::json_content(&serde_json::json!({ "ok": true }))
+  }
+
+  async fn handle_get_diagnostics(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let max_kb = match arguments.get("max_kb") {
+      None | Some(serde_json::Value::Null) => 64,
+      Some(value) => value
+        .as_u64()
+        .filter(|kb| (8..=512).contains(kb))
+        .ok_or_else(|| Self::invalid_argument("max_kb must be a whole number from 8 to 512"))?,
+    };
+    let app_handle = self.inner.lock().await.app_handle.clone();
+    let Some(handle) = app_handle else {
+      return Err(McpError {
+        code: -32001,
+        message: "MCP server is not running".to_string(),
+        data: None,
+      });
+    };
+    let diagnostics = crate::diagnostics::excerpt(
+      crate::app_dirs::log_dir(&handle),
+      max_kb as usize * 1024,
+      crate::diagnostics::Reader::Agent,
+    )
+    .await
+    .map_err(|_| McpError {
+      code: -32000,
+      message: "The app logs could not be read.".to_string(),
+      data: Some(serde_json::json!({ "code": "FEEDBACK_LOGS_UNREADABLE" })),
+    })?;
+    Self::json_content(&serde_json::json!({ "diagnostics": diagnostics }))
+  }
+
+  async fn handle_send_feedback(
+    &self,
+    caller: McpCaller<'_>,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    use crate::feedback::{FeedbackKind, FeedbackSource, MAX_MESSAGE_CHARS};
+
+    let message = arguments
+      .get("message")
+      .and_then(serde_json::Value::as_str)
+      .map(str::trim)
+      .filter(|message| !message.is_empty())
+      .ok_or_else(|| Self::invalid_argument("message is required"))?;
+    if message.chars().count() > MAX_MESSAGE_CHARS {
+      return Err(Self::invalid_argument(format!(
+        "message is longer than {MAX_MESSAGE_CHARS} characters"
+      )));
+    }
+    let kind = match arguments.get("kind") {
+      None | Some(serde_json::Value::Null) => FeedbackKind::Other,
+      Some(value) => value
+        .as_str()
+        .and_then(FeedbackKind::parse)
+        .ok_or_else(|| Self::invalid_argument("kind must be bug, idea, praise or other"))?,
+    };
+    let include_logs = arguments
+      .get("include_logs")
+      .and_then(serde_json::Value::as_bool)
+      .unwrap_or(false);
+    let profile_id = match arguments.get("profile_id") {
+      None | Some(serde_json::Value::Null) => None,
+      Some(value) => {
+        let id = value
+          .as_str()
+          .ok_or_else(|| Self::invalid_argument("profile_id must be a string"))?;
+        crate::feedback::validate_profile_id(Some(id), crate::feedback::profile_exists)
+          .map_err(|_| Self::invalid_argument("profile_id is not the id of a profile"))?
+      }
+    };
+
+    if !crate::feedback::agent_send_allowed() {
+      return Err(McpError {
+        code: -32000,
+        message: "Too much feedback was sent in the last hour. Try again later.".to_string(),
+        data: Some(serde_json::json!({ "code": "FEEDBACK_RATE_LIMITED" })),
+      });
+    }
+
+    let logs = if include_logs {
+      let app_handle = self.inner.lock().await.app_handle.clone();
+      match app_handle {
+        Some(handle) => Some(
+          crate::feedback::log_excerpt(
+            crate::app_dirs::log_dir(&handle),
+            crate::diagnostics::Reader::Agent,
+          )
+          .await
+          .map_err(|_| McpError {
+            code: -32000,
+            message: "The app logs could not be read. Send the feedback without include_logs."
+              .to_string(),
+            data: Some(serde_json::json!({ "code": "FEEDBACK_LOGS_UNREADABLE" })),
+          })?,
+        ),
+        None => None,
+      }
+    } else {
+      None
+    };
+    let logs_attached = logs.as_ref().is_some_and(|logs| !logs.is_empty());
+
+    let (agent_client, recent_calls) = crate::agent_console::feedback_context(caller.session);
+    let receipt = crate::feedback::send(crate::feedback::Feedback {
+      kind,
+      source: FeedbackSource::Agent,
+      message: message.to_string(),
+      email: None,
+      locale: None,
+      logs,
+      agent_client,
+      context: (!recent_calls.is_empty())
+        .then(|| serde_json::json!({ "recentCalls": recent_calls })),
+      profile_id,
+    })
+    .await
+    .map_err(|error| {
+      let code = serde_json::from_str::<serde_json::Value>(&error)
+        .ok()
+        .and_then(|value| {
+          value
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        })
+        .unwrap_or_else(|| "FEEDBACK_SEND_FAILED".to_string());
+      let message = match code.as_str() {
+        "FEEDBACK_RATE_LIMITED" => {
+          "The Donut team's server refused more feedback for now. Try again later."
+        }
+        "CLOUD_UNREACHABLE" | "SYSTEM_PROXY_UNREACHABLE" => {
+          "The Donut team's server could not be reached. Try again later."
+        }
+        _ => "The feedback could not be sent. Try again later.",
+      };
+      McpError {
+        code: -32000,
+        message: message.to_string(),
+        data: Some(serde_json::json!({ "code": code })),
+      }
+    })?;
+
+    crate::agent_console::feedback_sent(caller.session, kind.as_str(), message, logs_attached);
+    Self::json_content(&serde_json::json!({
+      "sent": true,
+      "feedback_id": receipt.id,
+      "logs_attached": logs_attached,
+    }))
+  }
+
+  pub(crate) async fn bring_profile_to_front(&self, profile_id: &str) -> Result<(), String> {
+    let target = self
+      .resolve_cdp_target(profile_id)
+      .await
+      .map_err(|_| crate::backend_error("PROFILE_NOT_RUNNING"))?;
+    self
+      .send_cdp(&target, "Page.bringToFront", serde_json::json!({}))
+      .await
+      .map(|_| ())
+      .map_err(|e| {
+        log::warn!(
+          "MCP profile not brought to front profile={profile_id} err=\"{}\"",
+          e.message
+        );
+        crate::backend_error("PROFILE_NOT_RUNNING")
+      })
+  }
+
+  async fn handle_pick_element(
+    &self,
+    arguments: &serde_json::Value,
+  ) -> Result<serde_json::Value, McpError> {
+    let profile_id = Self::require_str(arguments, "profile_id")?;
+    let request: AgentPickRequest = Self::agent_arguments(arguments)?;
+    // Clamped rather than refused: a caller asking for ten minutes over the
+    // bridge gets the longest wait the relay will actually carry.
+    let timeout_ms = request
+      .timeout_ms
+      .unwrap_or(DEFAULT_PICK_TIMEOUT_MS)
+      .clamp(1_000, MAX_BRIDGE_PICK_TIMEOUT_MS);
+    let ctx = self.agent_context(profile_id).await?;
+    let picked = agent_pick_element(&ctx, timeout_ms)
+      .await
+      .map_err(AgentError::into_mcp)?;
+    Self::json_content(&picked)
   }
 
   // --- Synchronizer handlers ---
@@ -5932,6 +13169,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing leader_profile_id".to_string(),
+        data: None,
       })?;
     let follower_ids: Vec<String> = arguments
       .get("follower_profile_ids")
@@ -5939,6 +13177,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing follower_profile_ids".to_string(),
+        data: None,
       })?
       .iter()
       .filter_map(|v| v.as_str().map(|s| s.to_string()))
@@ -5949,6 +13188,7 @@ impl McpServer {
       inner.app_handle.clone().ok_or_else(|| McpError {
         code: -32000,
         message: "MCP server not properly initialized".to_string(),
+        data: None,
       })?
     };
 
@@ -5958,14 +13198,10 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: e,
+        data: None,
       })?;
 
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": serde_json::to_string_pretty(&info).unwrap_or_default()
-      }]
-    }))
+    Self::json_content(&info)
   }
 
   async fn handle_stop_sync_session(
@@ -5978,6 +13214,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing session_id".to_string(),
+        data: None,
       })?;
 
     let app = {
@@ -5985,6 +13222,7 @@ impl McpServer {
       inner.app_handle.clone().ok_or_else(|| McpError {
         code: -32000,
         message: "MCP server not properly initialized".to_string(),
+        data: None,
       })?
     };
 
@@ -5994,6 +13232,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: e,
+        data: None,
       })?;
 
     Ok(serde_json::json!({
@@ -6009,12 +13248,7 @@ impl McpServer {
       .get_sessions()
       .await;
 
-    Ok(serde_json::json!({
-      "content": [{
-        "type": "text",
-        "text": serde_json::to_string_pretty(&sessions).unwrap_or_default()
-      }]
-    }))
+    Self::json_content(&sessions)
   }
 
   async fn handle_remove_sync_follower(
@@ -6027,6 +13261,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing session_id".to_string(),
+        data: None,
       })?;
     let follower_id = arguments
       .get("follower_profile_id")
@@ -6034,6 +13269,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing follower_profile_id".to_string(),
+        data: None,
       })?;
 
     let app = {
@@ -6041,6 +13277,7 @@ impl McpServer {
       inner.app_handle.clone().ok_or_else(|| McpError {
         code: -32000,
         message: "MCP server not properly initialized".to_string(),
+        data: None,
       })?
     };
 
@@ -6050,6 +13287,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: e,
+        data: None,
       })?;
 
     Ok(serde_json::json!({
@@ -6067,13 +13305,67 @@ impl McpServer {
   // Nothing here decides when a run happens or what it does. What this file
   // DOES decide is which profiles may be offered to the bot at all.
 
-  /// Render a value as the single text block an MCP tool answers with.
+  /// Render a value as a tool's answer (see `mcp_views::tool_json`).
   fn json_content<T: Serialize>(value: &T) -> Result<serde_json::Value, McpError> {
-    let text = serde_json::to_string_pretty(value).map_err(|e| McpError {
+    let value = serde_json::to_value(value).map_err(|e| McpError {
       code: -32000,
       message: format!("Failed to encode response: {e}"),
+      data: None,
     })?;
-    Ok(serde_json::json!({ "content": [{ "type": "text", "text": text }] }))
+    Ok(crate::mcp_views::tool_json(value))
+  }
+
+  /// The names an answer shows next to the ids a profile points at.
+  fn profile_names() -> crate::mcp_views::Names {
+    let groups = GROUP_MANAGER
+      .lock()
+      .ok()
+      .and_then(|manager| manager.get_all_groups().ok())
+      .unwrap_or_default()
+      .into_iter()
+      .map(|group| (group.id, group.name))
+      .collect();
+    let proxies = PROXY_MANAGER
+      .get_stored_proxies()
+      .into_iter()
+      .map(|proxy| (proxy.id, proxy.name))
+      .collect();
+    let vpns = crate::vpn::VPN_STORAGE
+      .lock()
+      .ok()
+      .and_then(|storage| storage.list_configs().ok())
+      .unwrap_or_default()
+      .into_iter()
+      .map(|vpn| (vpn.id, vpn.name))
+      .collect();
+    let statuses = crate::profile_statuses::list()
+      .into_iter()
+      .map(|status| (status.id, status.name))
+      .collect();
+    crate::mcp_views::Names {
+      groups,
+      proxies,
+      vpns,
+      statuses,
+      remote: crate::remote_session::indexed_live_profiles(),
+    }
+  }
+
+  /// Read a caller-supplied URL and validate its scheme in one step.
+  ///
+  /// The guard belongs HERE rather than at each call site: a regression test
+  /// that scans for `get("url")` cannot see a handler that reads the same
+  /// argument through `require_str`, and a handler that reads a URL without
+  /// validating it is how `file:///…` plus a content tool became a remote file
+  /// read. Reaching for this instead of `require_str` makes the safe path the
+  /// short one.
+  fn require_navigable_url<'a>(
+    arguments: &'a serde_json::Value,
+    key: &str,
+  ) -> Result<&'a str, McpError> {
+    let url = Self::require_str(arguments, key)?;
+    validate_navigable_url(url)?;
+    Ok(url)
   }
 
   fn require_str<'a>(arguments: &'a serde_json::Value, key: &str) -> Result<&'a str, McpError> {
@@ -6084,6 +13376,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: format!("Missing {key}"),
+        data: None,
       })
   }
 
@@ -6095,6 +13388,7 @@ impl McpServer {
     Self::optional_u16(arguments, key)?.ok_or_else(|| McpError {
       code: -32602,
       message: format!("Missing {key}"),
+      data: None,
     })
   }
 
@@ -6109,6 +13403,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: format!("{key} must be a whole number between 0 and 65535"),
+        data: None,
       })
   }
 
@@ -6123,6 +13418,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: format!("{key} must be a whole number between 0 and 255"),
+        data: None,
       })
   }
 
@@ -6137,6 +13433,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: format!("{key} must be a whole number between 0 and 4294967295"),
+        data: None,
       })
   }
 
@@ -6146,9 +13443,30 @@ impl McpServer {
   /// to do next; a stable code and its parameters are something it can branch
   /// on, and it is the same envelope the desktop and the REST API answer with.
   fn cloud_error(err: crate::cookie_bot::CookieBotError) -> McpError {
-    McpError {
-      code: -32000,
-      message: err.to_error_json(),
+    Self::cloud_failure(err.to_error_json())
+  }
+
+  /// A cloud failure for an agent. A code with a sentence of its own gets that
+  /// sentence as the message and the envelope as data; any other code keeps
+  /// the envelope as the message.
+  fn cloud_failure(envelope: String) -> McpError {
+    let parsed = serde_json::from_str::<serde_json::Value>(&envelope).ok();
+    let sentence = parsed
+      .as_ref()
+      .and_then(|value| value.get("code"))
+      .and_then(|code| code.as_str())
+      .and_then(cloud_failure_sentence);
+    match sentence {
+      Some(text) => McpError {
+        code: -32000,
+        message: text.to_string(),
+        data: parsed,
+      },
+      None => McpError {
+        code: -32000,
+        message: envelope,
+        data: None,
+      },
     }
   }
 
@@ -6166,6 +13484,7 @@ impl McpServer {
       .map_err(|e| McpError {
         code: -32000,
         message: format!("Failed to list profiles: {e}"),
+        data: None,
       })?;
 
     let profile = profiles
@@ -6174,21 +13493,22 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32000,
         message: format!("Profile not found: {profile_id}"),
+        data: None,
       })?;
 
-    crate::cookie_bot::bot_precondition(&profile, &crate::cookie_bot::exit_reachability(&profile))
-      .map_err(|message| McpError {
-        code: -32000,
-        message,
-      })?;
+    crate::cookie_bot::run_precondition(&profile).map_err(|message| McpError {
+      code: -32000,
+      message,
+      data: None,
+    })?;
     Ok(profile)
   }
 
-  /// Start this profile on a host of its own operating system.
+  /// Start this profile on the remote host its platform names.
   ///
-  /// Deliberately no `is_cross_os` guard: local `run_profile` refuses a foreign
-  /// profile because THIS machine is the wrong OS, and running it on a host of
-  /// its own OS is precisely what this exists for.
+  /// Deliberately no `is_cross_os` guard: local `run_profile` refuses a profile
+  /// bound to another OS because THIS machine is the wrong OS, and running it
+  /// on a host of its own OS is precisely what this exists for.
   async fn handle_run_profile_remote(
     &self,
     arguments: &serde_json::Value,
@@ -6198,6 +13518,9 @@ impl McpServer {
       .get("url")
       .and_then(|v| v.as_str())
       .map(str::to_string);
+    if let Some(url) = url.as_deref() {
+      validate_navigable_url(url)?;
+    }
     let profile = self.get_wayfern_profile(profile_id)?;
 
     // The host pulls the profile from cloud storage, so one that has never
@@ -6208,6 +13531,7 @@ impl McpServer {
       .map_err(|message| McpError {
         code: -32000,
         message,
+        data: None,
       })?;
 
     let app = {
@@ -6215,15 +13539,13 @@ impl McpServer {
       inner.app_handle.clone().ok_or_else(|| McpError {
         code: -32000,
         message: "MCP server not properly initialized".to_string(),
+        data: None,
       })?
     };
 
     let outcome = crate::remote_session::start_remote_session(app, &profile, url)
       .await
-      .map_err(|e| McpError {
-        code: -32000,
-        message: e.to_error_json(),
-      })?;
+      .map_err(|e| Self::cloud_failure(e.to_error_json()))?;
     Self::json_content(&outcome)
   }
 
@@ -6234,20 +13556,14 @@ impl McpServer {
     let session_id = Self::require_str(arguments, "session_id")?;
     let outcome = crate::remote_session::end_remote_session(session_id)
       .await
-      .map_err(|e| McpError {
-        code: -32000,
-        message: e.to_error_json(),
-      })?;
+      .map_err(|e| Self::cloud_failure(e.to_error_json()))?;
     Self::json_content(&outcome)
   }
 
   async fn handle_list_remote_sessions() -> Result<serde_json::Value, McpError> {
     let sessions = crate::remote_session::list_remote_sessions()
       .await
-      .map_err(|e| McpError {
-        code: -32000,
-        message: e.to_error_json(),
-      })?;
+      .map_err(|e| Self::cloud_failure(e.to_error_json()))?;
     Self::json_content(&sessions)
   }
 
@@ -6257,10 +13573,7 @@ impl McpServer {
     let session_id = Self::require_str(arguments, "session_id")?;
     let state = crate::remote_session::get_remote_session(session_id)
       .await
-      .map_err(|e| McpError {
-        code: -32000,
-        message: e.to_error_json(),
-      })?;
+      .map_err(|e| Self::cloud_failure(e.to_error_json()))?;
     Self::json_content(&state)
   }
 
@@ -6301,12 +13614,14 @@ impl McpServer {
 
     // `bot_precondition` already proved the profile has an OS the fleet can
     // lease. Taking the platform from the profile rather than the arguments is
-    // what stops an agent enrolling a macOS profile onto a Windows host.
+    // what stops an agent enrolling a macOS profile onto a Windows host; a
+    // Wayfern profile runs on a Linux host whatever OS it claims.
     let platform = profile
-      .resolved_os()
+      .remote_platform()
       .ok_or_else(|| McpError {
         code: -32000,
         message: "Profile has no recorded operating system".to_string(),
+        data: None,
       })?
       .to_string();
 
@@ -6315,8 +13630,9 @@ impl McpServer {
         return Err(McpError {
           code: -32602,
           message: format!(
-            "platform {requested:?} does not match the profile's own operating system {platform:?}"
+            "platform {requested:?} does not match the platform this profile runs on remotely {platform:?}"
           ),
+          data: None,
         });
       }
     }
@@ -6327,6 +13643,7 @@ impl McpServer {
       .ok_or_else(|| McpError {
         code: -32602,
         message: "Missing enabled".to_string(),
+        data: None,
       })?;
 
     let sites = arguments
@@ -6351,12 +13668,14 @@ impl McpServer {
       days_mask: Self::optional_u8(arguments, "days_mask")?.ok_or_else(|| McpError {
         code: -32602,
         message: "Missing days_mask".to_string(),
+        data: None,
       })?,
       timezone: Self::require_str(arguments, "timezone")?.to_string(),
       preset: Self::require_str(arguments, "preset")?.to_string(),
       max_minutes: Self::optional_u32(arguments, "max_minutes")?.ok_or_else(|| McpError {
         code: -32602,
         message: "Missing max_minutes".to_string(),
+        data: None,
       })?,
       sites,
       jitter_seconds: Self::optional_u32(arguments, "jitter_seconds")?,
@@ -6442,9 +13761,8 @@ impl McpServer {
   }
 
   async fn handle_list_cookie_bot_presets() -> Result<serde_json::Value, McpError> {
-    // Ids and a rough duration only. What a preset expands to — the site
-    // ordering, the dwell model, the scroll and click programme — is the
-    // server's, and stays there.
+    // Ids and a rough duration only. What a preset expands to is the server's,
+    // and stays there.
     let presets = crate::cookie_bot::list_presets()
       .await
       .map_err(Self::cloud_error)?;
@@ -6461,9 +13779,21 @@ impl McpServer {
   }
 }
 
-lazy_static::lazy_static! {
-  static ref MCP_SERVER: McpServer = McpServer::new();
+static MCP_SERVER: std::sync::LazyLock<McpServer> = std::sync::LazyLock::new(McpServer::new);
+
+/// What an agent reads for a cloud code it should relay to the person.
+fn cloud_failure_sentence(code: &str) -> Option<&'static str> {
+  match code {
+    "CLOUD_BROWSER_UPDATING" => Some(
+      "The cloud browser is updating to this profile's Wayfern version. Try again in a few minutes.",
+    ),
+    _ => None,
+  }
 }
+
+#[cfg(test)]
+#[path = "mcp_server_browser_tests.rs"]
+mod browser_tests;
 
 #[cfg(test)]
 mod tests {
@@ -6477,13 +13807,223 @@ mod tests {
   }
 
   #[test]
+  fn a_cloud_update_refusal_reads_as_a_sentence_with_its_envelope() {
+    let envelope = r#"{"code":"CLOUD_BROWSER_UPDATING","params":{"cloudVersion":"1.0.0.1","profileVersion":"1.0.0.2"}}"#;
+    let error = McpServer::cloud_failure(envelope.to_string());
+    assert!(error.message.starts_with("The cloud browser is updating"));
+    let data = error.data.expect("envelope as data");
+    assert_eq!(data["code"], "CLOUD_BROWSER_UPDATING");
+    assert_eq!(data["params"]["profileVersion"], "1.0.0.2");
+
+    let other = r#"{"code":"REMOTE_NO_CAPACITY"}"#;
+    let error = McpServer::cloud_failure(other.to_string());
+    assert_eq!(error.message, other);
+    assert!(error.data.is_none());
+  }
+
+  #[test]
+  fn an_engine_plan_refusal_is_explained_by_a_device_refusal() {
+    let engine = || {
+      McpError {
+      code: -32000,
+      message: r#"CDP error: {"code":-32000,"message":"Browser automation requires a paid Donut Browser plan."}"#
+        .to_string(),
+      data: None,
+    }
+    };
+    let device = "Browser automation is restricted to your primary device. Log out other devices to use it here.";
+    assert_eq!(
+      explain_engine_refusal(engine(), Some(device.to_string())).message,
+      device
+    );
+    assert_eq!(
+      explain_engine_refusal(engine(), None).message,
+      engine().message
+    );
+    let other = McpError {
+      code: -32000,
+      message: "Profile not found".to_string(),
+      data: None,
+    };
+    assert_eq!(
+      explain_engine_refusal(other, Some(device.to_string())).message,
+      "Profile not found"
+    );
+  }
+  #[test]
+  fn every_tool_has_explicit_annotations() {
+    for tool in McpServer::new().get_tools() {
+      let hints = tool_hints(&tool.name);
+      assert!(hints.is_some(), "{} has no annotations", tool.name);
+      let hints = hints.unwrap();
+      assert!(
+        !(hints.read_only && hints.destructive),
+        "{} reads only, so it cannot destroy",
+        tool.name
+      );
+      let annotations = tool_annotations(&tool.name);
+      for hint in [
+        "readOnlyHint",
+        "destructiveHint",
+        "idempotentHint",
+        "openWorldHint",
+      ] {
+        assert!(annotations[hint].is_boolean(), "{} {hint}", tool.name);
+      }
+    }
+    assert_eq!(tool_title("rotate_proxy_ip"), "Rotate proxy IP");
+    assert_eq!(tool_title("evaluate_javascript"), "Evaluate JavaScript");
+    assert_eq!(tool_title("list_profiles"), "List profiles");
+  }
+
+  #[tokio::test]
+  async fn tools_list_carries_titles_and_annotations() {
+    let server = McpServer::new();
+    let listed = server.handle_tools_list(None).await.unwrap();
+    let tools = listed["tools"].as_array().unwrap();
+    let navigate = tools.iter().find(|t| t["name"] == "navigate").unwrap();
+    assert_eq!(navigate["title"], "Navigate");
+    assert_eq!(navigate["annotations"]["openWorldHint"], true);
+    let list = tools.iter().find(|t| t["name"] == "list_profiles").unwrap();
+    assert_eq!(list["annotations"]["readOnlyHint"], true);
+  }
+
+  #[test]
+  fn a_stale_plan_token_says_to_restart_and_how_long_the_browser_ran() {
+    let message = stale_plan_token_message(Some(204_189));
+    assert!(message.contains("56 h"), "{message}");
+    assert!(
+      message.contains("kill_profile, then run_profile"),
+      "{message}"
+    );
+    assert!(!message.contains("requires a paid"), "{message}");
+    assert!(!stale_plan_token_message(None).contains(" h."));
+  }
+
+  #[test]
+  fn a_bot_check_is_named_but_a_login_form_is_not() {
+    assert_eq!(bot_wall("Just a moment...", ""), Some("a Cloudflare check"));
+    assert_eq!(
+      bot_wall("Example", "Please verify you are human to continue"),
+      Some("a human check")
+    );
+    assert_eq!(
+      bot_wall(
+        "Sign in",
+        "This site is protected by reCAPTCHA and the Google Privacy Policy"
+      ),
+      None,
+      "a CAPTCHA mentioned in a form's small print is not a wall"
+    );
+    let report = page_report(&PageState {
+      url: "https://shop.example/".into(),
+      title: "Attention Required! | Cloudflare".into(),
+      text: String::new(),
+    });
+    assert!(report.starts_with("Page: Attention Required! | Cloudflare <https://shop.example/>"));
+    assert!(report.contains("a Cloudflare block"));
+    assert_eq!(
+      page_report(&PageState {
+        url: "about:blank".into(),
+        ..Default::default()
+      }),
+      "Page: (no title) <about:blank>"
+    );
+  }
+
+  #[test]
+  fn a_screenshot_is_scaled_down_to_the_width_asked_and_never_up() {
+    assert_eq!(screenshot_scale(1280.0, 1.0, 1280.0), 1.0);
+    assert_eq!(screenshot_scale(1280.0, 2.0, 1280.0), 0.5);
+    assert_eq!(screenshot_scale(800.0, 1.0, 1280.0), 1.0);
+    assert_eq!(screenshot_scale(0.0, 1.0, 1280.0), 1.0);
+
+    let metrics = LayoutMetrics::from_reply(&serde_json::json!({
+      "cssVisualViewport": { "pageX": 0, "pageY": 600, "clientWidth": 1280, "clientHeight": 720 },
+      "visualViewport": { "clientWidth": 2560 },
+      "cssContentSize": { "width": 1280, "height": 5000 },
+    }));
+    assert_eq!(metrics.y, 600.0);
+    assert_eq!(metrics.dpr, 2.0);
+    assert_eq!(metrics.page_height, 5000.0);
+    // An older browser without the CSS metrics still gets a sane capture.
+    let bare = LayoutMetrics::from_reply(&serde_json::json!({}));
+    assert_eq!((bare.width, bare.dpr), (1280.0, 1.0));
+  }
+
+  #[test]
+  fn scrolling_moves_most_of_a_viewport_per_page() {
+    assert_eq!(scroll_delta("down", 1.0, 1000.0, 800.0), Some((0.0, 680.0)));
+    assert_eq!(scroll_delta("up", 2.0, 1000.0, 800.0), Some((0.0, -1360.0)));
+    assert_eq!(
+      scroll_delta("left", 1.0, 1000.0, 800.0),
+      Some((-850.0, 0.0))
+    );
+    assert_eq!(scroll_delta("sideways", 1.0, 1000.0, 800.0), None);
+  }
+
+  #[test]
+  fn a_key_name_becomes_the_event_a_keyboard_sends() {
+    let enter = key_stroke("Enter").unwrap();
+    assert_eq!((enter.key_code, enter.text.as_deref()), (13, Some("\r")));
+    let a = key_stroke("a").unwrap();
+    assert_eq!((a.code.as_str(), a.key_code), ("KeyA", 65));
+    assert_eq!(key_stroke("7").unwrap().code, "Digit7");
+    assert_eq!(key_stroke("Space").unwrap().text.as_deref(), Some(" "));
+    assert!(key_stroke("Enterr").is_none());
+    assert!(key_stroke("").is_none());
+    assert_eq!(modifier_bits(&["ctrl", "shift"]), Ok(10));
+    assert!(modifier_bits(&["hyper"]).is_err());
+  }
+
+  #[test]
+  fn wait_for_quotes_what_it_looks_for() {
+    let script = wait_for_script(Some("It's \"done\""), None).unwrap();
+    assert!(script.contains(r#".includes("It's \"done\"")"#), "{script}");
+    let script = wait_for_script(None, Some("#a[b='c']")).unwrap();
+    assert!(
+      script.contains(r##"querySelector("#a[b='c']")"##),
+      "{script}"
+    );
+    assert!(wait_for_script(None, None).is_none());
+    assert!(wait_for_script(Some("x"), Some("#y")).is_none());
+  }
+
+  /// Whether a scanned method body is the tool listing rather than a handler.
+  fn is_tool_listing(body: &str) -> bool {
+    body.trim_start().starts_with("pub fn get_tools")
+  }
+
+  #[test]
+  fn every_batchable_tool_exists_and_none_reads_files() {
+    let names: Vec<String> = McpServer::new()
+      .get_tools()
+      .into_iter()
+      .map(|t| t.name)
+      .collect();
+    for tool in BATCH_TOOLS {
+      assert!(names.iter().any(|name| name == tool), "{tool}");
+      assert!(!LOCAL_PATH_TOOLS.contains(tool), "{tool}");
+    }
+    assert!(!BATCH_TOOLS.contains(&"run_actions"), "a batch never nests");
+  }
+
+  #[test]
   fn test_mcp_tools_count() {
     let server = McpServer::new();
     let tools = server.get_tools();
 
-    // Should have at least 59 tools (39 + 7 browser interaction + 13 remote
-    // fleet and cookie-bot tools)
-    assert!(tools.len() >= 59);
+    // PINNED, not a floor. This read `>= 59` while the server actually served
+    // 80, so twenty-one tools could be deleted without the assertion moving -
+    // and every one of them is a published contract an MCP client is written
+    // against. A floor that sits far below the real number is not a test, it
+    // is a comment. Changing this number is the deliberate edit that says a
+    // tool was added or removed on purpose.
+    assert_eq!(
+      tools.len(),
+    117,
+    "the tool list is a published contract; update this number deliberately"
+    );
 
     // Names are the contract an MCP client is written against, so a duplicate
     // silently shadows one of the two in dispatch and the tool that loses is
@@ -6518,6 +14058,7 @@ mod tests {
     assert!(tool_names.contains(&"delete_group"));
     assert!(tool_names.contains(&"assign_profiles_to_group"));
     // Proxy tools
+    assert!(tool_names.contains(&"distribute_proxies"));
     assert!(tool_names.contains(&"list_proxies"));
     assert!(tool_names.contains(&"get_proxy"));
     assert!(tool_names.contains(&"create_proxy"));
@@ -6567,6 +14108,22 @@ mod tests {
     assert!(tool_names.contains(&"type_text"));
     assert!(tool_names.contains(&"get_page_content"));
     assert!(tool_names.contains(&"get_page_info"));
+    // The agent surface: what an agent reads, how it names things, and how it
+    // acts on them without a selector.
+    assert!(tool_names.contains(&"perceive_page"));
+    assert!(tool_names.contains(&"resolve_locator"));
+    assert!(tool_names.contains(&"click_locator"));
+    assert!(tool_names.contains(&"press_and_hold"));
+    assert!(tool_names.contains(&"type_locator"));
+    assert!(tool_names.contains(&"select_option"));
+    assert!(tool_names.contains(&"file_upload"));
+    // Network capture tools
+    assert!(tool_names.contains(&"start_network_capture"));
+    assert!(tool_names.contains(&"stop_network_capture"));
+    assert!(tool_names.contains(&"list_network_requests"));
+    assert!(tool_names.contains(&"get_network_request"));
+    assert!(tool_names.contains(&"extract_structured"));
+    assert!(tool_names.contains(&"pick_element"));
     // Remote fleet: an agent must be able to start a session, see it become
     // usable, drive it with the tools above, and stop it. Any one of those
     // missing makes remote driving unusable from MCP alone.
@@ -6659,8 +14216,16 @@ mod tests {
     linux.host_os = Some("linux".to_string());
     assert!(
       crate::cookie_bot::bot_precondition(&linux, &crate::remote_exit::ExitReachability::Remote)
+        .is_ok(),
+      "the fleet serves linux from a linux instance"
+    );
+
+    let mut android = eligible();
+    android.host_os = Some("android".to_string());
+    assert!(
+      crate::cookie_bot::bot_precondition(&android, &crate::remote_exit::ExitReachability::Remote)
         .is_err(),
-      "the fleet cannot lease a linux host"
+      "the fleet has no android host to lease"
     );
 
     let mut datacenter_egress = eligible();
@@ -6676,9 +14241,9 @@ mod tests {
     );
   }
 
-  // Enrolment carries only the user's own scalars. A site list, a dwell range
-  // or a step programme appearing in the schema would mean the browsing model
-  // had leaked out of the server and into this AGPL client.
+  // Enrolment carries only the user's own scalars. Anything describing what a
+  // run actually does appearing in the schema would mean the browsing model had
+  // leaked out of the server and into this AGPL client.
   #[test]
   fn the_bot_tools_expose_choices_not_behaviour() {
     let server = McpServer::new();
@@ -6730,10 +14295,1464 @@ mod tests {
     assert!(required.iter().any(|field| field == "preset"));
   }
 
+  #[tokio::test]
+  async fn a_body_past_the_shared_cap_is_refused_by_the_engine_itself() {
+    // MAX_MESSAGE_BYTES must match what the cloud endpoint accepts. Nothing
+    // exercised the
+    // check: deleting it left every test green, so the engine and the cloud
+    // endpoint could quietly drift apart, which is exactly the defect that
+    // once made `import_profile_cookies` 413 remotely.
+    let server = McpServer::instance();
+    server.mark_engine_ready_for_tests();
+
+    // Deliberately VALID JSON-RPC, just too big. A body of junk bytes would be
+    // refused as unparsable whether or not the cap exists, so it would assert
+    // nothing about the cap, the same two-paths-one-outcome trap that made an
+    // earlier test in this feature pass against deleted code.
+    let filler = "x".repeat(McpServer::MAX_MESSAGE_BYTES);
+    let oversized = format!(
+      r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"navigate","arguments":{{"url":"{filler}"}}}}}}"#
+    );
+    assert!(oversized.len() > McpServer::MAX_MESSAGE_BYTES);
+    assert!(
+      serde_json::from_str::<serde_json::Value>(&oversized).is_ok(),
+      "the fixture must be parseable, or the cap is not what rejects it"
+    );
+    assert!(matches!(
+      server.handle_message(None, oversized.as_bytes()).await,
+      McpOutcome::BadRequest
+    ));
+
+    // And a body just under it is judged on its content, not its size, the cap
+    // must not be doing the rejecting for ordinary calls.
+    let ok = br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
+    assert!(ok.len() < McpServer::MAX_MESSAGE_BYTES);
+    assert!(matches!(
+      server.handle_message(None, ok).await,
+      McpOutcome::Body { .. }
+    ));
+  }
+
+  /// Blank out comments and string literals so brace counting sees only code.
+  ///
+  /// Lengths and line breaks are preserved, so offsets and line numbers still
+  /// line up with the original source.
+  fn code_only(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = String::with_capacity(chars.len());
+    let mut i = 0;
+
+    // Blank a span, keeping newlines so line numbers survive.
+    let blank = |out: &mut String, from: usize, to: usize| {
+      for &c in &chars[from..to] {
+        out.push(if c == '\n' { '\n' } else { ' ' });
+      }
+    };
+
+    while i < chars.len() {
+      let c = chars[i];
+
+      // A line comment: everything to the end of the line.
+      if c == '/' && chars.get(i + 1) == Some(&'/') {
+        let mut end = i;
+        while end < chars.len() && chars[end] != '\n' {
+          end += 1;
+        }
+        blank(&mut out, i, end);
+        i = end;
+        continue;
+      }
+
+      // A raw string: `r`, any number of `#`, then the quote. Only when the `r`
+      // starts a token, or the tail of an identifier such as `for` opens one.
+      let starts_token = i == 0 || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
+      if c == 'r' && starts_token {
+        let mut hashes = 0;
+        while chars.get(i + 1 + hashes) == Some(&'#') {
+          hashes += 1;
+        }
+        if chars.get(i + 1 + hashes) == Some(&'"') {
+          let closing = format!("\"{}", "#".repeat(hashes));
+          let body_start = i + 2 + hashes;
+          let rest: String = chars[body_start..].iter().collect();
+          let end = rest
+            .find(&closing)
+            .map_or(chars.len(), |at| body_start + rest[..at].chars().count());
+          blank(&mut out, i, end);
+          i = end + closing.chars().count();
+          blank(&mut out, end, i.min(chars.len()));
+          continue;
+        }
+      }
+
+      // An ordinary string, with backslash escapes.
+      if c == '"' {
+        let mut end = i + 1;
+        while end < chars.len() && chars[end] != '"' {
+          end += if chars[end] == '\\' { 2 } else { 1 };
+        }
+        let end = end.min(chars.len());
+        blank(&mut out, i, end);
+        i = end;
+        if i < chars.len() {
+          out.push(' ');
+          i += 1;
+        }
+        continue;
+      }
+
+      out.push(c);
+      i += 1;
+    }
+
+    out
+  }
+
+  /// Every line (1-based) that binds a guard on the engine mutex and then
+  /// reaches an `.await` while that guard is still alive.
+  ///
+  /// The discriminator is SCOPE, not spelling. A guard lives until the block
+  /// that owns it closes, so the question is whether that closing brace comes
+  /// before the next await:
+  ///
+  /// ```ignore
+  /// let handle = {                             // safe: the block ends first
+  ///   let inner = self.inner.lock().await;
+  ///   inner.app_handle.as_ref().ok_or(..)?.clone()
+  /// };
+  /// something(&handle).await;
+  ///
+  /// let inner = self.inner.lock().await;       // held: no enclosing block
+  /// let handle = inner.app_handle.as_ref().ok_or(..)?.clone();
+  /// something(&handle).await;                  // the whole engine is frozen
+  /// ```
+  ///
+  /// The previous version keyed on `.clone()` in the binding statement, which
+  /// the second shape also has, so it skipped a real violation as though it
+  /// were the safe one.
+  fn engine_locks_held_across_an_await(source: &str) -> (Vec<usize>, usize) {
+    let code = code_only(source);
+    let chars: Vec<char> = code.chars().collect();
+
+    // Char offset where each line begins, so a hit can be reported by line.
+    let mut line_of = Vec::with_capacity(chars.len() + 1);
+    let mut line = 1usize;
+    for &c in &chars {
+      line_of.push(line);
+      if c == '\n' {
+        line += 1;
+      }
+    }
+    line_of.push(line);
+
+    let needle: Vec<char> = "self.inner.lock().await;".chars().collect();
+    let at = |i: usize, pat: &[char]| chars[i..].starts_with(pat);
+    let await_pat: Vec<char> = ".await".chars().collect();
+    let drop_pat: Vec<char> = "drop(inner)".chars().collect();
+
+    let mut offenders = Vec::new();
+    let mut sites = 0usize;
+
+    let mut i = 0;
+    while i < chars.len() {
+      if !at(i, &needle) {
+        i += 1;
+        continue;
+      }
+      // Only a BOUND guard outlives its statement. `self.inner.lock().await.x`
+      // is a temporary that dies at the semicolon.
+      let line_start = chars[..i]
+        .iter()
+        .rposition(|&c| c == '\n')
+        .map_or(0, |newline| newline + 1);
+      let prefix: String = chars[line_start..i].iter().collect();
+      if !prefix.trim_start().starts_with("let ") {
+        i += 1;
+        continue;
+      }
+      sites += 1;
+
+      // Walk forward from the end of the lock statement. `depth` counts how
+      // deep we are INSIDE the guard's own block; the `}` that takes it to -1
+      // is the one that drops the guard.
+      let mut depth = 0i32;
+      let mut cursor = i + needle.len();
+      while cursor < chars.len() {
+        match chars[cursor] {
+          '{' => depth += 1,
+          '}' => {
+            if depth == 0 {
+              break; // the enclosing block closed: the guard is gone
+            }
+            depth -= 1;
+          }
+          _ => {
+            if at(cursor, &drop_pat) {
+              break; // released by hand before the await
+            }
+            if at(cursor, &await_pat) {
+              offenders.push(line_of[i]);
+              break;
+            }
+          }
+        }
+        cursor += 1;
+      }
+
+      i += needle.len();
+    }
+
+    (offenders, sites)
+  }
+
   #[test]
-  fn test_mcp_server_initial_state() {
+  fn no_handler_holds_the_engine_lock_across_an_await() {
+    // `handle_message` takes this same mutex to validate the session on EVERY
+    // request, and to serve `initialize`. A handler that keeps the guard alive
+    // across a browser launch therefore freezes the whole engine for the
+    // duration: the launching agent's follow-up calls, a second agent, the
+    // website console, and even a new client trying to open a session.
+    //
+    // The detector is exercised in BOTH directions first, because the previous
+    // one could only be pointed at this file, and a rule that has never been
+    // shown to fire is indistinguishable from one that cannot.
+    let unscoped = r#"
+  async fn bad(&self) -> Result<(), McpError> {
+    let inner = self.inner.lock().await;
+    let app_handle = inner
+      .app_handle
+      .as_ref()
+      .ok_or_else(|| McpError { code: -32000, message: "no handle".to_string(), data: None })?
+      .clone();
+    something(&app_handle).await;
+    Ok(())
+  }
+"#;
+    let (flagged, sites) = engine_locks_held_across_an_await(unscoped);
+    assert_eq!(sites, 1, "the fixture must be seen as a lock site at all");
+    assert_eq!(
+      flagged,
+      vec![3],
+      "a guard bound at statement level is alive at the await, whatever the \
+       binding does with `.clone()`"
+    );
+
+    let scoped = r#"
+  async fn good(&self) -> Result<(), McpError> {
+    let app_handle = {
+      let inner = self.inner.lock().await;
+      inner
+        .app_handle
+        .as_ref()
+        .ok_or_else(|| McpError { code: -32000, message: "no handle".to_string(), data: None })?
+        .clone()
+    };
+    something(&app_handle).await;
+    Ok(())
+  }
+"#;
+    let (flagged, sites) = engine_locks_held_across_an_await(scoped);
+    assert_eq!(sites, 1);
+    assert!(
+      flagged.is_empty(),
+      "the block expression drops the guard before the await: {flagged:?}"
+    );
+
+    // And a guard let go by hand is not a violation either.
+    let released = r#"
+  async fn also_good(&self) -> Result<(), McpError> {
+    let inner = self.inner.lock().await;
+    let app_handle = inner.app_handle.clone();
+    drop(inner);
+    something(&app_handle).await;
+    Ok(())
+  }
+"#;
+    let (flagged, _) = engine_locks_held_across_an_await(released);
+    assert!(
+      flagged.is_empty(),
+      "an explicit drop releases it: {flagged:?}"
+    );
+
+    // Now the file itself.
+    let source = include_str!("mcp_server.rs");
+    let (offenders, sites) = engine_locks_held_across_an_await(source);
+    assert!(
+      sites >= 25,
+      "the scan found only {sites} lock sites, so it has gone blind to most of \
+       the file, the same way the line-window version silently matched none"
+    );
+    assert!(
+      offenders.is_empty(),
+      "these lines hold the engine mutex across an await, freezing every \
+       other MCP message for the duration: {offenders:?}. Clone the handle \
+       inside a block expression so the guard drops first."
+    );
+  }
+
+  #[test]
+  fn initialize_echoes_a_protocol_version_the_client_can_accept() {
+    // The client's check is unforgiving: the official SDK compares the
+    // answer against ITS OWN supported list and throws
+    // "Server's protocol version is not supported" on a miss. Answering with
+    // our newest regardless made the whole remote feature unreachable from any
+    // agent that had not upgraded in lockstep with us.
+    for asked in SUPPORTED_PROTOCOL_VERSIONS {
+      assert_eq!(
+        negotiate_protocol_version(Some(asked)),
+        *asked,
+        "a version we speak must be echoed back verbatim"
+      );
+    }
+
+    // Unknown or absent: answer with one we do support, so the client can
+    // decide for itself rather than be handed something meaningless.
+    assert_eq!(negotiate_protocol_version(None), PROTOCOL_VERSION);
+    assert_eq!(
+      negotiate_protocol_version(Some("1999-01-01")),
+      PROTOCOL_VERSION
+    );
+    assert_eq!(negotiate_protocol_version(Some("")), PROTOCOL_VERSION);
+    assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&PROTOCOL_VERSION));
+  }
+
+  #[tokio::test]
+  async fn an_older_client_is_answered_in_its_own_dialect() {
     let server = McpServer::new();
-    assert!(!server.is_running());
+    server.mark_engine_ready_for_tests();
+
+    let init = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}"#;
+    let McpOutcome::Body { body, .. } = server.handle_message(None, init).await else {
+      panic!("initialize must answer");
+    };
+    assert_eq!(
+      body["result"]["protocolVersion"], "2024-11-05",
+      "the client asked in 2024-11-05 and must be answered in it: {body}"
+    );
+
+    // And a client that names nothing still gets a usable answer.
+    let bare = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    let McpOutcome::Body { body, .. } = server.handle_message(None, bare).await else {
+      panic!("initialize must answer");
+    };
+    assert_eq!(body["result"]["protocolVersion"], PROTOCOL_VERSION);
+  }
+
+  #[test]
+  fn the_browser_is_never_told_to_open_a_local_file() {
+    // Over the CLOUD BRIDGE this is the difference between "control your
+    // browser" and an arbitrary local-file read reachable from the internet:
+    // `Page.navigate` loads `file:///…/.ssh/id_rsa` happily, and
+    // `get_page_content` hands the bytes back to whoever asked.
+    for blocked in [
+      "file:///etc/passwd",
+      "FILE:///etc/passwd",
+      "  file:///etc/passwd  ",
+      "file://localhost/etc/passwd",
+      "data:text/html,<script>fetch('/etc/passwd')</script>",
+      "javascript:alert(1)",
+      "chrome://settings",
+      "devtools://devtools/bundled/inspector.html",
+      "blob:https://example.com/abc",
+      "view-source:file:///etc/passwd",
+      "",
+      "/etc/passwd",
+      "\\\\server\\share",
+    ] {
+      let refused = validate_navigable_url(blocked);
+      assert!(refused.is_err(), "{blocked:?} must be refused");
+      assert!(
+        refused
+          .unwrap_err()
+          .message
+          .contains("URL_SCHEME_NOT_ALLOWED"),
+        "{blocked:?} must refuse with a code the UI can translate"
+      );
+    }
+
+    // And the ones a browser is actually asked to browse still work.
+    for allowed in [
+      "http://example.com",
+      "https://example.com/path?q=1#frag",
+      "HTTPS://EXAMPLE.COM",
+      "about:blank",
+      "  https://example.com  ",
+    ] {
+      assert!(
+        validate_navigable_url(allowed).is_ok(),
+        "{allowed:?} must be allowed"
+      );
+    }
+  }
+
+  #[test]
+  fn every_url_entry_point_is_guarded() {
+    // Derived from the source, and deliberately BROAD. Two earlier versions
+    // could not fail for the drift they existed to catch:
+    //   - `count >= 6` plus four hand-typed handler names saw nothing new;
+    //   - keying on the literal `get("url")` skipped any handler reading the
+    //     same argument through `require_str`, which is this file's newer
+    //     idiom, and the scan counted ITSELF as a fifth guarded handler, so
+    //     the floor tolerated a real one silently dropping out.
+    // The test module is therefore cut off before scanning, and any method
+    // mentioning a "url" argument at all must validate.
+    let full = include_str!("mcp_server.rs");
+    let source = full
+      .split_once("\n#[cfg(test)]")
+      .map(|(code, _)| code)
+      .unwrap_or(full);
+
+    let starts: Vec<usize> = source
+      .match_indices("\n  ")
+      .filter(|(i, _)| {
+        let rest = &source[i + 3..];
+        [
+          "fn ",
+          "async fn ",
+          "pub fn ",
+          "pub async fn ",
+          "pub(crate) fn ",
+          "pub(crate) async fn ",
+        ]
+        .iter()
+        .any(|p| rest.starts_with(p))
+      })
+      .map(|(i, _)| i)
+      .collect();
+    assert!(starts.len() > 20, "method scan found {}", starts.len());
+
+    let mut unguarded = Vec::new();
+    let mut guarded = Vec::new();
+    for (n, &begin) in starts.iter().enumerate() {
+      let stop = starts.get(n + 1).copied().unwrap_or(source.len());
+      let body = &source[begin..stop];
+      // ANY method that reads a "url" argument from the caller, however it
+      // spells the read.
+      if !(body.contains("arguments") && body.contains(r#""url""#)) || is_tool_listing(body) {
+        continue;
+      }
+      let name = body
+        .trim_start()
+        .trim_start_matches("pub(crate) ")
+        .trim_start_matches("pub ")
+        .trim_start_matches("async ")
+        .trim_start_matches("fn ")
+        .split(['(', '<'])
+        .next()
+        .unwrap_or("?")
+        .to_string();
+      if body.contains("validate_navigable_url") || body.contains("require_navigable_url") {
+        guarded.push(name);
+      } else {
+        unguarded.push(name);
+      }
+    }
+
+    assert!(
+      unguarded.is_empty(),
+      "these handlers take a url from the caller and never validate its \
+       scheme, which is how `file:///…` plus a content tool became a remote \
+       file read: {unguarded:?}"
+    );
+    // Pinned exactly, so a handler that DISAPPEARS from the scan, renamed,
+    // reformatted past the matcher, or deleted, fails loudly instead of
+    // shrinking the set the test believes it is protecting.
+    guarded.sort();
+    assert_eq!(
+      guarded,
+      vec![
+        "handle_batch_run_profiles",
+        "handle_navigate",
+        "handle_open_tab",
+        "handle_run_profile",
+        "handle_run_profile_remote",
+      ],
+      "the set of url-taking handlers changed; add the new one here once it \
+       validates, or find out why one stopped being seen"
+    );
+  }
+
+  #[test]
+  fn two_callers_never_share_an_element_index_cache() {
+    // `get_interactive_elements` stashes live element references on the page and
+    // hands back indices; `click_by_index` resolves an index against that stash.
+    // It used to be ONE `window.__donut_interactive` array for the whole page,
+    // which is shared, because the website console and an agent both arrive
+    // over the bridge, as do two runs of the same agent. Session A lists
+    // elements, B lists them, A's
+    // `click_by_index(3)` resolves against B's array and clicks the wrong
+    // thing while reporting success, on somebody's real browser.
+    let slot = interactive_cache_slot;
+
+    let a = slot("11111111-2222-3333-4444-555555555555");
+    let b = slot("66666666-7777-8888-9999-000000000000");
+    assert_ne!(a, b, "two sessions must not share a slot");
+
+    // Stable for one session, or an agent's own second call would lose the
+    // array its first call built.
+    assert_eq!(
+      a,
+      slot("11111111-2222-3333-4444-555555555555"),
+      "the same session must resolve to the same slot every time"
+    );
+
+    // DISTINCTNESS, which the previous key only claimed. Truncating at 64
+    // characters and mapping everything outside [A-Za-z0-9_] to `_` collapsed
+    // both of these pairs onto ONE slot, and a collision here is precisely the
+    // wrong click the key exists to prevent.
+    let shared_prefix = "s".repeat(64);
+    assert_ne!(
+      slot(&format!("{shared_prefix}-one")),
+      slot(&format!("{shared_prefix}-two")),
+      "two ids agreeing on a 64-character prefix must not share a slot"
+    );
+    assert_ne!(
+      slot("abc-def"),
+      slot("abc_def"),
+      "ids differing only in a character the old key erased must not share a slot"
+    );
+
+    // Quoted JS string literals, because they are substituted into
+    // `window[...]`. An unquoted identifier would read a different global, and
+    // the session half is the only caller-supplied part, so nothing in it may
+    // close the quote or paste an expression.
+    let overlong = "z".repeat(5_000);
+    for candidate in [
+      a,
+      slot("'; window.x = 1; //"),
+      slot("../../etc\\passwd"),
+      slot(""),
+      slot(overlong.as_str()),
+    ] {
+      assert!(
+        candidate.starts_with('\'') && candidate.ends_with('\''),
+        "the slot must be a quoted JS string, got {candidate}"
+      );
+      let inside = &candidate[1..candidate.len() - 1];
+      assert!(
+        inside
+          .chars()
+          .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+        "a caller-supplied id must not survive into the slot unsanitised: {candidate}"
+      );
+      assert!(
+        candidate.len() < 128,
+        "a caller must not be able to grow the evaluated script: {} chars",
+        candidate.len()
+      );
+    }
+
+    // And every script that touches the cache goes through the substitution
+    // rather than naming a slot directly, or one of them would keep writing to
+    // the shared global while the others moved.
+    let source = include_str!("mcp_server.rs");
+    let production = source
+      .split_once("\n#[cfg(test)]")
+      .map_or(source, |(code, _)| code);
+    assert!(
+      !production.contains("window.__donut_interactive"),
+      "no script may name the shared global directly any more"
+    );
+    assert_eq!(
+      production.matches("window[__CACHE__]").count()
+        + production.matches("window[{cache}]").count()
+        + production.matches("window[{slot}]").count(),
+      7,
+      "the seven cache sites (one write, four reads, two in the teardown) must \
+       all be parameterised"
+    );
+  }
+
+  #[tokio::test]
+  async fn an_index_tool_without_a_session_is_refused_not_guessed_at() {
+    // The hole the per-session key left open. `handle_message` serves a client
+    // that never called `initialize`, and the bridge passes whatever `sessionId`
+    // the relay frame carried, including none, so every sessionless caller
+    // used to land on ONE literal `anon` slot per transport. Two of them then
+    // shared an array, and session A's `click_by_index(3)` clicked whatever sat
+    // third in B's snapshot and reported "Clicked element at index 3".
+    //
+    // There is no safe slot to give such a caller, so it is refused. The
+    // refusal has to come FIRST, before argument parsing and before anything
+    // touches the page.
+    let server = McpServer::new();
+    let sessionless = McpCaller {
+      session: None,
+      toolsets: None,
+    };
+    let with_session = McpCaller {
+      session: Some("11111111-2222-3333-4444-555555555555"),
+      toolsets: None,
+    };
+    // Deliberately complete arguments: the refusal must be about the missing
+    // session, not about anything the caller forgot to send.
+    let args = serde_json::json!({
+      "profile_id": "00000000-0000-0000-0000-000000000000",
+      "index": 3,
+      "text": "hello",
+    });
+
+    let refusals = [
+      server
+        .handle_get_interactive_elements(sessionless, &args)
+        .await
+        .expect_err("listing must refuse a sessionless caller"),
+      server
+        .handle_click_by_index(sessionless, &args)
+        .await
+        .expect_err("clicking by index must refuse a sessionless caller"),
+      server
+        .handle_type_by_index(sessionless, &args)
+        .await
+        .expect_err("typing by index must refuse a sessionless caller"),
+    ];
+    for refusal in &refusals {
+      assert_eq!(
+        refusal.code, -32600,
+        "a missing session is a bad request, not a tool failure: {}",
+        refusal.message
+      );
+      assert!(
+        refusal.message.contains("initialize"),
+        "the refusal must tell the agent what to do about it: {}",
+        refusal.message
+      );
+    }
+
+    // And the refusal is about the SESSION, not a coincidence of this fixture:
+    // the same call WITH a session gets past the gate and fails later, on the
+    // profile that does not exist.
+    let later = server
+      .handle_click_by_index(with_session, &args)
+      .await
+      .expect_err("no such profile in a unit test");
+    assert!(
+      !later.message.contains("initialize"),
+      "a caller that HAS a session must not be refused for lacking one: {}",
+      later.message
+    );
+  }
+
+  #[tokio::test]
+  async fn ending_a_session_releases_the_page_globals_it_left_behind() {
+    // Every session mints its own page global, and before this nothing ever
+    // deleted one: `end_session` dropped the server-side record only, and no
+    // CDP call removed the array. A long-lived tab therefore accumulated one
+    // array of live element references per session that had ever listed it,
+    // pinning detached nodes for as long as the page stayed open.
+    let server = McpServer::new();
+    server.mark_engine_ready_for_tests();
+
+    let init = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    let McpOutcome::Body { new_session_id, .. } = server.handle_message(None, init).await else {
+      panic!("initialize must mint a session");
+    };
+    let session = new_session_id.expect("session id");
+    let slot = interactive_cache_slot(&session);
+
+    server
+      .remember_cached_page(&session, "profile-a", &slot)
+      .await;
+    server
+      .remember_cached_page(&session, "profile-b", &slot)
+      .await;
+    // Recorded once per page, not once per call.
+    server
+      .remember_cached_page(&session, "profile-a", &slot)
+      .await;
+    assert_eq!(
+      server.inner.lock().await.sessions[&session]
+        .cached_pages
+        .len(),
+      2,
+      "a session must remember every page it wrote a snapshot to, once each"
+    );
+
+    // Ending it takes the pages with it. Neither profile exists here, so the
+    // CDP delete cannot land, which is exactly the path that must still leave
+    // no server-side record behind, and must still return promptly.
+    server.end_session(&session).await;
+    let inner = server.inner.lock().await;
+    assert!(
+      !inner.sessions.contains_key(&session),
+      "the session itself must be gone"
+    );
+    drop(inner);
+
+    // A snapshot taken after the teardown must not resurrect the session.
+    server
+      .remember_cached_page(&session, "profile-c", &slot)
+      .await;
+    assert!(
+      !server.inner.lock().await.sessions.contains_key(&session),
+      "a late write must not recreate a session nothing will ever clean up"
+    );
+  }
+
+  #[test]
+  fn one_page_cannot_accumulate_unbounded_element_caches() {
+    // The teardown above only fires when a session ENDS, and no first-party
+    // client sends `end_session`, an evicted, crashed or simply abandoned
+    // session never will. So the page bounds itself too: the enumeration
+    // script keeps a registry of the slots it has written and deletes the
+    // oldest once the cap is passed.
+    let script = INTERACTIVE_ELEMENTS_JS
+      .replace("__MAX_CHARS__", "40000")
+      .replace("__CACHE__", "'__donut_interactive_bridge_abc'")
+      .replace("__REGISTRY__", INTERACTIVE_SLOT_REGISTRY)
+      .replace("__MAX_SLOTS__", &MAX_CACHE_SLOTS_PER_PAGE.to_string());
+
+    assert!(
+      !script.contains("__MAX_CHARS__")
+        && !script.contains("__CACHE__")
+        && !script.contains("__REGISTRY__")
+        && !script.contains("__MAX_SLOTS__"),
+      "every placeholder must be substituted, or the page throws instead of listing"
+    );
+    assert!(
+      script.contains(&format!("kept.length > {MAX_CACHE_SLOTS_PER_PAGE}")),
+      "the cap must be a real number in the emitted script"
+    );
+    assert!(
+      script.contains("delete window[evicted]"),
+      "passing the cap must actually delete the evicted slot, not merely stop \
+       tracking it"
+    );
+    assert!(
+      (1..=32).contains(&MAX_CACHE_SLOTS_PER_PAGE),
+      "a cap of {MAX_CACHE_SLOTS_PER_PAGE} is either no cap at all or too tight \
+       for the callers legitimately driving one page"
+    );
+
+    // The teardown deletes the same global the script writes, or `end_session`
+    // clears a slot nobody uses while the real one leaks on.
+    let production = include_str!("mcp_server.rs")
+      .split_once("\n#[cfg(test)]")
+      .map_or("", |(code, _)| code);
+    assert!(
+      production.contains("delete window[{slot}]"),
+      "end_session must delete the page global itself"
+    );
+    assert!(
+      production.contains("session.cached_pages"),
+      "end_session must take the pages from the session it removes"
+    );
+  }
+
+  #[tokio::test]
+  async fn the_session_the_transport_validated_is_the_one_the_cache_keys_on() {
+    // The slot is only per-session if the session actually REACHES the cache.
+    // `handle_message` is the one place the bridge hands a session id in,
+    // so the wiring from there down to the three cache sites is asserted here:
+    // without it `interactive_cache_slot` could be perfectly correct and every
+    // caller would still be handed a slot chosen from nothing.
+    let production = include_str!("mcp_server.rs")
+      .split_once("\n#[cfg(test)]")
+      .map_or("", |(code, _)| code);
+
+    let flattened: String = production.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+      flattened.contains("McpCaller { session: session_id"),
+      "handle_message must pass the caller's session on to the dispatcher, or \
+       every caller is refused the index tools it is entitled to"
+    );
+    for handler in [
+      "handle_get_interactive_elements",
+      "handle_click_by_index",
+      "handle_type_by_index",
+    ] {
+      let body = production
+        .split(&format!("async fn {handler}("))
+        .nth(1)
+        .unwrap_or_else(|| panic!("{handler} must exist"));
+      let signature = &body[..body.find(") ->").unwrap_or(body.len())];
+      assert!(
+        signature.contains("caller: McpCaller"),
+        "{handler} must be told WHO is asking, not just how they got here: \
+         {signature}"
+      );
+    }
+
+    // End to end: two sessions, one transport, and the engine must not answer
+    // the second one's `click_by_index` from the first one's snapshot. Both
+    // calls fail here (no browser in a unit test), so what is asserted is that
+    // the sessions are distinct and both survive the session check, the
+    // per-session slot is asserted directly above.
+    let server = McpServer::new();
+    server.mark_engine_ready_for_tests();
+    let init = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+      let McpOutcome::Body { new_session_id, .. } = server.handle_message(None, init).await else {
+        panic!("initialize must answer");
+      };
+      ids.push(new_session_id.expect("initialize must mint a session id"));
+    }
+    assert_ne!(
+      ids[0], ids[1],
+      "two initializes on one transport must be two different sessions"
+    );
+    assert_ne!(
+      interactive_cache_slot(&ids[0]),
+      interactive_cache_slot(&ids[1]),
+      "two live sessions on one transport must not resolve to one slot"
+    );
+
+    // Both survive the session check, so neither is refused for a reason other
+    // than the one under test.
+    let ping = br#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#;
+    for id in &ids {
+      assert!(
+        matches!(
+          server.handle_message(Some(id.as_str()), ping).await,
+          McpOutcome::Body { .. }
+        ),
+        "a freshly minted session must be usable"
+      );
+    }
+  }
+
+  #[test]
+  fn a_typing_request_that_would_run_for_hours_is_refused_before_it_starts() {
+    // The DECISION, exercised. An earlier version of this test asserted only
+    // that the plan arithmetic crossed the bound and that the constant appeared
+    // before `target.connect()` in the source, and neither noticed the guard
+    // being turned into `if false && planned > MAX_TYPING_SECONDS`, nor the
+    // bound being raised past anything reachable. Both mutations were MISSED.
+    // Calling the function that makes the decision catches both.
+    let ordinary = plan_typing("hello there", None, MAX_TYPING_SECONDS).expect("an ordinary field");
+    assert!(!ordinary.is_empty(), "a real plan must be produced");
+
+    // `session_wpm` is floored at 10 in human_typing.rs, so this is the slowest
+    // a plan can be, and the text length, which nothing bounds, is what makes
+    // the hours reachable.
+    // 1,000 characters, not 20,000. At the wpm floor a keystroke costs
+    // 60 / (10 * 5) = 1.2s, so ~250 characters already crosses the 300s bound -
+    // and generating a 20,000 character plan took this one test 24 seconds, on
+    // a suite that otherwise runs in seven.
+    // Still within MAX_TYPING_CHARS, so this exercises the DURATION bound
+    // rather than the length one: 1,000 characters at the wpm floor plans in
+    // well under a second but would take over an hour to type.
+    let refusal = plan_typing(&"a".repeat(1_000), Some(10.0), MAX_TYPING_SECONDS)
+      .expect_err("1,000 characters at the slowest rate must be refused");
+    assert_eq!(refusal.code, -32602);
+    assert!(
+      refusal.message.contains("TYPING_TOO_LONG"),
+      "the refusal must carry a translatable code: {}",
+      refusal.message
+    );
+    // The numbers travel with it, so the caller is told what to change rather
+    // than only that it was too much.
+    let body: serde_json::Value =
+      serde_json::from_str(&refusal.message).expect("the code envelope is JSON");
+    assert_eq!(body["params"]["limit"], "300");
+    assert!(
+      body["params"]["seconds"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .is_some_and(|seconds| seconds > MAX_TYPING_SECONDS),
+      "the reported duration must be the one that broke the bound: {body}"
+    );
+
+    // The LENGTH bound must bite before the plan is built, or the caller pays
+    // the superlinear planning cost of an arbitrarily long string first. Timed,
+    // because "it refuses" is not the property, "it refuses CHEAPLY" is.
+    let huge = "a".repeat(400_000);
+    let started = std::time::Instant::now();
+    let long_refusal = plan_typing(&huge, None, MAX_TYPING_SECONDS).expect_err("400,000 chars");
+    let took = started.elapsed();
+    assert!(
+      long_refusal.message.contains("TYPING_TOO_LONG"),
+      "{}",
+      long_refusal.message
+    );
+    assert!(
+      took < std::time::Duration::from_millis(500),
+      "the refusal must not require planning the text first; took {took:?}"
+    );
+
+    // And the sending path can no longer refuse at all: it is handed a plan
+    // that was already accepted.
+    let source = include_str!("mcp_server.rs");
+    let production = source
+      .split_once("\n#[cfg(test)]")
+      .map_or(source, |(code, _)| code);
+    let sender = production
+      .split("async fn dispatch_keystrokes(")
+      .nth(1)
+      .expect("dispatch_keystrokes must exist");
+    let sender = &sender[..sender.find("\n}").unwrap_or(sender.len())];
+    assert!(
+      !sender.contains("plan_typing"),
+      "the sender must take the accepted plan, not decide for itself, \
+       deciding here is what put the refusal after the field was emptied"
+    );
+    assert!(
+      !production.contains("send_human_keystrokes"),
+      "the plan-it-yourself entry point must be gone, or a handler can call \
+       it and reintroduce the late refusal"
+    );
+  }
+
+  #[test]
+  fn a_refused_typing_request_has_not_already_emptied_the_field() {
+    // The ORDER, which the duration bound alone never pinned. Both typing
+    // handlers used to focus the element and empty it first and call
+    // `plan_typing` only afterwards, so a TYPING_TOO_LONG was a lie: the server
+    // answered "refused" with the customer's form field already wiped. Nothing
+    // may touch the page before the plan is accepted.
+    let production = include_str!("mcp_server.rs")
+      .split_once("\n#[cfg(test)]")
+      .map_or("", |(code, _)| code);
+
+    for handler in ["handle_type_text", "handle_type_by_index"] {
+      let rest = production
+        .split(&format!("async fn {handler}("))
+        .nth(1)
+        .unwrap_or_else(|| panic!("{handler} must exist"));
+      let body = &rest[..rest.find("\n  async fn ").unwrap_or(rest.len())];
+
+      let plan = body
+        .find("plan_typing(text, wpm, MAX_BRIDGE_TYPING_SECONDS)?")
+        .unwrap_or_else(|| panic!("{handler} must plan through the bounded builder"));
+      assert_eq!(
+        body.matches("plan_typing(").count(),
+        1,
+        "{handler} must plan exactly once, before the page is touched"
+      );
+
+      // Everything that touches the page comes after the plan, and the page is
+      // touched in one place: the shared typing path, which replaces a field's
+      // text by selecting it, never by assigning a value.
+      assert!(
+        !body.contains(".value = ''") && !body.contains("let focus_js"),
+        "{handler} must leave the field to type_element"
+      );
+      for mutation in ["resolve_target(", "type_element("] {
+        let at = body
+          .find(mutation)
+          .unwrap_or_else(|| panic!("{handler} no longer contains {mutation}"));
+        assert!(
+          plan < at,
+          "{handler} reaches {mutation:?} at {at} before planning at {plan}: a \
+           refusal raised after that point has already changed the page it \
+           claims it did not touch"
+        );
+      }
+
+      // And the refusal really is a refusal: `?` on the plan, not a swallowed
+      // error that lets the handler carry on and clear the field anyway.
+      assert!(
+        body.contains("Some(plan_typing(text, wpm, MAX_BRIDGE_TYPING_SECONDS)?)"),
+        "{handler} must propagate the refusal rather than absorb it"
+      );
+    }
+  }
+
+  #[test]
+  fn an_mcp_caller_may_type_for_less_than_the_relay_will_wait() {
+    // A call over the bridge is answered with a timeout if it runs too long, so
+    // a plan that would type for longer is a guaranteed failure that still holds
+    // a process-wide permit for its whole duration. The local REST API keeps
+    // the five minutes: nothing upstream times it out.
+    assert_eq!(MAX_TYPING_SECONDS, 300.0);
+    assert_eq!(MAX_BRIDGE_TYPING_SECONDS, 80.0);
+    // The MCP budget must stay under the relay's 90 s call budget.
+    const { assert!(MAX_BRIDGE_TYPING_SECONDS < 90.0) };
+
+    // Exercised, not merely asserted: the same text is refused over MCP and
+    // accepted over REST. Each plan is built afresh with its
+    // own randomness, so the fixture sits far from both bounds: 1,200
+    // characters at 200 wpm plan to roughly 160 seconds, and the session rate
+    // is sampled with a standard deviation of 10 wpm (five percent here; at
+    // the 10 wpm floor it was a factor of three, which is why the fixture is
+    // not typed at the floor). Fatigue makes the plan superlinear, so the
+    // count is not to be scaled by eye.
+    let text = "a".repeat(1_200);
+    let over_rest = plan_typing(&text, Some(200.0), MAX_TYPING_SECONDS)
+      .expect("about 160 seconds is inside the REST budget");
+    let planned = over_rest.last().map_or(0.0, |event| event.time);
+    assert!(
+      planned > 110.0 && planned < 250.0,
+      "the fixture must sit well clear of both budgets, planned {planned}s"
+    );
+
+    let over_bridge = plan_typing(&text, Some(200.0), MAX_BRIDGE_TYPING_SECONDS)
+      .expect_err("the same text must be refused over MCP");
+    let body: serde_json::Value = serde_json::from_str(&over_bridge.message).unwrap();
+    assert_eq!(body["code"], "TYPING_TOO_LONG");
+    assert_eq!(
+      body["params"]["limit"], "80",
+      "the refusal must name the budget that applied, not the REST one"
+    );
+  }
+
+  #[test]
+  fn a_stored_proxy_loses_its_secrets_and_nothing_else_under_redaction() {
+    let mut proxy = serde_json::json!({
+      "id": "p1",
+      "name": "Berlin",
+      "proxy_settings": {
+        "proxy_type": "socks5",
+        "host": "proxy.example",
+        "port": 1080,
+        "username": "user",
+        "password": "hunter2",
+        "vless_uri": "vless://uuid@host:443?security=reality#name"
+      },
+      "geo_country": "DE",
+      "dynamic_proxy_url": "https://lists.example/rotate?key=SECRET",
+      "rotation_url": "https://provider.example/change-ip?token=ROTATE"
+    });
+    redact_proxy_secrets(&mut proxy);
+
+    assert_eq!(proxy["proxy_settings"]["password"], "[redacted]");
+    assert_eq!(proxy["proxy_settings"]["vless_uri"], "[redacted]");
+    assert_eq!(proxy["dynamic_proxy_url"], "[redacted]");
+    assert_eq!(proxy["rotation_url"], "[redacted]");
+    // Everything an agent needs to choose a proxy survives.
+    assert_eq!(proxy["id"], "p1");
+    assert_eq!(proxy["name"], "Berlin");
+    assert_eq!(proxy["proxy_settings"]["host"], "proxy.example");
+    assert_eq!(proxy["proxy_settings"]["port"], 1080);
+    assert_eq!(proxy["proxy_settings"]["username"], "user");
+    assert_eq!(proxy["geo_country"], "DE");
+    let text = proxy.to_string();
+    assert!(!text.contains("hunter2") && !text.contains("SECRET") && !text.contains("vless://"));
+    assert!(!text.contains("ROTATE"));
+
+    // A proxy with no secrets is left exactly as it was: no field is invented
+    // just to say it was redacted.
+    let mut bare = serde_json::json!({
+      "id": "p2",
+      "name": "Plain",
+      "proxy_settings": {
+        "proxy_type": "http",
+        "host": "h",
+        "port": 8080,
+        "username": null,
+        "password": null
+      }
+    });
+    let before = bare.clone();
+    redact_proxy_secrets(&mut bare);
+    assert_eq!(bare, before);
+  }
+
+  #[test]
+  fn the_proxy_readers_always_redact() {
+    // `handle_list_proxies` and `handle_get_proxy` serialize a `StoredProxy`
+    // whole, and every MCP caller holds an account credential rather than this
+    // machine, so both must route their answer through the redaction.
+    let production = include_str!("mcp_server.rs")
+      .split_once("\n#[cfg(test)]")
+      .map_or("", |(code, _)| code);
+    for handler in ["handle_list_proxies", "handle_get_proxy"] {
+      let rest = production
+        .split(&format!("async fn {handler}("))
+        .nth(1)
+        .unwrap_or_else(|| panic!("{handler} must exist"));
+      let body = &rest[..rest.find("\n  async fn ").unwrap_or(rest.len())];
+      assert_eq!(
+        body.matches("redact_proxy_secrets(").count(),
+        1,
+        "{handler} must redact in exactly one place"
+      );
+    }
+  }
+
+  #[tokio::test]
+  async fn exporting_proxies_is_refused_before_the_arguments_are_read() {
+    // The export exists to write every password and VLESS URI out in full,
+    // which is what the redaction above withholds from a remote caller. The
+    // refusal sits at the gate, so a well-formed export and a malformed one
+    // are indistinguishable from outside.
+    let server = McpServer::new();
+    server.mark_engine_ready_for_tests();
+
+    for arguments in [r#"{"format":"json"}"#, r#"{}"#] {
+      let call = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"export_proxies","arguments":{arguments}}}}}"#
+      );
+      let McpOutcome::Body { body, .. } = server.handle_message(None, call.as_bytes()).await else {
+        panic!("expected an answer");
+      };
+      assert!(
+        body["error"]["message"]
+          .as_str()
+          .unwrap_or_default()
+          .contains("TOOL_IS_LOCAL_ONLY"),
+        "export_proxies must be refused: {body}"
+      );
+    }
+
+    // And the list is pinned: only the export is refused by name, and it is.
+    assert_eq!(SECRET_EXPORT_TOOLS, &["export_proxies"]);
+  }
+
+  #[test]
+  fn every_tool_that_reads_a_local_path_is_on_the_local_only_list() {
+    // Derived from the source, and the list is PINNED. Iterating
+    // LOCAL_PATH_TOOLS to check each entry is refused is a tautology -
+    // deleting an entry just shortens the loop, so the membership itself is
+    // asserted, and a handler that reads a path without being listed fails.
+    let full = include_str!("mcp_server.rs");
+    let source = full
+      .split_once("\n#[cfg(test)]")
+      .map(|(code, _)| code)
+      .unwrap_or(full);
+
+    let starts: Vec<usize> = source
+      .match_indices("\n  ")
+      .filter(|(i, _)| {
+        let rest = &source[i + 3..];
+        ["fn ", "async fn ", "pub fn ", "pub async fn "]
+          .iter()
+          .any(|p| rest.starts_with(p))
+      })
+      .map(|(i, _)| i)
+      .collect();
+
+    let mut readers = Vec::new();
+    for (n, &begin) in starts.iter().enumerate() {
+      let stop = starts.get(n + 1).copied().unwrap_or(source.len());
+      let body = &source[begin..stop];
+      // `get_tools` only lists schemas; a batch tool's schema names `arguments`.
+      if !body.contains("arguments") || is_tool_listing(body) {
+        continue;
+      }
+      if body.contains(r#""path""#) || body.contains(r#""folder""#) {
+        let name = body
+          .trim_start()
+          .trim_start_matches("pub ")
+          .trim_start_matches("async ")
+          .trim_start_matches("fn ")
+          .split(['(', '<'])
+          .next()
+          .unwrap_or("?")
+          .trim_start_matches("handle_")
+          .to_string();
+        readers.push(name);
+      }
+    }
+
+    // The scan above only sees a path named as a LITERAL argument key in the
+    // handler. `import_browser_profiles` takes its path as `items[].source_path`
+    // on a deserialized struct, so no such literal appears anywhere in its body
+    // and it sat off the list, reachable from the internet, until a review
+    // caught it by reading the struct instead. The declared schema is the
+    // contract that does show nested arguments, so it is walked here too and
+    // the two sources are unioned: a path reachable through EITHER the argument
+    // keys or the published schema has to be refused over the bridge.
+    fn path_like(name: &str) -> bool {
+      let lowered = name.to_ascii_lowercase();
+      lowered.contains("path")
+        || lowered.contains("folder")
+        || lowered.contains("directory")
+        || lowered == "dir"
+        || lowered.ends_with("_dir")
+    }
+
+    fn walk(schema: &serde_json::Value, found: &mut bool) {
+      let serde_json::Value::Object(map) = schema else {
+        return;
+      };
+      if let Some(serde_json::Value::Object(props)) = map.get("properties") {
+        for (key, value) in props {
+          if path_like(key) {
+            *found = true;
+          }
+          walk(value, found);
+        }
+      }
+      if let Some(items) = map.get("items") {
+        walk(items, found);
+      }
+      for branch in ["anyOf", "oneOf", "allOf"] {
+        if let Some(serde_json::Value::Array(options)) = map.get(branch) {
+          for option in options {
+            walk(option, found);
+          }
+        }
+      }
+    }
+
+    for tool in McpServer::new().get_tools() {
+      let mut found = false;
+      walk(&tool.input_schema, &mut found);
+      if found {
+        readers.push(tool.name.clone());
+      }
+    }
+
+    readers.sort();
+    readers.dedup();
+
+    let mut listed: Vec<String> = LOCAL_PATH_TOOLS.iter().map(|t| t.to_string()).collect();
+    listed.sort();
+    assert_eq!(
+      readers, listed,
+      "a handler reads a caller-supplied filesystem path but is not refused \
+       over the bridge (or the list names one that no longer reads a path)"
+    );
+  }
+
+  #[tokio::test]
+  async fn a_tool_that_reads_this_machine_is_refused_over_the_bridge() {
+    // `add_extension` takes a caller-supplied path, `fs::read`s it, stores the
+    // bytes, and the sync engine uploads them, an arbitrary local-file read
+    // with the same shape as the `file://` hole the URL allowlist closed, but
+    // reachable from the internet with an account credential.
+    //
+    // A remote caller cannot know this machine's filesystem, so there is no
+    // legitimate remote use to preserve: refusing is strictly better than
+    // guessing at safe roots.
+    let server = McpServer::new();
+    server.mark_engine_ready_for_tests();
+
+    for tool in LOCAL_PATH_TOOLS {
+      let call = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{tool}","arguments":{{"path":"/etc/passwd","folder":"/etc"}}}}}}"#
+      );
+
+      let McpOutcome::Body { body, .. } = server.handle_message(None, call.as_bytes()).await else {
+        panic!("expected an answer for {tool}");
+      };
+      let message = body["error"]["message"].as_str().unwrap_or_default();
+      assert!(
+        message.contains("TOOL_IS_LOCAL_ONLY"),
+        "{tool} must be refused over the bridge with a translatable code: {body}"
+      );
+    }
+  }
+
+  #[tokio::test]
+  async fn a_nested_path_is_refused_over_the_bridge_in_its_real_shape() {
+    // The loop above sends `{"path": ..., "folder": ...}` to every listed
+    // tool, which is not the shape `import_browser_profiles` actually takes -
+    // its path rides inside `items[].source_path`. Sending the real payload is
+    // the difference between proving the NAME is on a list and proving the
+    // CALL an attacker would make is refused.
+    let server = McpServer::new();
+    server.mark_engine_ready_for_tests();
+
+    let call = serde_json::json!({
+      "jsonrpc": "2.0",
+      "id": 1,
+      "method": "tools/call",
+      "params": {
+        "name": "import_browser_profiles",
+        "arguments": {
+          "items": [{
+            "source_path": "/Users/someone/Library/Application Support/Google/Chrome/Default",
+            "new_profile_name": "stolen"
+          }]
+        }
+      }
+    })
+    .to_string();
+
+    let McpOutcome::Body { body, .. } = server.handle_message(None, call.as_bytes()).await else {
+      panic!("expected an answer");
+    };
+    assert!(
+      body["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("TOOL_IS_LOCAL_ONLY"),
+      "a remote caller must not be able to name a directory on this disk: {body}"
+    );
+
+    // The refusal must happen BEFORE the arguments are even parsed, so a
+    // malformed remote payload cannot be told apart from a well-formed one.
+    // Otherwise the error text itself answers "does this path exist".
+    let probe = serde_json::json!({
+      "jsonrpc": "2.0",
+      "id": 2,
+      "method": "tools/call",
+      "params": { "name": "import_browser_profiles", "arguments": {} }
+    })
+    .to_string();
+    let McpOutcome::Body { body, .. } = server.handle_message(None, probe.as_bytes()).await else {
+      panic!("expected an answer");
+    };
+    assert!(
+      body["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("TOOL_IS_LOCAL_ONLY"),
+      "the gate must sit ahead of argument parsing: {body}"
+    );
+  }
+
+  #[tokio::test]
+  async fn the_session_map_is_bounded() {
+    // Nothing evicts a session except an explicit `end_session`, and no
+    // first-party client sends one, so without a cap the map grows for the
+    // life of the process. The oldest is evicted rather than the newest
+    // refused: the caller asking for a session is the one actually present.
+    let server = McpServer::new();
+    server.mark_engine_ready_for_tests();
+
+    let init = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    let mut first = None;
+    for i in 0..(MAX_SESSIONS + 8) {
+      let McpOutcome::Body { new_session_id, .. } = server.handle_message(None, init).await else {
+        panic!("initialize must mint a session");
+      };
+      if i == 0 {
+        first = new_session_id;
+      }
+    }
+
+    assert!(
+      server.inner.lock().await.sessions.len() <= MAX_SESSIONS,
+      "the session map must stay bounded"
+    );
+
+    // The oldest went first, and the map still works for a fresh session.
+    let ping = br#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#;
+    assert!(matches!(
+      server
+        .handle_message(Some(&first.expect("first session")), ping)
+        .await,
+      McpOutcome::UnknownSession
+    ));
+  }
+
+  #[tokio::test]
+  async fn the_cap_evicts_what_is_idle_not_what_is_busy() {
+    // Evicting by CREATION time threw out the wrong session every time: a
+    // long-lived agent's is by definition the oldest, so a wall of abandoned
+    // sessions from closed browser tabs would evict the one client actually
+    // working, and the official MCP SDK does not re-initialize on the 404
+    // that follows, so that agent stays wedged.
+    let server = McpServer::new();
+    server.mark_engine_ready_for_tests();
+
+    let init = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    let ping = br#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#;
+
+    let McpOutcome::Body { new_session_id, .. } = server.handle_message(None, init).await else {
+      panic!("initialize must mint a session");
+    };
+    let agent = new_session_id.expect("session id");
+
+    // Fill the map, keeping the agent's session in active use throughout.
+    let mut newest = None;
+    for i in 0..(MAX_SESSIONS + 16) {
+      if let McpOutcome::Body { new_session_id, .. } = server.handle_message(None, init).await {
+        newest = new_session_id;
+      }
+      if i % 4 == 0 {
+        assert!(
+          matches!(
+            server.handle_message(Some(&agent), ping).await,
+            McpOutcome::Body { .. }
+          ),
+          "the busy session must survive: it is the one being used"
+        );
+      }
+    }
+
+    assert!(
+      server.inner.lock().await.sessions.len() <= MAX_SESSIONS,
+      "still bounded"
+    );
+    assert!(
+      matches!(
+        server.handle_message(Some(&agent), ping).await,
+        McpOutcome::Body { .. }
+      ),
+      "the session in continuous use must outlive the idle ones"
+    );
+
+    // And the newest survives too. Without this the test passes for an
+    // eviction policy that throws out whatever just arrived, which keeps the
+    // map bounded and the busy session alive while making every new client
+    // unable to hold a session at all.
+    assert!(
+      matches!(
+        server
+          .handle_message(Some(&newest.expect("a newest session")), ping)
+          .await,
+        McpOutcome::Body { .. }
+      ),
+      "a freshly minted session must not be the one evicted"
+    );
+  }
+
+  #[tokio::test]
+  async fn every_tool_is_in_a_toolset_and_a_selection_lists_only_its_toolsets() {
+    let server = McpServer::new();
+    let advertised: std::collections::HashSet<String> = server
+      .get_tools()
+      .into_iter()
+      .map(|tool| tool.name)
+      .collect();
+    for name in &advertised {
+      assert!(
+        crate::mcp_toolsets::toolset_of(name).is_some(),
+        "{name} is in no toolset, so a client that picks toolsets never sees it"
+      );
+    }
+    for (set, tools) in crate::mcp_toolsets::TOOLSETS {
+      for tool in *tools {
+        assert!(
+          advertised.contains(*tool),
+          "{set} lists {tool}, which is no tool"
+        );
+      }
+    }
+
+    let selection = crate::mcp_toolsets::parse(Some("network")).unwrap();
+    let listed = server
+      .handle_tools_list(Some(&selection))
+      .await
+      .expect("tools list");
+    let names: Vec<&str> = listed["tools"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .map(|tool| tool["name"].as_str().unwrap())
+      .collect();
+    assert!(names.contains(&"list_profiles") && names.contains(&"rotate_proxy_ip"));
+    assert!(!names.contains(&"list_cookie_bot_schedules"));
+    assert!(names.len() < advertised.len());
+    let list = listed["tools"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .find(|tool| tool["name"] == "list_profiles")
+      .unwrap();
+    assert_eq!(list["outputSchema"]["type"], "object");
+  }
+
+  #[tokio::test]
+  async fn the_launch_settings_an_agent_can_set_are_the_ones_it_can_read() {
+    let server = McpServer::new();
+    let tools = server.handle_tools_list(None).await.expect("tools list");
+    let update = tools["tools"]
+      .as_array()
+      .expect("tools array")
+      .iter()
+      .find(|tool| tool["name"] == "update_profile_fingerprint")
+      .expect("update_profile_fingerprint is advertised");
+    let properties = &update["inputSchema"]["properties"];
+    for field in ["restore_session", "webrtc_mode"] {
+      assert!(
+        properties.get(field).is_some(),
+        "{field} must be settable through the tool that owns the Wayfern config"
+      );
+    }
+    assert_eq!(
+      properties["webrtc_mode"]["enum"],
+      serde_json::json!(["auto", "tcp_only", "block"]),
+      "the modes offered must be the modes the launcher understands"
+    );
+    // A mode the launcher would silently read as `auto` is refused instead.
+    assert!(crate::wayfern_manager::WebRtcMode::parse("sideways").is_none());
   }
 
   #[test]
@@ -6745,9 +15764,11 @@ mod tests {
       .find(|tool| tool.name == "create_proxy")
       .expect("create_proxy tool");
     let properties = &create.input_schema["properties"];
-    assert!(properties["proxy_type"]["enum"]
-      .as_array()
-      .is_some_and(|values| values.iter().any(|value| value == "vless")));
+    for xray_type in ["vless", "vmess", "trojan", "hysteria2"] {
+      assert!(properties["proxy_type"]["enum"]
+        .as_array()
+        .is_some_and(|values| values.iter().any(|value| value == xray_type)));
+    }
     assert!(properties["vless_uri"].is_object());
 
     let required = create.input_schema["required"]
@@ -6784,6 +15805,19 @@ mod tests {
       "get_interactive_elements",
       "click_by_index",
       "type_by_index",
+      // The agent surface reads and drives the same browser.
+      "perceive_page",
+      "resolve_locator",
+      "click_locator",
+      "type_locator",
+      "extract_structured",
+      "pick_element",
+      "select_option",
+      "file_upload",
+      // A capture reads every request the browser makes.
+      "start_network_capture",
+      "list_network_requests",
+      "get_network_request",
       // Leases a remote host for up to two hours and spends the pooled
       // remote-hour budget.
       "run_cookie_bot_now",
@@ -6800,9 +15834,9 @@ mod tests {
 
     for name in [
       "list_profiles",
-      // Configuration, not automation: one row in Donut cloud, no hardware
-      // leased. Metering it would throttle an agent enrolling a fleet of
-      // profiles, while the budget that guards the hardware is spent per run.
+      // Configuration, not automation: nothing is leased. Metering it would
+      // throttle an agent enrolling many profiles, and it is not what spends
+      // the account's hours.
       "set_cookie_bot_schedule",
       "delete_cookie_bot_schedule",
       "list_cookie_bot_schedules",
@@ -6825,5 +15859,1786 @@ mod tests {
       "tools/list",
       None
     )));
+  }
+
+  // --- The agent surface --------------------------------------------------
+  //
+  // Driven against the fake Wayfern socket in `wayfern_cdp::test_support`,
+  // because the property that matters, WHICH engine a profile gets and what
+  // that engine puts on the wire, only shows up when something answers.
+
+  fn agent_context_for(version: &str, target: CdpTarget) -> AgentContext {
+    AgentContext::new(
+      BrowserProfile {
+        id: uuid::Uuid::nil(),
+        name: "p".to_string(),
+        browser: "wayfern".to_string(),
+        version: version.to_string(),
+        ..Default::default()
+      },
+      target,
+    )
+  }
+
+  /// The params of every frame sent with `method`, in order.
+  fn params_of(
+    frames: &crate::wayfern_cdp::test_support::Frames,
+    method: &str,
+  ) -> Vec<serde_json::Value> {
+    frames
+      .lock()
+      .unwrap()
+      .iter()
+      .filter(|f| f["method"] == method)
+      .map(|f| f["params"].clone())
+      .collect()
+  }
+
+  /// The CDP press, held moves and release of a hold at (140, 215): whole
+  /// pixels, the held button's mask while it is down, no move to the pixel of
+  /// the event before, and the release at the last position. Answers how many
+  /// held moves there were.
+  fn assert_dispatched_hold(mouse: &[serde_json::Value], button: &str, mask: u64) -> usize {
+    let press = mouse
+      .iter()
+      .position(|e| e["type"] == "mousePressed")
+      .expect("a press");
+    let release = mouse.len() - 1;
+    assert_eq!(mouse[release]["type"], "mouseReleased");
+    assert_eq!(mouse[press]["x"], 140.0);
+    assert_eq!(mouse[press]["y"], 215.0);
+    assert_eq!(mouse[press]["button"], button);
+    assert_eq!(mouse[press]["buttons"], mask);
+    let mut previous = (140.0, 215.0);
+    for moved in &mouse[press + 1..release] {
+      assert_eq!(moved["type"], "mouseMoved");
+      assert_eq!(moved["buttons"], mask);
+      let (x, y) = (moved["x"].as_f64().unwrap(), moved["y"].as_f64().unwrap());
+      assert_eq!((x.fract(), y.fract()), (0.0, 0.0));
+      assert!(
+        (x - 140.0).abs() <= 2.0 && (y - 215.0).abs() <= 2.0,
+        "{moved}"
+      );
+      assert_ne!((x, y), previous);
+      previous = (x, y);
+    }
+    assert_eq!(mouse[release]["x"].as_f64(), Some(previous.0));
+    assert_eq!(mouse[release]["y"].as_f64(), Some(previous.1));
+    assert_eq!(mouse[release]["buttons"], 0);
+    release - press - 1
+  }
+
+  #[tokio::test]
+  async fn a_152_profile_holds_with_a_clasp_and_small_glides_while_the_button_is_down() {
+    use crate::wayfern_cdp::test_support::{fake_browser, methods, Fake};
+
+    let element = ElementRef::Locator(LocatorDescription {
+      role: Some("button".to_string()),
+      name: Some("Press and hold".to_string()),
+      ..Default::default()
+    });
+    let (target, frames) = fake_browser(Fake::Cooperative).await;
+    let ctx = agent_context_for("152.0.7977.64", target);
+    let held = agent_press_and_hold(&ctx, &element, 1200, "left")
+      .await
+      .expect("a cooperative browser completes the hold");
+    assert!(held.held);
+    assert_eq!(held.engine, Engine::Wayfern);
+    // Never shorter than asked, and not an exact length.
+    assert!((1224..3000).contains(&held.held_ms), "{}", held.held_ms);
+    let sent = methods(&frames);
+    let vellum: Vec<&str> = sent
+      .iter()
+      .filter(|m| m.starts_with("Vellum."))
+      .map(String::as_str)
+      .collect();
+    let clasp = vellum.iter().position(|m| *m == "Vellum.clasp").unwrap();
+    assert_eq!(
+      vellum[..=clasp],
+      ["Vellum.acquire", "Vellum.glide", "Vellum.clasp"]
+    );
+    assert_eq!(
+      vellum[vellum.len() - 2..],
+      ["Vellum.unclasp", "Vellum.release"]
+    );
+    let held_moves = &vellum[clasp + 1..vellum.len() - 2];
+    assert!(!held_moves.is_empty());
+    assert!(held_moves.iter().all(|m| *m == "Vellum.glide"));
+    assert!(!sent.iter().any(|m| m == "Input.dispatchMouseEvent"));
+    assert_eq!(
+      params_of(&frames, "Vellum.clasp"),
+      vec![serde_json::json!({ "pointer": "0000000000000001", "button": "left" })]
+    );
+    // Every held move stays within a pixel and a half of the press point,
+    // and none goes where the pointer already is.
+    let glides = params_of(&frames, "Vellum.glide");
+    let mut previous = (140.0, 215.0);
+    for glide in &glides[1..] {
+      let (x, y) = (glide["x"].as_f64().unwrap(), glide["y"].as_f64().unwrap());
+      assert!((x - 140.0).hypot(y - 215.0) <= 1.41, "{glide}");
+      assert!((x - previous.0).hypot(y - previous.1) >= 0.29, "{glide}");
+      previous = (x, y);
+    }
+    let wire = serde_json::to_value(&held).unwrap();
+    assert_eq!(wire["match"]["backendNodeId"], 7);
+    assert_eq!(wire["engine"], "wayfern");
+    assert_eq!(wire["button"], "left");
+    assert_eq!(sent.last().map(String::as_str), Some("Page.disable"));
+  }
+
+  #[tokio::test]
+  async fn a_hold_falls_back_to_dispatched_events_without_a_clasp_or_on_an_older_build() {
+    use crate::wayfern_cdp::test_support::{fake_browser, methods, Fake};
+
+    // A Wayfern built before the clasp: the pointer still glides there, then
+    // the press, the held moves and the release are trusted mouse events.
+    let (target, frames) = fake_browser(Fake::NoClasp).await;
+    let ctx = agent_context_for("152.0.7977.64", target);
+    let element = ElementRef::Locator(LocatorDescription {
+      role: Some("button".to_string()),
+      name: Some("Save".to_string()),
+      ..Default::default()
+    });
+    let held = agent_press_and_hold(&ctx, &element, 2500, "right")
+      .await
+      .unwrap();
+    assert_eq!(held.engine, Engine::Fallback);
+    assert!(held.held_ms >= 2550);
+    let sent = methods(&frames);
+    assert!(sent.iter().any(|m| m == "Vellum.glide"));
+    assert!(!sent.iter().any(|m| m == "Vellum.unclasp"));
+    assert_eq!(
+      sent
+        .iter()
+        .rfind(|m| m.starts_with("Vellum."))
+        .map(String::as_str),
+      Some("Vellum.release")
+    );
+    let mouse = params_of(&frames, "Input.dispatchMouseEvent");
+    let no_clasp_moves = assert_dispatched_hold(&mouse, "right", 2);
+
+    // An older build: no Vellum at all.
+    let (target, frames) = fake_browser(Fake::Cooperative).await;
+    let ctx = agent_context_for("151.0.7922.76", target);
+    let held = agent_press_and_hold(&ctx, &element, 2500, "left")
+      .await
+      .unwrap();
+    assert_eq!(held.engine, Engine::Fallback);
+    let sent = methods(&frames);
+    assert!(!sent.iter().any(|m| m.starts_with("Vellum.")));
+    let mouse = params_of(&frames, "Input.dispatchMouseEvent");
+    assert_eq!(mouse[0]["type"], "mouseMoved");
+    assert!(mouse[0].get("buttons").is_none());
+    let old_moves = assert_dispatched_hold(&mouse[1..], "left", 1);
+    // The pointer moves while held on at least one of the two holds; a move
+    // that rounds to the pixel it is on sends nothing, by design.
+    assert!(no_clasp_moves + old_moves >= 1);
+  }
+
+  #[test]
+  fn a_hold_takes_a_bounded_whole_duration_and_a_button_it_can_keep_down() {
+    assert_eq!(hold_settings(None, None).unwrap(), (3000, "left"));
+    assert_eq!(
+      hold_settings(Some(100.0), Some("right")).unwrap(),
+      (100, "right")
+    );
+    assert_eq!(
+      hold_settings(Some(30000.0), Some("middle")).unwrap(),
+      (30000, "middle")
+    );
+    for ms in [99.0, 30001.0, 1500.5, f64::NAN] {
+      let error = hold_settings(Some(ms), None).unwrap_err().into_mcp();
+      assert_eq!(error.code, -32602, "{ms}");
+      assert_eq!(
+        error.message,
+        "duration_ms must be a whole number from 100 to 30000"
+      );
+    }
+    assert!(hold_settings(None, Some("back")).is_err());
+  }
+
+  #[tokio::test]
+  async fn the_rest_hold_names_its_element_exactly_one_way() {
+    use crate::wayfern_cdp::test_support::{fake_browser, Fake};
+    let (target, _frames) = fake_browser(Fake::Cooperative).await;
+    let ctx = agent_context_for("152.0.7977.64", target);
+    for body in [
+      serde_json::json!({}),
+      serde_json::json!({ "selector": "  " }),
+      serde_json::json!({ "selector": "#a", "locator": { "role": "button" } }),
+    ] {
+      let request: AgentHoldRequest = serde_json::from_value(body.clone()).unwrap();
+      assert!(
+        matches!(
+          agent_hold(&ctx, &request).await,
+          Err(AgentError::InvalidArgument(_))
+        ),
+        "{body}"
+      );
+    }
+    let request: AgentHoldRequest = serde_json::from_value(
+      serde_json::json!({ "locator": { "name": "Save" }, "durationMs": 100 }),
+    )
+    .unwrap();
+    assert!(agent_hold(&ctx, &request).await.unwrap().held_ms >= 102);
+  }
+
+  #[tokio::test]
+  async fn a_152_profile_clicks_through_vellum_and_an_older_one_through_dispatch() {
+    use crate::wayfern_cdp::test_support::{fake_browser, methods, Fake};
+
+    let request: AgentClickRequest = serde_json::from_value(serde_json::json!({
+      "locator": { "role": "button", "name": "Save" }
+    }))
+    .unwrap();
+
+    // The 152 engine: the native resolver names the node, the DOM confirms the
+    // node carries what was matched and says where it is on screen, and a real
+    // pointer strikes it. No script runs in the page and nothing is dispatched
+    // synthetically.
+    let (target, frames) = fake_browser(Fake::Cooperative).await;
+    let ctx = agent_context_for("152.0.7977.64", target);
+    assert_eq!(ctx.engine, Engine::Wayfern);
+    let clicked = agent_click_locator(&ctx, &request)
+      .await
+      .expect("a cooperative browser completes the click");
+    assert!(clicked.clicked);
+    assert_eq!(clicked.engine, Engine::Wayfern);
+    assert_eq!(clicked.matched.signature, "s7");
+    let sent = methods(&frames);
+    let vellum: Vec<&str> = sent
+      .iter()
+      .filter(|m| m.starts_with("Vellum."))
+      .map(String::as_str)
+      .collect();
+    assert_eq!(
+      vellum,
+      vec![
+        "Vellum.acquire",
+        "Vellum.glide",
+        "Vellum.strike",
+        "Vellum.release"
+      ]
+    );
+    assert!(sent.iter().any(|m| m == "Wayfern.resolveLocator"));
+    assert!(sent.iter().any(|m| m == "DOM.describeNode"));
+    assert!(sent.iter().any(|m| m == "DOM.resolveNode"));
+    assert!(
+      !sent
+        .iter()
+        .any(|m| m == "Input.dispatchMouseEvent" || m == "Runtime.evaluate"),
+      "the native path must inject nothing and dispatch nothing: {sent:?}"
+    );
+    // The page was told to expect a navigation, and told to stop afterwards.
+    assert_eq!(sent.first().map(String::as_str), Some("Page.enable"));
+    assert_eq!(sent.last().map(String::as_str), Some("Page.disable"));
+    let wire = serde_json::to_value(&clicked).unwrap();
+    assert_eq!(wire["match"]["backendNodeId"], 7);
+    assert_eq!(wire["engine"], "wayfern");
+    assert_eq!(wire["navigated"], false);
+
+    // The fallback engine: the locator is applied by a script and the click
+    // is a trusted mouse event at the element's centre, exactly what the
+    // selector tools have always done.
+    let (target, frames) = fake_browser(Fake::Cooperative).await;
+    let ctx = agent_context_for("151.0.7922.76", target);
+    assert_eq!(ctx.engine, Engine::Fallback);
+    let clicked = agent_click_locator(&ctx, &request).await.unwrap();
+    assert_eq!(clicked.engine, Engine::Fallback);
+    assert_eq!(clicked.matched.signature, "s7");
+    let sent = methods(&frames);
+    assert!(sent.iter().any(|m| m == "Runtime.evaluate"));
+    let mouse: Vec<serde_json::Value> = frames
+      .lock()
+      .unwrap()
+      .iter()
+      .filter(|f| f["method"] == "Input.dispatchMouseEvent")
+      .cloned()
+      .collect();
+    assert_eq!(mouse.len(), 3, "move, press, release: {sent:?}");
+    assert_eq!(mouse[0]["params"]["type"], "mouseMoved");
+    assert_eq!(mouse[1]["params"]["type"], "mousePressed");
+    assert_eq!(mouse[2]["params"]["type"], "mouseReleased");
+    assert_eq!(mouse[1]["params"]["x"], 140.0);
+    assert_eq!(mouse[1]["params"]["button"], "left");
+    assert!(
+      !sent
+        .iter()
+        .any(|m| m.starts_with("Vellum.") || m.starts_with("Wayfern.")),
+      "an older browser must never be sent the domains it lacks: {sent:?}"
+    );
+  }
+
+  /// What the fake saw, with each step of the typing function named by its
+  /// step and every other frame by its method.
+  fn typing_steps(frames: &crate::wayfern_cdp::test_support::Frames) -> Vec<String> {
+    frames
+      .lock()
+      .unwrap()
+      .iter()
+      .filter_map(|f| {
+        let method = f["method"].as_str()?;
+        match f["params"]["arguments"][0]["value"].as_str() {
+          Some(step) if method == "Runtime.callFunctionOn" => Some(step.to_string()),
+          _ => Some(method.to_string()),
+        }
+      })
+      .collect()
+  }
+
+  #[tokio::test]
+  async fn a_152_profile_types_through_inscribe_and_an_older_one_through_key_events() {
+    use crate::wayfern_cdp::test_support::{fake_browser, methods, Fake};
+
+    let request: AgentTypeRequest = serde_json::from_value(serde_json::json!({
+      "locator": { "role": "textbox", "name": "Email" },
+      "text": "hi",
+      "clear_first": true
+    }))
+    .unwrap();
+
+    let (target, frames) = fake_browser(Fake::Cooperative).await;
+    let ctx = agent_context_for("152.0.7977.64", target);
+    let typed = agent_type_locator(&ctx, &request, 300.0).await.unwrap();
+    assert!(typed.typed);
+    assert!(typed.verified, "the field read back holds the text");
+    assert_eq!(typed.engine, Engine::Wayfern);
+    assert_eq!(typed.characters, 2);
+    assert_eq!(typed.corrections, Some(1));
+    let steps: Vec<String> = typing_steps(&frames)
+      .into_iter()
+      .filter(|m| !m.contains('.') || m.starts_with("Vellum.") || m == "DOM.resolveNode")
+      .collect();
+    // The field is struck where a hand would land, the focus is confirmed in it
+    // before a key is sent, its text is selected so the keys replace it, and it
+    // is read back once the page has answered.
+    assert_eq!(
+      steps,
+      vec![
+        "DOM.resolveNode",
+        "field",
+        "point",
+        "Vellum.acquire",
+        "Vellum.glide",
+        "Vellum.strike",
+        "focus",
+        "prepare",
+        "Vellum.inscribe",
+        "Vellum.release",
+        "read",
+      ]
+    );
+    {
+      let sent_frames = frames.lock().unwrap();
+      let inscribe = sent_frames
+        .iter()
+        .find(|f| f["method"] == "Vellum.inscribe")
+        .unwrap();
+      assert_eq!(inscribe["params"]["text"], "hi");
+      assert_eq!(inscribe["params"]["typos"], true);
+      let glide = sent_frames
+        .iter()
+        .find(|f| f["method"] == "Vellum.glide")
+        .unwrap();
+      assert_eq!(glide["params"]["x"], 140.0);
+      let prepare = sent_frames
+        .iter()
+        .find(|f| f["params"]["arguments"][0]["value"] == "prepare")
+        .unwrap();
+      assert_eq!(prepare["params"]["arguments"][1]["value"], true);
+      assert_eq!(prepare["params"]["objectId"], "field-7");
+      assert!(
+        !prepare["params"]["functionDeclaration"]
+          .as_str()
+          .unwrap()
+          .contains(".value ="),
+        "a field is never emptied by assigning its value"
+      );
+    }
+
+    let (target, frames) = fake_browser(Fake::Cooperative).await;
+    let ctx = agent_context_for("151.0.7922.76", target);
+    let typed = agent_type_locator(&ctx, &request, 300.0).await.unwrap();
+    assert_eq!(typed.engine, Engine::Fallback);
+    assert_eq!(typed.characters, 2);
+    assert_eq!(typed.corrections, None);
+    assert!(typed.verified);
+    let sent = methods(&frames);
+    assert_eq!(sent.first().map(String::as_str), Some("Runtime.evaluate"));
+    assert!(
+      sent
+        .iter()
+        .filter(|m| *m == "Input.dispatchKeyEvent")
+        .count()
+        >= 4,
+      "two characters are at least two key downs and two key ups: {sent:?}"
+    );
+    assert!(!sent.iter().any(|m| m.starts_with("Vellum.")));
+    // Focused by the page before the keys, so no click was needed.
+    assert!(!sent.iter().any(|m| m == "Input.dispatchMouseEvent"));
+  }
+
+  #[tokio::test]
+  async fn typing_the_page_does_not_keep_is_refused_rather_than_reported() {
+    use crate::wayfern_cdp::test_support::{fake_browser, methods, Fake};
+
+    let request: AgentTypeRequest = serde_json::from_value(serde_json::json!({
+      "locator": { "role": "textbox", "name": "Email" },
+      "text": "hi@example.com"
+    }))
+    .unwrap();
+
+    // Typed, then reset by the page: the field reads back empty.
+    for version in ["152.0.7977.64", "151.0.7922.76"] {
+      let (target, _) = fake_browser(Fake::TypingLost).await;
+      let ctx = agent_context_for(version, target);
+      let refused = agent_type_locator(&ctx, &request, 300.0)
+        .await
+        .expect_err("a field that holds nothing did not take the text");
+      let error = refused.into_mcp();
+      assert_eq!(error.code, -32000);
+      let data = error.data.expect("the verdict travels in data");
+      assert_eq!(data["code"], "TYPE_NOT_APPLIED", "{version}");
+      assert_eq!(data["reason"], "value");
+      assert_eq!(data["value"], "");
+      assert!(error.message.contains("holds nothing"), "{}", error.message);
+    }
+
+    // A field that never takes the focus gets no keys at all: they would land
+    // in whatever has it. The older engine clicks it before it gives up.
+    let (target, frames) = fake_browser(Fake::FieldUnfocusable).await;
+    let ctx = agent_context_for("152.0.7977.64", target);
+    let refused = agent_type_locator(&ctx, &request, 300.0)
+      .await
+      .expect_err("no focus, no typing");
+    assert!(
+      matches!(
+        &refused,
+        AgentError::TypeNotApplied {
+          reason: "not_focused",
+          ..
+        }
+      ),
+      "{refused:?}"
+    );
+    let sent = methods(&frames);
+    assert!(sent.iter().any(|m| m == "Vellum.strike"));
+    assert!(!sent.iter().any(|m| m == "Vellum.inscribe"), "{sent:?}");
+    assert_eq!(
+      sent.last().map(String::as_str),
+      Some("Runtime.releaseObjectGroup")
+    );
+
+    let (target, frames) = fake_browser(Fake::FieldUnfocusable).await;
+    let ctx = agent_context_for("151.0.7922.76", target);
+    let refused = agent_type_locator(&ctx, &request, 300.0)
+      .await
+      .expect_err("no focus, no typing");
+    assert_eq!(refused.code(), "TYPE_NOT_APPLIED");
+    let sent = methods(&frames);
+    assert_eq!(
+      sent
+        .iter()
+        .filter(|m| *m == "Input.dispatchMouseEvent")
+        .count(),
+      3,
+      "move, press and release before giving up: {sent:?}"
+    );
+    assert!(
+      !sent.iter().any(|m| m == "Input.dispatchKeyEvent"),
+      "{sent:?}"
+    );
+  }
+
+  #[tokio::test]
+  async fn a_click_lands_where_the_page_aims_and_the_dom_decides_in_a_frame() {
+    use crate::wayfern_cdp::test_support::{fake_browser, methods, Fake};
+
+    let request: AgentClickRequest = serde_json::from_value(serde_json::json!({
+      "locator": { "role": "radio", "name": "Female" }
+    }))
+    .unwrap();
+    // The page names the point (a label, an unobstructed spot); no quads.
+    let (target, frames) = fake_browser(Fake::Cooperative).await;
+    let ctx = agent_context_for("154.0.8037.57", target);
+    agent_click_locator(&ctx, &request).await.unwrap();
+    let steps = typing_steps(&frames);
+    let point = steps.iter().position(|m| m == "point").unwrap();
+    let strike = steps.iter().position(|m| m == "Vellum.strike").unwrap();
+    assert!(point < strike, "{steps:?}");
+    assert!(
+      !steps.iter().any(|m| m == "DOM.getContentQuads"),
+      "{steps:?}"
+    );
+
+    // In a frame the page's own coordinates are not the viewport's.
+    let (target, frames) = fake_browser(Fake::FramedNode).await;
+    let ctx = agent_context_for("154.0.8037.57", target);
+    agent_click_locator(&ctx, &request).await.unwrap();
+    assert_eq!(node_ids_sent(&frames, "DOM.getContentQuads"), vec![7]);
+
+    // Nothing to click: refused as the caller's problem, not a broken reply.
+    let (target, frames) = fake_browser(Fake::HiddenControl).await;
+    let ctx = agent_context_for("154.0.8037.57", target);
+    let refused = agent_click_locator(&ctx, &request)
+      .await
+      .expect_err("no box, no click");
+    let error = refused.into_mcp();
+    assert_eq!(error.data.as_ref().unwrap()["code"], "BAD_REQUEST");
+    assert!(
+      error.message.contains("no visible box"),
+      "{}",
+      error.message
+    );
+    assert!(!methods(&frames).iter().any(|m| m == "Vellum.strike"));
+
+    let typing: AgentTypeRequest = serde_json::from_value(serde_json::json!({
+      "locator": { "role": "textbox", "name": "Email" },
+      "text": "hi"
+    }))
+    .unwrap();
+    let (target, frames) = fake_browser(Fake::HiddenControl).await;
+    let ctx = agent_context_for("154.0.8037.57", target);
+    let refused = agent_type_locator(&ctx, &typing, 300.0)
+      .await
+      .expect_err("no box, no typing");
+    assert_eq!(refused.code(), "BAD_REQUEST");
+    assert!(!methods(&frames).iter().any(|m| m.starts_with("Vellum.")));
+  }
+
+  #[test]
+  fn a_field_holds_the_typed_text_through_masks_and_appends() {
+    // Cleared first: the value is the text, whatever a mask added.
+    assert!(field_took("Jane", "", "Jane", true, false));
+    assert!(field_took("5551234567", "", "(555) 123-4567", true, false));
+    assert!(field_took(
+      "5551234567",
+      "",
+      "+1 (555) 123-4567",
+      true,
+      false
+    ));
+    assert!(field_took("ab12cd", "", "AB12CD", true, false));
+    assert!(field_took("New Y", "", "New York", true, false));
+    assert!(field_took(
+      "line one\nline two",
+      "",
+      "line one\r\nline two",
+      true,
+      false
+    ));
+    // Nothing kept, or only part of it.
+    assert!(!field_took("Jane", "", "", true, false));
+    assert!(!field_took("abcdef", "", "abc", true, false));
+    assert!(!field_took("Jane", "Old", "Old", true, false));
+    // A field that already held the text, emptied and typed again.
+    assert!(field_took("Jane", "Jane", "Jane", true, false));
+    // Appended: only what came after the old text counts.
+    assert!(field_took(" Doe", "Jane", "Jane Doe", false, false));
+    assert!(field_took("hello", "hello", "hellohello", false, false));
+    assert!(!field_took("hello", "hello", "hello", false, false));
+    assert!(!field_took("Doe", "Jane Doe", "Jane Doe", false, false));
+    // One box per character: the first box holds the start.
+    assert!(field_took("123456", "", "1", true, true));
+    assert!(!field_took("123456", "", "9", true, true));
+    assert!(!field_took("123456", "", "1", true, false));
+    // Nothing to tell a mask from: no letters or digits.
+    assert!(field_took("--", "", "", true, false));
+  }
+
+  #[test]
+  fn a_field_that_is_not_text_is_not_judged_by_its_value() {
+    let read = |kind: &str, field_type: &str, value: &str| FieldValue {
+      kind: kind.to_string(),
+      field_type: field_type.to_string(),
+      value: value.to_string(),
+      ..Default::default()
+    };
+    let empty = read("value", "text", "");
+    assert!(typing_verdict("Jane", &empty, &read("value", "text", "Jane"), true).unwrap());
+    assert!(typing_verdict("Jane", &empty, &read("editable", "div", "Jane\n"), true).unwrap());
+    // A date field shows its own format, and an element that is no field
+    // shows nothing to compare.
+    assert!(!typing_verdict(
+      "2026-10-19",
+      &empty,
+      &read("value", "date", "2026-10-19"),
+      true
+    )
+    .unwrap());
+    assert!(!typing_verdict("Jane", &empty, &read("none", "", ""), true).unwrap());
+    // A refusal names what the field holds, except a secret.
+    let refused = typing_verdict("Jane", &empty, &read("value", "text", "J"), true).unwrap_err();
+    assert!(
+      refused.message().contains("holds \"J\""),
+      "{}",
+      refused.message()
+    );
+    assert_eq!(refused.detail()["value"], "J");
+    let secret = FieldValue {
+      secret: true,
+      ..read("value", "password", "abc")
+    };
+    let refused = typing_verdict("hunter22", &empty, &secret, true).unwrap_err();
+    assert!(
+      refused.message().contains("3 characters"),
+      "{}",
+      refused.message()
+    );
+    assert!(!refused.message().contains("abc"));
+    assert!(refused.detail().get("value").is_none());
+  }
+
+  #[test]
+  fn the_typing_method_is_the_one_the_budgets_chose() {
+    let plan = [crate::human_typing::TypingEvent {
+      time: 0.1,
+      action: crate::human_typing::TypingAction::Char('a'),
+    }];
+    let timeout = Duration::from_secs(5);
+    assert!(matches!(
+      TypingMethod::chosen(Some(timeout), None, false),
+      TypingMethod::Vellum { typos: false, .. }
+    ));
+    assert!(matches!(
+      TypingMethod::chosen(None, Some(&plan), true),
+      TypingMethod::Keystrokes(events) if events.len() == 1
+    ));
+    assert!(matches!(
+      TypingMethod::chosen(None, None, true),
+      TypingMethod::Insert
+    ));
+  }
+
+  #[test]
+  fn an_ambiguous_match_settles_on_the_candidate_that_stands_out() {
+    let candidate = |name: &str, role: &str, width: f64| {
+      serde_json::json!({
+        "role": role, "name": name, "text": "", "signature": name,
+        "bounds": { "x": 0.0, "y": 0.0, "width": width, "height": 20.0 }
+      })
+    };
+    let locator =
+      |json: serde_json::Value| -> LocatorDescription { serde_json::from_value(json).unwrap() };
+
+    // The exact name over the longer one that contains it.
+    let first_names = [
+      candidate("First Name (optional)", "textField", 200.0),
+      candidate("First Name", "textField", 200.0),
+    ];
+    let contains = locator(serde_json::json!({ "nameContains": "First Name" }));
+    assert_eq!(preferred_candidate(&contains, 2, &first_names), Some(1));
+    let any_case = locator(serde_json::json!({ "nameContains": "first  name" }));
+    assert_eq!(preferred_candidate(&any_case, 2, &first_names), Some(1));
+    // The exact form already chose: both carry it, nothing stands out.
+    let exact = locator(serde_json::json!({ "name": "First Name" }));
+    let twins = [
+      candidate("First Name", "textField", 200.0),
+      candidate("First Name", "textField", 200.0),
+    ];
+    assert_eq!(preferred_candidate(&exact, 2, &twins), None);
+    // The visible one over the one with no box.
+    let shown = [
+      candidate("Save", "button", 0.0),
+      candidate("Save", "button", 80.0),
+    ];
+    assert_eq!(preferred_candidate(&exact, 2, &shown), Some(1));
+    // The control over the label, and the label's text, that name it.
+    let labelled = [
+      candidate("Female", "labelText", 60.0),
+      candidate("Female", "staticText", 50.0),
+      candidate("Female", "radioButton", 16.0),
+    ];
+    assert_eq!(preferred_candidate(&exact, 3, &labelled), Some(2));
+    // A label and the text inside it: the text, innermost.
+    let mut text = candidate("Female", "staticText", 40.0);
+    text["bounds"]["x"] = serde_json::json!(10.0);
+    text["bounds"]["height"] = serde_json::json!(16.0);
+    let nested = [candidate("Female", "labelText", 60.0), text];
+    assert_eq!(preferred_candidate(&exact, 2, &nested), Some(1));
+    // A list the resolver cut short is not ranked: the best may be missing.
+    assert_eq!(preferred_candidate(&contains, 12, &first_names), None);
+    assert_eq!(preferred_candidate(&contains, 1, &first_names[..1]), None);
+
+    // The refusal lists what matched, up to the caller's limit.
+    let many: Vec<serde_json::Value> = (0..30)
+      .map(|i| candidate(&format!("Row {i}"), "row", 10.0))
+      .collect();
+    let refused = ambiguity(30, many, Some(5));
+    let detail = refused.detail();
+    assert_eq!(detail["matchCount"], 30);
+    assert_eq!(detail["candidates"].as_array().map(Vec::len), Some(5));
+    assert!(refused
+      .message()
+      .starts_with("Ambiguous locator: 30 nodes match"));
+    assert!(refused.message().contains("Row 4") && !refused.message().contains("Row 5\""));
+  }
+  #[test]
+  fn a_candidate_from_the_browsers_ambiguity_reply_becomes_a_match() {
+    // The browser's reply lists candidates without a box.
+    let candidate = serde_json::json!({
+      "backendNodeId": 4,
+      "role": "textField",
+      "name": "First Name",
+      "text": "",
+      "signature": "8eb94bf54df1ce79",
+      "attributes": [{ "name": "id", "value": "first-name" }],
+    });
+    let matched = ambiguity_candidate(&candidate).expect("a candidate without bounds still reads");
+    assert_eq!(matched.name, "First Name");
+    assert_eq!(matched.backend_node_id, Some(4));
+  }
+
+  #[tokio::test]
+  async fn a_native_ambiguity_with_one_exact_name_is_not_refused() {
+    use crate::wayfern_cdp::test_support::{fake_browser, Fake};
+
+    let request: AgentResolveRequest = serde_json::from_value(serde_json::json!({
+      "locator": { "nameContains": "First Name" }
+    }))
+    .unwrap();
+    let (target, _) = fake_browser(Fake::AmbiguousByName).await;
+    let ctx = agent_context_for("154.0.8037.57", target);
+    let resolved = agent_resolve_locator(&ctx, &request).await.unwrap();
+    assert_eq!(resolved.matched.name, "First Name");
+    assert_eq!(resolved.matched.signature, "s8");
+    assert_eq!(resolved.engine, Engine::Wayfern);
+  }
+
+  #[tokio::test]
+  async fn a_native_ambiguity_with_no_boxes_is_ranked_by_the_page() {
+    use crate::wayfern_cdp::test_support::{fake_browser, methods, Fake};
+
+    let request: AgentResolveRequest = serde_json::from_value(serde_json::json!({
+      "locator": { "role": "link", "name": "Save" }
+    }))
+    .unwrap();
+    let (target, frames) = fake_browser(Fake::AmbiguousForTheBrowser).await;
+    let ctx = agent_context_for("155.0.8059.79", target);
+    let resolved = agent_resolve_locator(&ctx, &request).await.unwrap();
+    assert_eq!(resolved.engine, Engine::Fallback);
+    assert_eq!(resolved.backend_node_id, Some(353));
+    let sent = methods(&frames);
+    let native = sent
+      .iter()
+      .position(|m| m == "Wayfern.resolveLocator")
+      .unwrap();
+    assert!(
+      sent[native..].iter().any(|m| m == "Runtime.evaluate"),
+      "{sent:?}"
+    );
+  }
+
+  #[tokio::test]
+  async fn the_152_only_tools_refuse_an_older_profile_before_touching_the_browser() {
+    use crate::wayfern_cdp::test_support::{fake_browser, methods, Fake};
+
+    let (target, frames) = fake_browser(Fake::Cooperative).await;
+    let ctx = agent_context_for("151.0.7922.76", target);
+
+    let extraction: ExtractionRequest = serde_json::from_value(serde_json::json!({
+      "container": { "role": "listitem" },
+      "field_map": [{ "key": "title", "locator": { "role": "link" }, "source": "text" }]
+    }))
+    .unwrap();
+    let refused = agent_extract(&ctx, &extraction)
+      .await
+      .expect_err("extraction has no fallback");
+    assert!(
+      matches!(&refused, AgentError::RequiresWayfern152 { version } if version == "151.0.7922.76")
+    );
+    let error = refused.into_mcp();
+    assert_eq!(error.code, -32000);
+    assert!(error.message.contains("Wayfern 152"));
+    assert_eq!(error.data.as_ref().unwrap()["code"], "WAYFERN_152_REQUIRED");
+
+    let refused = agent_pick_element(&ctx, 5_000)
+      .await
+      .expect_err("the picker has no fallback");
+    assert!(matches!(refused, AgentError::RequiresWayfern152 { .. }));
+
+    assert!(
+      methods(&frames).is_empty(),
+      "a refusal for the browser's version must not open a socket to it"
+    );
+
+    // And a request that cannot mean anything is refused on either engine,
+    // before the version is even consulted.
+    let malformed: ExtractionRequest = serde_json::from_value(serde_json::json!({
+      "container": { "role": "listitem" },
+      "field_map": [{ "key": "price", "locator": { "role": "cell" }, "source": "attribute" }]
+    }))
+    .unwrap();
+    let ctx = agent_context_for(
+      "152.0.7977.64",
+      CdpTarget::Local {
+        ws_url: "ws://127.0.0.1:1/never".to_string(),
+      },
+    );
+    let refused = agent_extract(&ctx, &malformed)
+      .await
+      .expect_err("no attribute named");
+    assert!(
+      matches!(refused, AgentError::InvalidArgument(_)),
+      "{refused:?}"
+    );
+    assert_eq!(refused.into_mcp().code, -32602);
+  }
+
+  #[tokio::test]
+  async fn an_ambiguous_locator_carries_its_candidates_in_the_error_data() {
+    use crate::wayfern_cdp::test_support::{fake_browser, Fake};
+
+    let request: AgentResolveRequest = serde_json::from_value(serde_json::json!({
+      "locator": { "role": "button", "name": "Save" },
+      "candidate_limit": 5
+    }))
+    .unwrap();
+
+    for version in ["152.0.7977.64", "151.0.7922.76"] {
+      let (target, _) = fake_browser(Fake::AmbiguousLocator).await;
+      let ctx = agent_context_for(version, target);
+      let refused = agent_resolve_locator(&ctx, &request)
+        .await
+        .expect_err("two matches must be refused on both engines");
+      let error = refused.into_mcp();
+      assert_eq!(error.code, -32000, "{version}");
+      assert!(
+        error
+          .message
+          .starts_with("Ambiguous locator: 2 nodes match"),
+        "{version}: {}",
+        error.message
+      );
+      let data = error.data.expect("the candidates travel in data");
+      assert_eq!(data["code"], "LOCATOR_AMBIGUOUS");
+      assert_eq!(data["matchCount"], 2);
+      assert_eq!(
+        data["candidates"].as_array().map(Vec::len),
+        Some(2),
+        "{version}"
+      );
+      assert_eq!(data["candidates"][0]["backendNodeId"], 7);
+    }
+
+    // A clean resolution on both engines carries the engine that answered.
+    for (version, engine) in [("152.0.7977.64", "wayfern"), ("151.0.7922.76", "fallback")] {
+      let (target, _) = fake_browser(Fake::Cooperative).await;
+      let ctx = agent_context_for(version, target);
+      let resolved = agent_resolve_locator(&ctx, &request).await.unwrap();
+      let wire = serde_json::to_value(&resolved).unwrap();
+      assert_eq!(wire["engine"], engine);
+      assert_eq!(wire["matchCount"], 1);
+      assert_eq!(wire["match"]["signature"], "s7");
+      assert_eq!(wire["locator"]["name"], "Save");
+    }
+
+    // An empty locator matches everything, which is never what was meant.
+    let empty: AgentResolveRequest =
+      serde_json::from_value(serde_json::json!({ "locator": {} })).unwrap();
+    let (target, frames) = fake_browser(Fake::Cooperative).await;
+    let ctx = agent_context_for("152.0.7977.64", target);
+    let refused = agent_resolve_locator(&ctx, &empty)
+      .await
+      .expect_err("empty");
+    assert!(matches!(refused, AgentError::InvalidArgument(_)));
+    assert!(crate::wayfern_cdp::test_support::methods(&frames).is_empty());
+  }
+
+  #[tokio::test]
+  async fn perception_keeps_the_browsers_shape_on_both_engines() {
+    use crate::wayfern_cdp::test_support::{fake_browser, methods, Fake};
+
+    let request = PerceptionRequest::default();
+    let (target, frames) = fake_browser(Fake::Cooperative).await;
+    let ctx = agent_context_for("152.0.7977.64", target);
+    let page = agent_perceive(&ctx, &request).await.unwrap();
+    assert_eq!(page.engine, Engine::Wayfern);
+    assert_eq!(page.nodes[0].name.as_deref(), Some("Save"));
+    assert_eq!(methods(&frames), vec!["Wayfern.capturePagePerception"]);
+
+    let (target, frames) = fake_browser(Fake::Cooperative).await;
+    let ctx = agent_context_for("151.0.7922.76", target);
+    let page = agent_perceive(&ctx, &request).await.unwrap();
+    assert_eq!(page.engine, Engine::Fallback);
+    assert!(page.snapshot_id.starts_with("fallback-"));
+    assert_eq!(page.nodes[0].name.as_deref(), Some("Save"));
+    assert_eq!(page.frames[0].frame_id, "f0");
+    assert!(page.cursor.is_none());
+    assert_eq!(methods(&frames), vec!["Runtime.evaluate"]);
+    let wire = serde_json::to_value(&page).unwrap();
+    assert_eq!(wire["engine"], "fallback");
+    assert_eq!(wire["nodes"][0]["inViewport"], true);
+    assert_eq!(wire["stats"]["returnedNodes"], 1);
+
+    // A cursor is a 152 feature: the fallback cannot continue anything.
+    let continuation: PerceptionRequest =
+      serde_json::from_value(serde_json::json!({ "cursor": "snap-1.2" })).unwrap();
+    let refused = agent_perceive(&ctx, &continuation)
+      .await
+      .expect_err("no cursors");
+    assert!(matches!(refused, AgentError::InvalidArgument(_)));
+  }
+
+  /// The `backendNodeId` every frame of `method` named.
+  fn node_ids_sent(frames: &crate::wayfern_cdp::test_support::Frames, method: &str) -> Vec<i64> {
+    frames
+      .lock()
+      .unwrap()
+      .iter()
+      .filter(|f| f["method"] == method)
+      .filter_map(|f| f["params"]["backendNodeId"].as_i64())
+      .collect()
+  }
+
+  #[tokio::test]
+  async fn a_renumbered_node_id_is_found_in_the_page_before_the_click() {
+    use crate::wayfern_cdp::test_support::{fake_browser, methods, Fake};
+
+    // Wayfern 152 to 155 answer the right match with the wrong node id. The
+    // click must land on the node the page finds, never on the one the id names.
+    let request: AgentClickRequest = serde_json::from_value(serde_json::json!({
+      "locator": { "role": "button", "name": "Save" }
+    }))
+    .unwrap();
+    // A sibling with the same markup and other text is not the match either.
+    let (target, frames) = fake_browser(Fake::RenumberedToSibling).await;
+    let ctx = agent_context_for("154.0.8037.57", target);
+    let clicked = agent_click_locator(&ctx, &request).await.unwrap();
+    assert_eq!(clicked.matched.backend_node_id, Some(353));
+    assert_eq!(node_ids_sent(&frames, "DOM.resolveNode"), vec![353]);
+
+    let (target, frames) = fake_browser(Fake::RenumberedNodeIds).await;
+    let ctx = agent_context_for("154.0.8037.57", target);
+    let clicked = agent_click_locator(&ctx, &request).await.unwrap();
+    assert_eq!(clicked.engine, Engine::Wayfern);
+    assert_eq!(clicked.matched.signature, "s7");
+    assert_eq!(clicked.matched.backend_node_id, Some(353));
+    assert_eq!(node_ids_sent(&frames, "DOM.resolveNode"), vec![353]);
+    {
+      let sent = frames.lock().unwrap();
+      let pin = sent
+        .iter()
+        .find(|f| f["method"] == "Runtime.evaluate")
+        .expect("the page is asked for the match");
+      assert_eq!(pin["params"]["returnByValue"], false);
+      let expression = pin["params"]["expression"].as_str().unwrap();
+      assert!(expression.contains("\"mode\":\"pin\""));
+      assert!(expression.contains("\"signature\":\"s7\""));
+    }
+    let sent = methods(&frames);
+    assert!(sent.iter().any(|m| m == "Runtime.releaseObjectGroup"));
+    assert!(sent.iter().any(|m| m == "Vellum.strike"));
+    assert!(!sent.iter().any(|m| m == "Input.dispatchMouseEvent"));
+
+    let resolve: AgentResolveRequest = serde_json::from_value(serde_json::json!({
+      "locator": { "role": "button", "name": "Save" }
+    }))
+    .unwrap();
+    let (target, _) = fake_browser(Fake::RenumberedNodeIds).await;
+    let ctx = agent_context_for("154.0.8037.57", target);
+    let resolved = agent_resolve_locator(&ctx, &resolve).await.unwrap();
+    let wire = serde_json::to_value(&resolved).unwrap();
+    assert_eq!(wire["backendNodeId"], 353);
+    assert_eq!(wire["match"]["backendNodeId"], 353);
+    assert_eq!(wire["engine"], "wayfern");
+  }
+
+  #[tokio::test]
+  async fn a_locator_the_browser_cannot_match_is_applied_in_the_page() {
+    use crate::wayfern_cdp::test_support::{fake_browser, methods, Fake};
+
+    // The browser's index never carries `id`, so this locator can only match
+    // in the page.
+    let resolve: AgentResolveRequest = serde_json::from_value(serde_json::json!({
+      "locator": { "attributes": [{ "name": "id", "value": "save" }] }
+    }))
+    .unwrap();
+    let (target, frames) = fake_browser(Fake::NativeNoMatch).await;
+    let ctx = agent_context_for("154.0.8037.57", target);
+    let resolved = agent_resolve_locator(&ctx, &resolve).await.unwrap();
+    let wire = serde_json::to_value(&resolved).unwrap();
+    assert_eq!(wire["engine"], "fallback");
+    assert_eq!(wire["backendNodeId"], 353);
+    assert_eq!(wire["match"]["signature"], "s7");
+    assert_eq!(wire["locator"]["attributes"][0]["name"], "id");
+    let sent = methods(&frames);
+    assert_eq!(
+      sent.first().map(String::as_str),
+      Some("Wayfern.resolveLocator")
+    );
+    assert!(sent.iter().any(|m| m == "Runtime.getProperties"));
+
+    let click: AgentClickRequest = serde_json::from_value(serde_json::json!({
+      "locator": { "attributes": [{ "name": "id", "value": "save" }] }
+    }))
+    .unwrap();
+    let (target, frames) = fake_browser(Fake::NativeNoMatch).await;
+    let ctx = agent_context_for("154.0.8037.57", target);
+    let clicked = agent_click_locator(&ctx, &click).await.unwrap();
+    assert_eq!(clicked.engine, Engine::Wayfern);
+    assert_eq!(node_ids_sent(&frames, "DOM.resolveNode"), vec![353]);
+
+    // Nothing in the page either: the refusal is the usual one.
+    let nowhere: AgentResolveRequest = serde_json::from_value(serde_json::json!({
+      "locator": { "role": "button", "name": "Nowhere" }
+    }))
+    .unwrap();
+    let (target, frames) = fake_browser(Fake::NativeNoMatch).await;
+    let ctx = agent_context_for("154.0.8037.57", target);
+    let refused = agent_resolve_locator(&ctx, &nowhere)
+      .await
+      .expect_err("nothing matches");
+    let error = refused.into_mcp();
+    assert_eq!(error.data.as_ref().unwrap()["code"], "LOCATOR_NO_MATCH");
+    assert!(error.message.contains("name=Nowhere"), "{}", error.message);
+    assert!(!methods(&frames).iter().any(|m| m == "DOM.describeNode"));
+  }
+
+  #[tokio::test]
+  async fn a_capture_that_used_its_budget_is_answered_from_the_page() {
+    use crate::wayfern_cdp::test_support::{fake_browser, methods, Fake};
+
+    let (target, frames) = fake_browser(Fake::SlowPerception).await;
+    let ctx = agent_context_for("154.0.8037.57", target);
+    let page = agent_perceive(&ctx, &PerceptionRequest::default())
+      .await
+      .unwrap();
+    assert_eq!(page.engine, Engine::Fallback);
+    assert_eq!(page.text, "Save");
+    assert_eq!(
+      methods(&frames),
+      vec!["Wayfern.capturePagePerception", "Runtime.evaluate"]
+    );
+
+    // A larger budget covers the same capture.
+    let generous: PerceptionRequest =
+      serde_json::from_value(serde_json::json!({ "budget_ms": 10_000 })).unwrap();
+    let (target, _) = fake_browser(Fake::SlowPerception).await;
+    let ctx = agent_context_for("154.0.8037.57", target);
+    let page = agent_perceive(&ctx, &generous).await.unwrap();
+    assert_eq!(page.engine, Engine::Wayfern);
+
+    // A continuation belongs to the browser's snapshot; the page has no cursor.
+    let continuation: PerceptionRequest =
+      serde_json::from_value(serde_json::json!({ "cursor": "snap-1.2" })).unwrap();
+    let (target, frames) = fake_browser(Fake::SlowPerception).await;
+    let ctx = agent_context_for("154.0.8037.57", target);
+    let page = agent_perceive(&ctx, &continuation).await.unwrap();
+    assert_eq!(page.engine, Engine::Wayfern);
+    assert_eq!(methods(&frames), vec!["Wayfern.capturePagePerception"]);
+  }
+
+  /// The `params` of every recorded call to `method`.
+  fn sent_params(
+    frames: &crate::wayfern_cdp::test_support::Frames,
+    method: &str,
+  ) -> Vec<serde_json::Value> {
+    frames
+      .lock()
+      .unwrap()
+      .iter()
+      .filter(|f| f["method"] == method)
+      .map(|f| f["params"].clone())
+      .collect()
+  }
+
+  #[tokio::test]
+  async fn a_capture_the_browser_cut_short_is_answered_from_the_page() {
+    use crate::wayfern_cdp::test_support::{fake_browser, methods, Fake};
+
+    let (target, frames) = fake_browser(Fake::CutPerception).await;
+    let ctx = agent_context_for("155.0.8059.79", target);
+    let page = agent_perceive(&ctx, &PerceptionRequest::default())
+      .await
+      .unwrap();
+    assert_eq!(page.engine, Engine::Fallback);
+    assert_eq!(
+      methods(&frames),
+      vec!["Wayfern.capturePagePerception", "Runtime.evaluate"]
+    );
+
+    // The caller's own ceiling cut it: the browser's answer stands, and says so.
+    let capped: PerceptionRequest =
+      serde_json::from_value(serde_json::json!({ "max_nodes": 50 })).unwrap();
+    let (target, frames) = fake_browser(Fake::CutPerception).await;
+    let ctx = agent_context_for("155.0.8059.79", target);
+    let page = agent_perceive(&ctx, &capped).await.unwrap();
+    assert_eq!(page.engine, Engine::Wayfern);
+    assert_eq!(page.stats.frames_truncated, 1);
+    assert_eq!(
+      sent_params(&frames, "Wayfern.capturePagePerception")[0]["maxNodes"],
+      50
+    );
+    let wire = serde_json::to_value(&page).unwrap();
+    assert_eq!(wire["stats"]["framesTruncated"], 1);
+  }
+
+  #[tokio::test]
+  async fn a_viewport_capture_bounds_the_nodes_it_returns() {
+    use crate::wayfern_cdp::test_support::{fake_browser, methods, Fake};
+
+    // The browser counts its ceiling in document order, before the viewport
+    // filter, so it is never given one: after a scroll it kept only the header.
+    let roomy: PerceptionRequest =
+      serde_json::from_value(serde_json::json!({ "viewport_only": true, "max_nodes": 3 })).unwrap();
+    let (target, frames) = fake_browser(Fake::CrowdedPerception).await;
+    let ctx = agent_context_for("152.0.7977.64", target);
+    let page = agent_perceive(&ctx, &roomy).await.unwrap();
+    assert_eq!(page.engine, Engine::Wayfern);
+    assert_eq!(page.nodes.len(), 3);
+    let sent = sent_params(&frames, "Wayfern.capturePagePerception");
+    assert_eq!(sent[0]["viewportOnly"], true);
+    assert!(sent[0].get("maxNodes").is_none(), "{}", sent[0]);
+
+    // More nodes than the bound: the page answers, cut at the bound.
+    let tight: PerceptionRequest =
+      serde_json::from_value(serde_json::json!({ "viewport_only": true, "max_nodes": 2 })).unwrap();
+    let (target, frames) = fake_browser(Fake::CrowdedPerception).await;
+    let ctx = agent_context_for("152.0.7977.64", target);
+    let page = agent_perceive(&ctx, &tight).await.unwrap();
+    assert_eq!(page.engine, Engine::Fallback);
+    assert_eq!(
+      methods(&frames),
+      vec!["Wayfern.capturePagePerception", "Runtime.evaluate"]
+    );
+    let script = sent_params(&frames, "Runtime.evaluate")[0]["expression"]
+      .as_str()
+      .unwrap()
+      .to_string();
+    assert!(script.contains("\"maxNodes\":2"), "{script}");
+    assert!(script.contains("\"viewportOnly\":true"), "{script}");
+  }
+
+  #[test]
+  fn the_fallback_script_reads_text_through_shadow_roots_and_slots() {
+    let script = fallback_script(&serde_json::json!({ "mode": "perceive" }));
+    assert!(!script.contains("__FLAT_TEXT__"));
+    assert!(script.contains("assignedNodes()"));
+    // Bounds are the browser's: viewport coordinates, with no scroll added.
+    assert!(!script.contains("scrollY"), "{script}");
+    let page_text = rendered_text_js("document.body");
+    assert!(page_text.contains("assignedNodes()"));
+    assert!(page_text.ends_with("(document.body)"), "{page_text}");
+  }
+
+  #[test]
+  fn attribute_bags_compare_what_the_index_and_the_dom_both_carry() {
+    let index = attribute_bag([("href", "/a"), ("data-ved", "x")].into_iter());
+    let dom = attribute_bag(
+      [
+        ("ID", "link"),
+        ("data-ved", "x"),
+        ("class", "c"),
+        ("style", "color: red"),
+        ("HREF", "/a"),
+        ("value", "secret"),
+      ]
+      .into_iter(),
+    );
+    assert_eq!(index, dom);
+    assert_ne!(
+      index,
+      attribute_bag([("href", "/b"), ("data-ved", "x")].into_iter())
+    );
+    assert!(attribute_bag([("id", "x"), ("class", "y")].into_iter()).is_empty());
+  }
+
+  #[test]
+  fn the_picker_waits_less_over_mcp_than_the_relay_does() {
+    assert_eq!(MAX_PICK_TIMEOUT_MS, 300_000);
+    assert_eq!(MAX_BRIDGE_PICK_TIMEOUT_MS, 80_000);
+    // A wait that outlives the relay's 90 s call budget is a guaranteed failure.
+    const { assert!(MAX_BRIDGE_PICK_TIMEOUT_MS < 90_000) };
+    const { assert!(DEFAULT_PICK_TIMEOUT_MS <= MAX_BRIDGE_PICK_TIMEOUT_MS) };
+  }
+
+  #[test]
+  fn the_vellum_typing_budget_refuses_before_the_page_is_touched() {
+    // The browser paces the keys itself, so the refusal has to be estimated
+    // from the length; it must be conservative, and it must be the same
+    // envelope the planner answers with.
+    let budget = vellum_typing_budget("hello there", 300.0).expect("an ordinary field");
+    assert_eq!(budget, Duration::from_secs(300));
+
+    let refusal = vellum_typing_budget(&"a".repeat(2_000), 300.0).expect_err("too long");
+    assert_eq!(refusal.code, -32602);
+    let body: serde_json::Value = serde_json::from_str(&refusal.message).unwrap();
+    assert_eq!(body["code"], "TYPING_TOO_LONG");
+    assert_eq!(body["params"]["limit"], "300");
+
+    // Over the bridge the same text is refused sooner.
+    assert!(vellum_typing_budget(&"a".repeat(400), 300.0).is_ok());
+    assert!(vellum_typing_budget(&"a".repeat(400), 80.0).is_err());
+
+    // And the length bound bites first, whatever the budget.
+    let huge = "a".repeat(MAX_TYPING_CHARS + 1);
+    assert!(vellum_typing_budget(&huge, f64::MAX).is_err());
+
+    // The refusal is the structured error both doors understand.
+    let agent: AgentError = refusal.into();
+    assert!(matches!(agent, AgentError::TypingTooLong { limit, .. } if limit == 300.0));
+  }
+
+  #[test]
+  fn the_typing_tools_plan_only_for_the_engine_that_needs_a_plan() {
+    // The source-scanning test above pins the order of the selector and index
+    // typing tools. What is pinned here is that the 152 branch is decided from
+    // the PROFILE'S version, read at the point of use, and that the Vellum
+    // budget is decided in the same place as the plan, before the page.
+    let production = include_str!("mcp_server.rs")
+      .split_once("\n#[cfg(test)]")
+      .map_or("", |(code, _)| code);
+    for handler in ["handle_type_text", "handle_type_by_index"] {
+      let rest = production
+        .split(&format!("async fn {handler}("))
+        .nth(1)
+        .unwrap_or_else(|| panic!("{handler} must exist"));
+      let body = &rest[..rest.find("\n  async fn ").unwrap_or(rest.len())];
+      let engine = body
+        .find("Engine::for_version(&profile.version)")
+        .unwrap_or_else(|| panic!("{handler} must read the engine off the profile"));
+      let budget = body
+        .find("vellum_typing_budget(")
+        .unwrap_or_else(|| panic!("{handler} must budget Vellum typing"));
+      assert!(
+        body.matches("MAX_BRIDGE_TYPING_SECONDS").count() >= 2,
+        "{handler} must budget both engines on the MCP budget"
+      );
+      let page = body.find("type_element(").unwrap();
+      assert!(
+        engine < budget && budget < page,
+        "{handler}: engine, budget, then the page"
+      );
+      // Vellum when budgeted, the plan when made, otherwise the instant path,
+      // which every engine keeps.
+      assert!(
+        body.contains("TypingMethod::chosen(inscribe_timeout, plan.as_deref(), typos)"),
+        "{handler} must type through the method its budgets chose"
+      );
+    }
+    for handler in ["handle_click_element", "handle_click_by_index"] {
+      let rest = production
+        .split(&format!("async fn {handler}("))
+        .nth(1)
+        .unwrap_or_else(|| panic!("{handler} must exist"));
+      let body = &rest[..rest.find("\n  async fn ").unwrap_or(rest.len())];
+      assert!(body.contains("ctx.engine.is_wayfern()"), "{handler}");
+      assert!(body.contains("vellum_click("), "{handler}");
+      assert!(
+        body.contains("el.click()"),
+        "{handler} must keep the pre-152 click"
+      );
+    }
+  }
+
+  #[tokio::test]
+  async fn every_agent_tool_is_advertised_gated_and_dispatchable() {
+    let server = McpServer::new();
+    let advertised: Vec<String> = server.get_tools().into_iter().map(|t| t.name).collect();
+    let production = include_str!("mcp_server.rs")
+      .split_once("\n#[cfg(test)]")
+      .map_or("", |(code, _)| code);
+    let dispatch = production
+      .split("async fn dispatch_tool_call(")
+      .nth(1)
+      .expect("dispatch must exist");
+    let dispatch = &dispatch[..dispatch.find("\n  async fn ").unwrap_or(dispatch.len())];
+
+    for tool in [
+      "perceive_page",
+      "resolve_locator",
+      "click_locator",
+      "type_locator",
+      "extract_structured",
+      "pick_element",
+      "select_option",
+      "file_upload",
+      "start_network_capture",
+      "list_network_requests",
+      "get_network_request",
+    ] {
+      assert!(
+        advertised.iter().any(|t| t == tool),
+        "{tool} is not advertised"
+      );
+      let arm = dispatch
+        .split(&format!("\"{tool}\" => {{"))
+        .nth(1)
+        .unwrap_or_else(|| panic!("{tool} is not dispatched"));
+      let arm = &arm[..arm.find("\n      }").unwrap_or(arm.len())];
+      assert!(
+        arm.contains("can_use_browser_automation"),
+        "{tool} must sit behind the browser-automation gate"
+      );
+      // Every one of them takes a profile id and nothing from this disk, so
+      // the bridge is allowed to call them.
+      assert!(!LOCAL_PATH_TOOLS.contains(&tool));
+      assert!(!SECRET_EXPORT_TOOLS.contains(&tool));
+    }
+
+    // And over the bridge they are answered, not refused as local-only. They
+    // fail here for want of a browser, never with the local-only code.
+    server.mark_engine_ready_for_tests();
+    let call = serde_json::json!({
+      "jsonrpc": "2.0",
+      "id": 1,
+      "method": "tools/call",
+      "params": { "name": "perceive_page", "arguments": { "profile_id": "00000000-0000-0000-0000-000000000000" } }
+    })
+    .to_string();
+    let McpOutcome::Body { body, .. } = server.handle_message(None, call.as_bytes()).await else {
+      panic!("expected an answer");
+    };
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+      !message.contains("TOOL_IS_LOCAL_ONLY"),
+      "the agent surface must be reachable over the bridge: {body}"
+    );
+  }
+
+  #[test]
+  fn aria_role_names_are_translated_to_the_browsers_tokens() {
+    // Wayfern indexes Blink's own role tokens, so `textbox` matches nothing
+    // there while `textField` does. An agent that has read ARIA writes the
+    // former; the translation is the client's job, and only for the tokens
+    // that differ in substance, since the browser already ignores case and
+    // separators.
+    let role = |name: &str| {
+      canonical_locator(&LocatorDescription {
+        role: Some(name.to_string()),
+        ..Default::default()
+      })
+      .role
+      .unwrap()
+    };
+    assert_eq!(role("textbox"), "textField");
+    assert_eq!(role("TextBox"), "textField");
+    assert_eq!(role("text-box"), "textField");
+    assert_eq!(role("radio"), "radioButton");
+    assert_eq!(role("img"), "image");
+    assert_eq!(role("text"), "staticText");
+    // What the browser already understands passes through untouched.
+    assert_eq!(role("textField"), "textField");
+    assert_eq!(role("text_field"), "text_field");
+    assert_eq!(role("button"), "button");
+    assert_eq!(role("listitem"), "listitem");
+    // And nothing else about the locator moves.
+    let full = LocatorDescription {
+      role: Some("textbox".into()),
+      name: Some("Email".into()),
+      attributes: Some(vec![crate::wayfern_cdp::LocatorAttribute {
+        name: "id".into(),
+        value: "email".into(),
+      }]),
+      ..Default::default()
+    };
+    let canonical = canonical_locator(&full);
+    assert_eq!(canonical.name.as_deref(), Some("Email"));
+    assert_eq!(canonical.attributes, full.attributes);
+    assert!(canonical_locator(&LocatorDescription::default()).is_empty());
+  }
+
+  #[tokio::test]
+  async fn an_agent_and_the_person_can_talk_through_the_bridge() {
+    let server = McpServer::new();
+    server.mark_engine_ready_for_tests();
+    let call = |session: Option<String>, body: serde_json::Value| {
+      let server = &server;
+      async move {
+        let bytes = body.to_string();
+        match server
+          .handle_message(session.as_deref(), bytes.as_bytes())
+          .await
+        {
+          McpOutcome::Body {
+            body,
+            new_session_id,
+          } => (body, new_session_id),
+          _ => panic!("expected an answer"),
+        }
+      }
+    };
+    let tool = |id: u64, name: &str, arguments: serde_json::Value| {
+      serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": { "name": name, "arguments": arguments }
+      })
+    };
+    let text = |body: &serde_json::Value, index: usize| -> serde_json::Value {
+      serde_json::from_str(
+        body["result"]["content"][index]["text"]
+          .as_str()
+          .unwrap_or("null"),
+      )
+      .unwrap_or(serde_json::Value::Null)
+    };
+
+    let (init, session) = call(
+      None,
+      serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": "2025-06-18", "clientInfo": { "name": "Claude Code", "version": "2.1.0" } }
+      }),
+    )
+    .await;
+    let session = session.expect("initialize opens a session");
+    assert!(init["result"]["instructions"]
+      .as_str()
+      .unwrap()
+      .contains("get_human_updates"));
+    let recorded = crate::agent_console::snapshot()
+      .await
+      .sessions
+      .into_iter()
+      .find(|s| s.session_id == session)
+      .expect("the console knows the session");
+    assert_eq!(recorded.client_name.as_deref(), Some("Claude Code"));
+
+    let (asked, _) = call(
+      Some(session.clone()),
+      tool(2, "ask_human", serde_json::json!({ "question": "Which account?", "choices": ["A", "B"], "wait_seconds": 0 })),
+    )
+    .await;
+    let pending = text(&asked, 0);
+    assert_eq!(pending["status"], "pending", "{asked}");
+    let request_id = pending["request_id"].as_u64().unwrap();
+    crate::agent_console::answer_agent_request(request_id, "B".to_string())
+      .await
+      .unwrap();
+    let (waited, _) = call(
+      Some(session.clone()),
+      tool(
+        3,
+        "wait_for_human",
+        serde_json::json!({ "request_id": request_id, "wait_seconds": 0 }),
+      ),
+    )
+    .await;
+    assert_eq!(text(&waited, 0)["answer"], "B");
+
+    crate::agent_console::send_agent_note(
+      "Skip profile 7".to_string(),
+      Some(session.clone()),
+      None,
+    )
+    .await
+    .unwrap();
+    let (progress, _) = call(
+      Some(session.clone()),
+      tool(
+        4,
+        "report_progress",
+        serde_json::json!({ "message": "Checking", "done": 1, "total": 3 }),
+      ),
+    )
+    .await;
+    let note = progress["result"]["content"][1]["text"]
+      .as_str()
+      .unwrap_or_default();
+    assert!(note.contains("Skip profile 7"), "{progress}");
+
+    let held = format!("held-{}", Uuid::new_v4());
+    let help = crate::agent_console::open_request(crate::agent_console::NewRequest {
+      session_id: Some(session.clone()),
+      kind: crate::agent_console::ThreadKind::Help,
+      text: "Sign in".to_string(),
+      profile_id: Some(held.clone()),
+      choices: Vec::new(),
+    })
+    .await;
+    let (refused, _) = call(
+      Some(session.clone()),
+      tool(
+        5,
+        "navigate",
+        serde_json::json!({ "profile_id": held, "url": "https://example.com" }),
+      ),
+    )
+    .await;
+    assert_eq!(
+      refused["error"]["data"]["code"], "PROFILE_HELD_BY_HUMAN",
+      "{refused}"
+    );
+    let (updates, _) = call(
+      Some(session.clone()),
+      tool(6, "get_human_updates", serde_json::json!({})),
+    )
+    .await;
+    assert!(text(&updates, 0)["held_profiles"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .any(|hold| hold["profile_id"] == held.as_str()));
+    crate::agent_console::dismiss_agent_request(help)
+      .await
+      .unwrap();
+  }
+
+  #[tokio::test]
+  async fn send_feedback_checks_its_arguments_and_shows_the_person_what_was_sent() {
+    let server = McpServer::new();
+    server.mark_engine_ready_for_tests();
+    let send = |session: &str, id: u64, arguments: serde_json::Value| {
+      let server = &server;
+      let session = session.to_string();
+      async move {
+        let body = serde_json::json!({
+          "jsonrpc": "2.0",
+          "id": id,
+          "method": "tools/call",
+          "params": { "name": "send_feedback", "arguments": arguments }
+        })
+        .to_string();
+        match server.handle_message(Some(&session), body.as_bytes()).await {
+          McpOutcome::Body { body, .. } => body,
+          _ => panic!("expected an answer"),
+        }
+      }
+    };
+
+    let init = serde_json::json!({
+      "jsonrpc": "2.0",
+      "id": 1,
+      "method": "initialize",
+      "params": { "protocolVersion": "2025-06-18", "clientInfo": { "name": "Feedback Agent", "version": "1.2" } }
+    })
+    .to_string();
+    let McpOutcome::Body {
+      body: init,
+      new_session_id: Some(session),
+    } = server.handle_message(None, init.as_bytes()).await
+    else {
+      panic!("initialize opens a session");
+    };
+    assert!(init["result"]["instructions"]
+      .as_str()
+      .unwrap()
+      .contains("send_feedback"));
+
+    for (id, arguments) in [
+      (2, serde_json::json!({})),
+      (3, serde_json::json!({ "message": "   " })),
+      (
+        4,
+        serde_json::json!({ "message": "ok", "kind": "complaint" }),
+      ),
+      (
+        5,
+        serde_json::json!({ "message": "x".repeat(crate::feedback::MAX_MESSAGE_CHARS + 1) }),
+      ),
+      (
+        6,
+        serde_json::json!({ "message": "ok", "profile_id": "not-a-uuid" }),
+      ),
+      (7, serde_json::json!({ "message": "ok", "profile_id": 7 })),
+    ] {
+      let refused = send(&session, id, arguments).await;
+      assert_eq!(
+        refused["error"]["data"]["code"], "INVALID_ARGUMENT",
+        "{refused}"
+      );
+    }
+    assert!(McpServer::is_passive_tool("send_feedback"));
+
+    let (client, calls) = crate::agent_console::feedback_context(Some(&session));
+    assert_eq!(client.as_deref(), Some("Feedback Agent 1.2"));
+    assert!(calls.iter().all(|call| call.get("arguments").is_none()));
+
+    crate::agent_console::feedback_sent(Some(&session), "bug", "navigate hangs", true);
+    let thread = crate::agent_console::snapshot().await.thread;
+    let item = thread
+      .iter()
+      .rev()
+      .find(|item| item.session_id.as_deref() == Some(session.as_str()))
+      .expect("the person sees the feedback");
+    assert_eq!(item.kind, crate::agent_console::ThreadKind::Feedback);
+    assert_eq!(item.text, "navigate hangs");
+    let feedback = item.feedback.as_ref().unwrap();
+    assert_eq!((feedback.kind.as_str(), feedback.logs), ("bug", true));
+  }
+
+  #[test]
+  fn upload_files_are_read_and_checked_before_the_page_is_touched() {
+    let files = upload_files(&serde_json::json!({
+      "files": [
+        { "name": "notes.txt", "text": "héllo" },
+        { "name": "../pic.png", "content_base64": "data:image/png;base64,AAEC\nAw==" },
+        { "name": "raw.bin", "content_base64": "_-8" },
+      ]
+    }))
+    .unwrap();
+    assert_eq!(files[0].name, "notes.txt");
+    assert_eq!(files[0].bytes, "héllo".as_bytes());
+    assert_eq!(files[1].name, "pic.png");
+    assert_eq!(files[1].bytes, vec![0, 1, 2, 3]);
+    assert_eq!(files[2].bytes, vec![0xff, 0xef]);
+
+    let refused =
+      |arguments: serde_json::Value| upload_files(&arguments).unwrap_err().into_mcp().message;
+    assert!(refused(serde_json::json!({})).contains("at least one file"));
+    assert!(refused(serde_json::json!({ "files": [] })).contains("at least one file"));
+    assert!(
+      refused(serde_json::json!({ "files": [{ "name": "a.txt" }] })).contains("exactly one of")
+    );
+    assert!(refused(
+      serde_json::json!({ "files": [{ "name": "a.txt", "text": "x", "content_base64": "eA==" }] })
+    )
+    .contains("exactly one of"));
+    assert!(
+      refused(serde_json::json!({ "files": [{ "name": "..", "text": "x" }] }))
+        .contains("not a usable file name")
+    );
+    assert!(refused(serde_json::json!({
+      "files": [{ "name": "a.txt", "text": "x" }, { "name": "A.TXT", "text": "y" }]
+    }))
+    .contains("Two files are named"));
+    assert!(refused(
+      serde_json::json!({ "files": [{ "name": "a.bin", "content_base64": "%%%" }] })
+    )
+    .contains("not base64"));
+    let many: Vec<serde_json::Value> = (0..=crate::agent_uploads::MAX_UPLOAD_FILES)
+      .map(|n| serde_json::json!({ "name": format!("{n}.txt"), "text": "x" }))
+      .collect();
+    assert!(refused(serde_json::json!({ "files": many })).contains("At most"));
+    let large = "x".repeat(crate::agent_uploads::MAX_UPLOAD_BYTES + 1);
+    assert!(
+      refused(serde_json::json!({ "files": [{ "name": "big.txt", "text": large }] }))
+        .contains("KB")
+    );
+  }
+
+  #[test]
+  fn a_select_refusal_tells_the_agent_what_to_do() {
+    let message = |answer: serde_json::Value| select_refusal(&answer).unwrap().into_mcp().message;
+    assert!(
+      message(serde_json::json!({ "error": "not_select", "tag": "div" }))
+        .contains("<div>, not a <select>")
+    );
+    let missing = message(serde_json::json!({
+      "error": "no_option",
+      "missing": ["Mars"],
+      "count": 2,
+      "options": [{ "value": "de", "label": "Germany", "disabled": false }],
+    }));
+    assert!(
+      missing.contains("Mars") && missing.contains("Germany"),
+      "{missing}"
+    );
+    assert!(message(serde_json::json!({ "error": "single" })).contains("takes one option"));
+    assert!(select_refusal(&serde_json::json!({ "selected": [], "changed": false })).is_none());
+  }
+
+  #[test]
+  fn a_form_tool_names_its_element_four_ways_and_reads_no_path() {
+    let server = McpServer::new();
+    for name in ["select_option", "file_upload"] {
+      let tool = server
+        .get_tools()
+        .into_iter()
+        .find(|tool| tool.name == name)
+        .unwrap();
+      let properties = tool.input_schema["properties"].as_object().unwrap();
+      for key in ["profile_id", "selector", "locator", "index", "element_id"] {
+        assert!(properties.contains_key(key), "{name} lacks {key}");
+      }
+      assert_eq!(tool.input_schema["required"][0], "profile_id");
+      assert!(!LOCAL_PATH_TOOLS.contains(&name));
+    }
+  }
+
+  #[tokio::test]
+  async fn a_form_tool_refuses_two_ways_of_naming_its_element() {
+    let server = McpServer::new();
+    let caller = McpCaller {
+      session: Some("s"),
+      toolsets: None,
+    };
+    for arguments in [
+      serde_json::json!({}),
+      serde_json::json!({ "selector": "#a", "index": 1 }),
+      serde_json::json!({ "locator": { "role": "button" }, "selector": "#a" }),
+    ] {
+      let error = server
+        .form_element_ref(caller, "p", &arguments)
+        .await
+        .err()
+        .unwrap();
+      assert!(error.message.contains("one way"), "{arguments}");
+    }
+    let named = server
+      .form_element_ref(
+        caller,
+        "p",
+        &serde_json::json!({ "selector": "select#country" }),
+      )
+      .await
+      .unwrap();
+    assert!(matches!(named, ElementRef::Selector(selector) if selector == "select#country"));
+    let located = server
+      .form_element_ref(
+        caller,
+        "p",
+        &serde_json::json!({ "locator": { "role": "textbox", "name": "Email" } }),
+      )
+      .await
+      .unwrap();
+    assert!(
+      matches!(located, ElementRef::Locator(locator) if locator.role.as_deref() == Some("textField"))
+    );
+  }
+
+  #[test]
+  fn network_reads_without_a_capture_say_how_to_start_one() {
+    let profile = serde_json::json!({ "profile_id": "no-capture-profile" });
+    let error = McpServer::handle_list_network_requests(&profile).unwrap_err();
+    assert_eq!(error.data.unwrap()["code"], "NETWORK_CAPTURE_NOT_RUNNING");
+    let error = McpServer::handle_get_network_request(&serde_json::json!({
+      "profile_id": "no-capture-profile",
+      "request_id": 1,
+    }))
+    .unwrap_err();
+    assert!(error.message.contains("start_network_capture"));
+    let error = McpServer::handle_list_network_requests(&serde_json::json!({
+      "profile_id": "no-capture-profile",
+      "limit": 0,
+    }))
+    .unwrap_err();
+    assert_eq!(error.code, -32602);
+    let stopped = McpServer::handle_stop_network_capture(&profile).unwrap();
+    assert_eq!(stopped["structuredContent"]["stopped"], false);
+  }
+
+  #[test]
+  fn a_create_setting_that_failed_is_reported_as_not_applied() {
+    let clean = created_profile_result("Shop", "p-1", &[]);
+    assert_eq!(
+      clean["content"][0]["text"],
+      "Profile 'Shop' created (id: p-1)"
+    );
+    assert_eq!(
+      clean["structuredContent"]["not_applied"],
+      serde_json::json!([])
+    );
+
+    let failed = created_profile_result(
+      "Shop",
+      "p-1",
+      &[
+        ("status_id", "PROFILE_STATUS_NOT_FOUND".to_string()),
+        ("tags", "disk full".to_string()),
+      ],
+    );
+    let text = failed["content"][0]["text"].as_str().unwrap();
+    assert!(text.starts_with("Profile 'Shop' created (id: p-1)"));
+    assert!(text.contains("Not applied: status_id (PROFILE_STATUS_NOT_FOUND); tags (disk full)"));
+    assert_eq!(
+      failed["structuredContent"]["not_applied"],
+      serde_json::json!(["status_id", "tags"])
+    );
   }
 }

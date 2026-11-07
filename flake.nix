@@ -7,19 +7,19 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, ... }:
-    flake-utils.lib.eachDefaultSystem (system:
+    # Not eachDefaultSystem: nixpkgs 26.11 dropped x86_64-darwin, and evaluating
+    # it there aborts `nix flake show --all-systems` for every system.
+    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ] (system:
       let
         pkgs = import nixpkgs {
           inherit system;
           config.allowUnfree = true;
         };
         lib = pkgs.lib;
+        isLinux = pkgs.stdenv.hostPlatform.isLinux;
 
-        nodejs =
-          if pkgs ? nodejs_23 then
-            pkgs.nodejs_23
-          else
-            pkgs.nodejs_22;
+        # The version in .node-version; 24 only where 26 is not packaged.
+        nodejs = pkgs.nodejs_26 or pkgs.nodejs_24;
 
         rustPackages = with pkgs; [
           cargo
@@ -29,7 +29,9 @@
           rustfmt
         ];
 
-        commonLibs = with pkgs; [
+        # The Linux GTK/WebKit stack. On macOS, Tauri uses the system WebKit
+        # through the Apple SDK that stdenv already provides.
+        commonLibs = lib.optionals isLinux (with pkgs; [
           webkitgtk_4_1
           libsoup_3
           glib
@@ -73,11 +75,11 @@
           gmp
           zlib
           stdenv.cc.cc.lib
-        ];
+        ]);
 
         runtimeLibPath = lib.makeLibraryPath commonLibs;
         nixLd = pkgs.stdenv.cc.bintools.dynamicLinker;
-        pkgConfigLibs = [
+        pkgConfigLibs = [ pkgs.openssl pkgs.zlib ] ++ lib.optionals isLinux [
           pkgs.at-spi2-atk
           pkgs.at-spi2-core
           pkgs.cairo
@@ -88,25 +90,30 @@
           pkgs.libayatana-appindicator
           pkgs.libsoup_3
           pkgs.libxkbcommon
-          pkgs.openssl
           pkgs.pango
           pkgs.harfbuzz
           pkgs.webkitgtk_4_1
         ];
-        pkgConfigPath = lib.makeSearchPath "lib/pkgconfig" (
-          pkgConfigLibs ++ map lib.getDev pkgConfigLibs
-        );
-        releaseVersion = "0.29.5";
+        # The .pc files these name in Requires have to resolve too: gdk-3.0
+        # requires zlib, and a list of direct dependencies alone left it out,
+        # so `nix run .#build` failed in gdk-sys. The propagated closure brings
+        # in everything the listed libraries themselves depend on.
+        pkgConfigClosure = lib.closePropagation (pkgConfigLibs ++ map lib.getDev pkgConfigLibs);
+        pkgConfigPath = lib.concatStringsSep ":" [
+          (lib.makeSearchPath "lib/pkgconfig" (pkgConfigClosure ++ map lib.getDev pkgConfigClosure))
+          (lib.makeSearchPath "share/pkgconfig" pkgConfigClosure)
+        ];
+        releaseVersion = "0.36.0";
         releaseAppImage =
           if system == "x86_64-linux" then
             pkgs.fetchurl {
-              url = "https://github.com/zhom/donutbrowser/releases/download/v0.29.5/Donut_0.29.5_amd64.AppImage";
-              hash = "sha256-/zOFGaHTk4S53DLZe2BXmILe/P1dlb9dT94hyvEqXcM=";
+              url = "https://github.com/donutbrowser/donutbrowser/releases/download/v0.36.0/Donut_0.36.0_amd64.AppImage";
+              hash = "sha256-hGi8rGAIryTIqLpj6QfuW0NQQ4D70pHZIciUmteEo6c=";
             }
           else if system == "aarch64-linux" then
             pkgs.fetchurl {
-              url = "https://github.com/zhom/donutbrowser/releases/download/v0.29.5/Donut_0.29.5_aarch64.AppImage";
-              hash = "sha256-w2xibn/GZq681vZDj9pYNOrwhnqxX0POhmBO8XMFb+c=";
+              url = "https://github.com/donutbrowser/donutbrowser/releases/download/v0.36.0/Donut_0.36.0_aarch64.AppImage";
+              hash = "sha256-8cktUQcv0QM+JgLFLY1oG4hpVkBE/Smu7k//wJBg6A4=";
             }
           else
             null;
@@ -185,6 +192,55 @@
               '';
             };
 
+        # tsrs, the type checker in package.json, installs a glibc build on
+        # Linux, which NixOS runs only through nix-ld. Its static musl build
+        # runs anywhere, so the shell and the apps point the npm launcher at
+        # it (TSRS_BINARY). When package.json moves to a tsrs version with no
+        # hash here, the launcher falls back to the binary in node_modules.
+        tsrsVersion = (builtins.fromJSON (builtins.readFile ./package.json)).devDependencies.tsrs;
+        tsrsHashes = {
+          "0.20.1-ts7.1.0-beta" = {
+            x86_64-linux = "sha512-DoqErlQkQioKYunFyl6nUXWR1kjerqoRV56dggx7qMKvauSZMGkjBQ2Za4tmnISIn4BiJBOyZa/SYc0wfnxDpA==";
+            aarch64-linux = "sha512-AEj++EKJ+ZlRLWdFtYopctph5klOpUtZ+ehiezsrgMr/GP118E0H+5ux1vg1FM20jbAipNxecPg/311MOzN/fw==";
+          };
+        };
+        tsrsHash = (tsrsHashes.${tsrsVersion} or { }).${system} or null;
+        tsrsMusl =
+          if tsrsHash != null then
+            let
+              npmArch = if system == "x86_64-linux" then "x64" else "arm64";
+            in
+            pkgs.stdenvNoCC.mkDerivation {
+              pname = "tsrs";
+              version = tsrsVersion;
+              src = pkgs.fetchurl {
+                url = "https://registry.npmjs.org/@tsrs/linux-${npmArch}-musl/-/linux-${npmArch}-musl-${tsrsVersion}.tgz";
+                hash = tsrsHash;
+              };
+              dontFixup = true;
+              # The binary reads the lib.*.d.ts files next to it.
+              installPhase = ''
+                runHook preInstall
+                mkdir -p "$out/lib/tsrs"
+                cp -r . "$out/lib/tsrs/"
+                runHook postInstall
+              '';
+            }
+          else
+            null;
+
+        linuxLibraryEnv = lib.optionalString isLinux ''
+          export NIX_LD="${nixLd}"
+          export NIX_LD_LIBRARY_PATH="${runtimeLibPath}:''${NIX_LD_LIBRARY_PATH:-}"
+          export LD_LIBRARY_PATH="${runtimeLibPath}:''${LD_LIBRARY_PATH:-}"
+          export LIBRARY_PATH="${runtimeLibPath}:''${LIBRARY_PATH:-}"
+          export XDG_DATA_DIRS="${pkgs.gsettings-desktop-schemas}/share:${pkgs.gtk3}/share:''${XDG_DATA_DIRS:-}"
+          ${lib.optionalString (tsrsMusl != null) ''export TSRS_BINARY="${tsrsMusl}/lib/tsrs/tsrs"''}
+        '';
+        pkgConfigModules =
+          (lib.optionals isLinux [ "gdk-3.0" "webkit2gtk-4.1" "javascriptcoregtk-4.1" "libsoup-3.0" "ayatana-appindicator3-0.1" ])
+          ++ [ "openssl" ];
+
         mkApp = name: text:
           let
             app = pkgs.writeShellApplication {
@@ -197,7 +253,7 @@
                 gnugrep
                 gnused
                 curl
-                gcc
+                stdenv.cc
                 pkg-config
                 openssl
                 cargo
@@ -210,10 +266,7 @@
               ];
               text = ''
                 export NODE_ENV=development
-                export NIX_LD="${nixLd}"
-                export NIX_LD_LIBRARY_PATH="${runtimeLibPath}:''${NIX_LD_LIBRARY_PATH:-}"
-                export LD_LIBRARY_PATH="${runtimeLibPath}:''${LD_LIBRARY_PATH:-}"
-                export LIBRARY_PATH="${runtimeLibPath}:''${LIBRARY_PATH:-}"
+                ${linuxLibraryEnv}
                 export PKG_CONFIG_PATH="${pkgConfigPath}:''${PKG_CONFIG_PATH:-}"
                 export RUST_SRC_PATH="${pkgs.rustPlatform.rustLibSrc}"
                 ${text}
@@ -250,13 +303,9 @@
 
           shellHook = ''
             export NODE_ENV=development
-            export NIX_LD="${nixLd}"
-            export NIX_LD_LIBRARY_PATH="${runtimeLibPath}:''${NIX_LD_LIBRARY_PATH:-}"
-            export LD_LIBRARY_PATH="${runtimeLibPath}:''${LD_LIBRARY_PATH:-}"
-            export LIBRARY_PATH="${runtimeLibPath}:''${LIBRARY_PATH:-}"
+            ${linuxLibraryEnv}
             export PKG_CONFIG_PATH="${pkgConfigPath}:''${PKG_CONFIG_PATH:-}"
             export RUST_SRC_PATH="${pkgs.rustPlatform.rustLibSrc}"
-            export XDG_DATA_DIRS="${pkgs.gsettings-desktop-schemas}/share:${pkgs.gtk3}/share:''${XDG_DATA_DIRS:-}"
 
             echo "Donut Browser dev shell ready."
             echo "Quick start:"
@@ -276,6 +325,14 @@
           echo "Rust: $(rustc --version)"
           echo "Cargo: $(cargo --version)"
           echo "Tauri CLI: $(cargo-tauri --version)"
+          # Every library the Rust build links through pkg-config, with the
+          # packages their .pc files require. A gap fails here in seconds
+          # instead of minutes into `nix run .#build`.
+          modules=(${lib.escapeShellArgs pkgConfigModules})
+          for module in "''${modules[@]}"; do
+            pkg-config --cflags --libs "$module" > /dev/null
+            echo "$module: $(pkg-config --modversion "$module")"
+          done
         '';
 
         apps.deps = mkApp "donut-deps" ''
@@ -301,7 +358,10 @@
 
         apps.build = mkApp "donut-build" ''
           set -euo pipefail
-          pnpm build
+          # mkApp exports NODE_ENV=development for the dev apps, and next build
+          # fails to prerender under it ("Cannot read properties of null
+          # (reading 'useContext')" on /_global-error).
+          NODE_ENV=production pnpm build
           (cd src-tauri && cargo build)
         '';
 

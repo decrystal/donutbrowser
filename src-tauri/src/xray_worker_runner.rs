@@ -2,7 +2,7 @@ use crate::proxy_runner::find_sidecar_executable;
 #[cfg(unix)]
 use crate::proxy_storage::is_process_running;
 use crate::proxy_storage::{process_identity_matches, resolve_process_start_time};
-use crate::xray::{build_client_config_json, parse_vless_uri, XrayClientRuntime};
+use crate::xray::{build_client_config_json, parse_share_link, XrayClientRuntime};
 use crate::xray_worker_storage::{
   create_xray_worker_log, delete_xray_worker_config, generate_xray_worker_id,
   get_xray_worker_config, get_xray_worker_config_from_path, list_xray_worker_configs,
@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+// A first start on Windows can wait for antivirus to scan xray.exe.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const READY_CHECK_TIMEOUT: Duration = Duration::from_millis(750);
 static XRAY_BINARY_VERIFIED: AtomicBool = AtomicBool::new(false);
@@ -138,10 +139,18 @@ async fn wait_until_ready(
     if let Some(config) = get_xray_worker_config(id) {
       if !process_identity_matches(supervisor_pid, Some(supervisor_start_time)) {
         let log = std::fs::read_to_string(xray_worker_log_path(id)).unwrap_or_default();
-        if !log.is_empty() {
-          log::error!("Xray worker {id} exited during startup: {log}");
-        }
-        return Err(structured_error("XRAY_START_FAILED"));
+        let tail: String = {
+          let chars: Vec<char> = log.trim().chars().collect();
+          chars[chars.len().saturating_sub(1500)..].iter().collect()
+        };
+        log::warn!(
+          "Xray worker exited during startup id={id} pid={supervisor_pid} log=\"{}\"",
+          crate::log_redaction::Plain(&crate::log_redaction::text(&tail))
+        );
+        return Err(structured_error_with_detail(
+          "XRAY_START_FAILED",
+          "the worker exited during startup",
+        ));
       }
       if config.pid == Some(supervisor_pid)
         && config.pid_start_time == Some(supervisor_start_time)
@@ -153,7 +162,13 @@ async fn wait_until_ready(
     }
 
     if tokio::time::Instant::now() >= deadline {
-      return Err(structured_error("XRAY_START_FAILED"));
+      return Err(structured_error_with_detail(
+        "XRAY_START_FAILED",
+        format!(
+          "the worker was not ready after {} s",
+          STARTUP_TIMEOUT.as_secs()
+        ),
+      ));
     }
     tokio::time::sleep(POLL_INTERVAL).await;
   }
@@ -163,12 +178,23 @@ pub async fn start_xray_worker(
   profile_id: Option<&str>,
   vless_uri: &str,
 ) -> Result<XrayWorkerConfig, Box<dyn std::error::Error>> {
+  start_xray_worker_for_owner(profile_id, vless_uri, std::process::id()).await
+}
+
+/// Starts a worker that lives until `owner_pid` exits, or until it is stopped
+/// or re-bound with `set_browser_pid`. The `donut-proxy xray start` command
+/// passes the pid of the process that called it, because its own pid is gone
+/// the moment it prints the result.
+pub async fn start_xray_worker_for_owner(
+  profile_id: Option<&str>,
+  vless_uri: &str,
+  owner_pid: u32,
+) -> Result<XrayWorkerConfig, Box<dyn std::error::Error>> {
   let _start_guard = XRAY_START_LOCK.lock().await;
-  parse_vless_uri(vless_uri)
+  parse_share_link(vless_uri)
     .map_err(|error| -> Box<dyn std::error::Error> { crate::vless_config_error(&error).into() })?;
   crate::proxy_runner::ensure_sidecar_version().await?;
   ensure_xray_binary()?;
-  let owner_pid = std::process::id();
   let owner_start_time =
     resolve_process_start_time(owner_pid).ok_or_else(|| structured_error("XRAY_START_FAILED"))?;
 
@@ -212,14 +238,10 @@ pub async fn start_xray_worker(
 
   let mut last_error = None;
   for attempt in 1..=3 {
-    match spawn_xray_worker(profile_id, vless_uri).await {
+    match spawn_xray_worker(profile_id, vless_uri, owner_pid, owner_start_time).await {
       Ok(worker) => return Ok(worker),
       Err(error) => {
-        if attempt < 3 {
-          log::warn!(
-            "Xray worker startup attempt {attempt} failed; retrying with a new local port"
-          );
-        }
+        log::debug!("Xray worker start attempt failed attempt={attempt}/3 err=\"{error}\"");
         last_error = Some(error.to_string());
       }
     }
@@ -234,7 +256,10 @@ pub async fn start_xray_worker(
 async fn spawn_xray_worker(
   profile_id: Option<&str>,
   vless_uri: &str,
+  owner_pid: u32,
+  owner_start_time: u64,
 ) -> Result<XrayWorkerConfig, Box<dyn std::error::Error>> {
+  let started = std::time::Instant::now();
   let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
     .map_err(|error| structured_error_with_detail("XRAY_START_FAILED", error))?;
   let local_port = listener
@@ -260,11 +285,8 @@ async fn spawn_xray_worker(
     username,
     password,
   );
-  let owner_pid = std::process::id();
   config.browser_pid = Some(owner_pid);
-  config.browser_pid_start_time = Some(
-    resolve_process_start_time(owner_pid).ok_or_else(|| structured_error("XRAY_START_FAILED"))?,
-  );
+  config.browser_pid_start_time = Some(owner_start_time);
   save_xray_worker_config(&config)
     .map_err(|error| structured_error_with_detail("XRAY_START_FAILED", error))?;
 
@@ -322,6 +344,15 @@ async fn spawn_xray_worker(
 
   let ready = wait_until_ready(&id, supervisor_pid, supervisor_start_time).await?;
   pending.armed = false;
+  log::info!(
+    "Xray worker started id={id} pid={supervisor_pid} xray_pid={} port={local_port} profile={} elapsed_ms={}",
+    ready
+      .xray_pid
+      .map(|pid| pid.to_string())
+      .unwrap_or_else(|| "none".to_string()),
+    profile_id.unwrap_or("none"),
+    started.elapsed().as_millis()
+  );
   Ok(ready)
 }
 
@@ -330,7 +361,9 @@ pub fn set_browser_pid(worker_id: &str, browser_pid: u32) -> bool {
     return false;
   }
   let Some(browser_pid_start_time) = resolve_process_start_time(browser_pid) else {
-    log::warn!("Failed to resolve browser PID {browser_pid} identity for Xray worker {worker_id}");
+    log::warn!(
+      "Browser start time unknown, Xray worker owner not recorded xray_worker={worker_id} browser_pid={browser_pid}"
+    );
     return false;
   };
   let Some(mut config) = get_xray_worker_config(worker_id) else {
@@ -348,7 +381,7 @@ fn persist_browser_identity(
   config.browser_pid_start_time = Some(browser_pid_start_time);
   if !crate::xray_worker_storage::update_xray_worker_config(config) {
     log::warn!(
-      "Failed to persist browser PID {browser_pid} on Xray worker {}",
+      "Xray worker owner write failed xray_worker={} browser_pid={browser_pid}",
       config.id
     );
     return false;
@@ -382,6 +415,10 @@ impl Drop for PendingSupervisor {
       if let Some(pid) = self.pid {
         if self.pid_start_time.is_none() || process_identity_matches(pid, self.pid_start_time) {
           terminate_supervisor_unchecked(pid);
+          log::info!(
+            "Xray worker stopped id={} pid={pid} reason=start_failed",
+            self.id
+          );
         }
       }
       if let Some((pid, start_time)) = xray_process {
@@ -447,19 +484,35 @@ pub fn stop_xray_worker_now(id: &str) -> Result<bool, Box<dyn std::error::Error>
   };
 
   delete_xray_worker_config(id);
-  if let Some(pid) = config
+  let supervisor = config
     .pid
-    .filter(|pid| process_identity_matches(*pid, config.pid_start_time))
-  {
+    .filter(|pid| process_identity_matches(*pid, config.pid_start_time));
+  if let Some(pid) = supervisor {
     terminate_supervisor_unchecked(pid);
   }
-  if let Some(pid) = config
+  let xray = config
     .xray_pid
-    .filter(|pid| process_identity_matches(*pid, config.xray_pid_start_time))
-  {
+    .filter(|pid| process_identity_matches(*pid, config.xray_pid_start_time));
+  if let Some(pid) = xray {
     terminate_process_unchecked(pid);
   }
   delete_xray_worker_config(id);
+  let pid_text = |pid: Option<u32>| {
+    pid
+      .map(|pid| pid.to_string())
+      .unwrap_or_else(|| "none".to_string())
+  };
+  log::info!(
+    "Xray worker stopped id={id} pid={} xray_pid={} profile={} how={}",
+    pid_text(config.pid),
+    pid_text(config.xray_pid),
+    config.profile_id.as_deref().unwrap_or("none"),
+    if supervisor.is_some() || xray.is_some() {
+      "terminated"
+    } else {
+      "already_gone"
+    }
+  );
   Ok(true)
 }
 
@@ -520,7 +573,7 @@ pub async fn run_xray_worker(config_path: &Path) -> Result<(), Box<dyn std::erro
   );
   save_xray_worker_config_to_path(&config, config_path)
     .map_err(|error| structured_error_with_detail("XRAY_START_FAILED", error))?;
-  let parsed = parse_vless_uri(&config.vless_uri)
+  let parsed = parse_share_link(&config.vless_uri)
     .map_err(|error| -> Box<dyn std::error::Error> { crate::vless_config_error(&error).into() })?;
   let runtime = XrayClientRuntime {
     listen_port: config.local_port,
@@ -647,164 +700,5 @@ pub async fn run_xray_worker(config_path: &Path) -> Result<(), Box<dyn std::erro
 }
 
 #[cfg(test)]
-mod tests {
-  use super::*;
-  use crate::proxy_storage::process_start_time;
-
-  #[cfg(unix)]
-  fn short_lived_child() -> Child {
-    Command::new("sh")
-      .args(["-c", "sleep 0.2"])
-      .spawn()
-      .unwrap()
-  }
-
-  #[cfg(windows)]
-  fn short_lived_child() -> Child {
-    Command::new("cmd")
-      .args(["/C", "ping -n 2 127.0.0.1 >NUL"])
-      .spawn()
-      .unwrap()
-  }
-
-  #[test]
-  fn supervisor_child_is_reaped_after_exit() {
-    let child = short_lived_child();
-    let pid = child.id();
-    let start_time = resolve_process_start_time(pid).unwrap();
-    spawn_supervisor_reaper(child).join().unwrap();
-    assert!(!process_identity_matches(pid, Some(start_time)));
-  }
-
-  fn readiness_config(port: u16) -> XrayWorkerConfig {
-    let mut config = XrayWorkerConfig::new(
-      "readiness".to_string(),
-      None,
-      "vless://unused".to_string(),
-      port,
-      "local-user".to_string(),
-      "local-password".to_string(),
-    );
-    let pid = std::process::id();
-    config.xray_pid = Some(pid);
-    config.xray_pid_start_time = process_start_time(pid);
-    config
-  }
-
-  #[test]
-  fn parses_macos_major_versions_for_sidecar_compatibility() {
-    assert_eq!(parse_macos_major_version("11.7.10\n"), Some(11));
-    assert_eq!(parse_macos_major_version("12.0"), Some(12));
-    assert_eq!(parse_macos_major_version("15.5.1"), Some(15));
-    assert_eq!(parse_macos_major_version("unknown"), None);
-  }
-
-  #[tokio::test]
-  async fn readiness_requires_the_expected_authenticated_socks_endpoint() {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-      .await
-      .unwrap();
-    let config = readiness_config(listener.local_addr().unwrap().port());
-    let expected_username = config.username.clone();
-    let expected_password = config.password.clone();
-    let server = tokio::spawn(async move {
-      let (mut stream, _) = listener.accept().await.unwrap();
-      let mut greeting = [0_u8; 3];
-      stream.read_exact(&mut greeting).await.unwrap();
-      assert_eq!(greeting, [5, 1, 2]);
-      stream.write_all(&[5, 2]).await.unwrap();
-
-      let mut header = [0_u8; 2];
-      stream.read_exact(&mut header).await.unwrap();
-      assert_eq!(header[0], 1);
-      let mut username = vec![0_u8; header[1] as usize];
-      stream.read_exact(&mut username).await.unwrap();
-      let password_len = stream.read_u8().await.unwrap();
-      let mut password = vec![0_u8; password_len as usize];
-      stream.read_exact(&mut password).await.unwrap();
-      assert_eq!(username, expected_username.as_bytes());
-      assert_eq!(password, expected_password.as_bytes());
-      stream.write_all(&[1, 0]).await.unwrap();
-    });
-
-    assert!(authenticated_socks_ready(&config).await);
-    server.await.unwrap();
-  }
-
-  #[tokio::test]
-  async fn readiness_rejects_an_unrelated_listener_on_the_reserved_port() {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-      .await
-      .unwrap();
-    let config = readiness_config(listener.local_addr().unwrap().port());
-    let server = tokio::spawn(async move {
-      let (mut stream, _) = listener.accept().await.unwrap();
-      let mut greeting = [0_u8; 3];
-      stream.read_exact(&mut greeting).await.unwrap();
-      stream.write_all(&[5, 0]).await.unwrap();
-    });
-
-    assert!(!authenticated_socks_ready(&config).await);
-    server.await.unwrap();
-  }
-
-  #[test]
-  fn browser_identity_is_persisted_on_the_exact_worker() {
-    let temp = tempfile::tempdir().unwrap();
-    let _cache_guard = crate::app_dirs::set_test_cache_dir(temp.path().to_path_buf());
-    let id = format!("xray-browser-owner-{}", uuid::Uuid::new_v4());
-    let config = XrayWorkerConfig::new(
-      id.clone(),
-      Some("profile".to_string()),
-      "vless://unused".to_string(),
-      1080,
-      "local-user".to_string(),
-      "local-password".to_string(),
-    );
-    save_xray_worker_config(&config).unwrap();
-
-    let browser_pid = std::process::id();
-    assert!(set_browser_pid(&id, browser_pid));
-    let saved = get_xray_worker_config(&id).unwrap();
-    assert_eq!(saved.browser_pid, Some(browser_pid));
-    assert_eq!(
-      saved.browser_pid_start_time,
-      process_start_time(browser_pid)
-    );
-
-    assert!(delete_xray_worker_config(&id));
-  }
-
-  #[test]
-  fn reusable_worker_requires_and_persists_the_exact_live_owner() {
-    let temp = tempfile::tempdir().unwrap();
-    let _cache_guard = crate::app_dirs::set_test_cache_dir(temp.path().to_path_buf());
-    let id = format!("xray-worker-lease-{}", uuid::Uuid::new_v4());
-    let mut config = XrayWorkerConfig::new(
-      id.clone(),
-      Some("profile".to_string()),
-      "vless://unused".to_string(),
-      1080,
-      "local-user".to_string(),
-      "local-password".to_string(),
-    );
-    config.browser_pid = Some(u32::MAX);
-    config.browser_pid_start_time = Some(1);
-    save_xray_worker_config(&config).unwrap();
-
-    let owner_pid = std::process::id();
-    let owner_start_time = process_start_time(owner_pid).unwrap();
-    assert!(!worker_is_leased_to(&config, owner_pid, owner_start_time));
-    assert!(persist_browser_identity(
-      &mut config,
-      owner_pid,
-      owner_start_time
-    ));
-    assert!(worker_is_leased_to(&config, owner_pid, owner_start_time));
-    let saved = get_xray_worker_config(&id).unwrap();
-    assert_eq!(saved.browser_pid, Some(owner_pid));
-    assert_eq!(saved.browser_pid_start_time, Some(owner_start_time));
-
-    assert!(delete_xray_worker_config(&id));
-  }
-}
+#[path = "xray_worker_runner_tests.rs"]
+mod tests;

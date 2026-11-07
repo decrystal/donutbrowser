@@ -17,6 +17,7 @@ across multiple operating systems and installation methods.
   - MSI: Silent installation using msiexec
   - EXE: Silent installation with multiple fallback flags (NSIS, Inno Setup)
   - ZIP: Binary replacement
+  - Portable ZIP: files swapped at restart, data kept (`portable_update.rs`)
 - **Architecture**: Supports both x64 and x86_64
 
 ### Linux
@@ -38,7 +39,7 @@ The updater automatically detects how the application was installed:
 
 ## Update Process
 
-1. **Check**: Fetches releases from GitHub API
+1. **Check**: Fetches releases from GitHub and from Donut's copy on donutbrowser.com, every hour
 2. **Filter**: Filters releases based on build type (stable vs nightly)
 3. **Compare**: Compares versions using semantic versioning or commit hashes
 4. **Download**: Downloads appropriate asset with progress tracking
@@ -65,7 +66,6 @@ Includes comprehensive unit tests for:
 */
 
 use crate::events;
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -96,12 +96,38 @@ pub struct AppReleaseAsset {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AppRelease {
   pub tag_name: String,
+  /// GitHub sends `null` for a release with no name, notes or date yet.
+  #[serde(default, deserialize_with = "null_as_empty")]
   pub name: String,
+  #[serde(default, deserialize_with = "null_as_empty")]
   pub body: String,
+  #[serde(default, deserialize_with = "null_as_empty")]
   pub published_at: String,
+  #[serde(default)]
   pub prerelease: bool,
+  #[serde(default)]
   pub assets: Vec<AppReleaseAsset>,
 }
+
+fn null_as_empty<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+  Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// GitHub's API for this repository.
+const GITHUB_REPO_API: &str = "https://api.github.com/repos/donutbrowser/donutbrowser";
+/// Donut's copy of the newest stable and nightly releases, which the cloud
+/// reads from GitHub with a token. It still answers when GitHub refuses an
+/// address that many installs share (60 unauthenticated requests an hour).
+const DONUT_RELEASES_URL: &str = "https://api.donutbrowser.com/api/app-releases";
+/// One release list is small; a source slower than this is skipped.
+const SOURCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long after a check the next one runs.
+const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// The next check after one that found the newest release still missing
+/// SHA256SUMS.txt, which the release workflow uploads minutes after the builds.
+const NOT_READY_RECHECK: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// The next check after one that reached no source.
+const FAILED_RECHECK: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AppUpdateInfo {
@@ -124,17 +150,35 @@ pub struct AppUpdateInfo {
   /// cross-checked in addition to SHA256SUMS.txt when present.
   #[serde(default)]
   pub asset_digest: Option<String>,
+  /// True when the app downloads and installs this update without asking.
+  /// False for a manual update and when the person turned automatic updates
+  /// off: the UI then offers the update and waits.
+  #[serde(default)]
+  pub auto_install: bool,
+}
+
+impl AppUpdateInfo {
+  /// What this install may do with the update. A copy replaced by hand only
+  /// hears about it; with automatic updates off, the person starts the
+  /// install.
+  fn with_install_policy(mut self, replaced_by_hand: bool, auto_updates_disabled: bool) -> Self {
+    if replaced_by_hand {
+      self.manual_update_required = true;
+    }
+    self.auto_install = !self.manual_update_required && !auto_updates_disabled;
+    self
+  }
 }
 
 pub struct AppAutoUpdater {
-  client: Client,
+  client: crate::app_proxy::SharedClient,
   extractor: &'static crate::extraction::Extractor,
 }
 
 impl AppAutoUpdater {
   fn new() -> Self {
     Self {
-      client: Client::new(),
+      client: crate::app_proxy::SharedClient::new(|builder| builder),
       extractor: crate::extraction::Extractor::instance(),
     }
   }
@@ -161,6 +205,41 @@ impl AppAutoUpdater {
     true
   }
 
+  /// How this copy was installed, for bug reports: `portable`, `flatpak`,
+  /// `snap`, `appimage`, `deb`, `rpm`, `manual`, `app` (macOS), `installer`
+  /// (Windows) or `unknown`.
+  pub fn install_kind() -> &'static str {
+    if crate::app_dirs::is_portable() {
+      return "portable";
+    }
+    #[cfg(target_os = "linux")]
+    {
+      match crate::app_dirs::linux_sandbox() {
+        Some(crate::app_dirs::LinuxSandbox::Flatpak) => "flatpak",
+        Some(crate::app_dirs::LinuxSandbox::Snap) => "snap",
+        None => match Self::instance().detect_linux_installation_method() {
+          LinuxInstallationMethod::AppImage => "appimage",
+          LinuxInstallationMethod::Deb => "deb",
+          LinuxInstallationMethod::Rpm => "rpm",
+          LinuxInstallationMethod::Manual => "manual",
+          LinuxInstallationMethod::Unknown => "unknown",
+        },
+      }
+    }
+    #[cfg(target_os = "macos")]
+    {
+      "app"
+    }
+    #[cfg(target_os = "windows")]
+    {
+      "installer"
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+      "unknown"
+    }
+  }
+
   /// Get current app version from build-time injection
   pub fn get_current_version() -> String {
     // Use build-time injected version instead of CARGO_PKG_VERSION
@@ -171,173 +250,271 @@ impl AppAutoUpdater {
   pub async fn check_for_updates(
     &self,
   ) -> Result<Option<AppUpdateInfo>, Box<dyn std::error::Error + Send + Sync>> {
-    let current_version = Self::get_current_version();
-    let is_nightly = Self::is_nightly_build();
-
-    log::info!("=== App Update Check ===");
-    log::info!("Current version: {current_version}");
-    log::info!("Is nightly build: {is_nightly}");
-    log::info!("STABLE_RELEASE env: {:?}", option_env!("STABLE_RELEASE"));
-
-    let releases = self.fetch_app_releases().await?;
-    log::info!("Fetched {} releases from GitHub", releases.len());
-
-    // Filter releases based on build type
-    let filtered_releases: Vec<&AppRelease> = if is_nightly {
-      // For nightly builds, look for nightly releases
-      let nightly_releases: Vec<&AppRelease> = releases
-        .iter()
-        .filter(|release| release.tag_name.starts_with("nightly-"))
-        .collect();
-      log::info!("Found {} nightly releases", nightly_releases.len());
-      nightly_releases
-    } else {
-      // For stable builds, look for stable releases (semver format)
-      let stable_releases: Vec<&AppRelease> = releases
-        .iter()
-        .filter(|release| release.tag_name.starts_with('v'))
-        .collect();
-      log::info!("Found {} stable releases", stable_releases.len());
-      stable_releases
-    };
-
-    if filtered_releases.is_empty() {
-      log::info!("No releases found for build type (nightly: {is_nightly})");
-      return Ok(None);
-    }
-
-    // Get the latest release
-    let latest_release = filtered_releases[0];
-    log::info!(
-      "Latest release: {} ({})",
-      latest_release.tag_name,
-      latest_release.name
-    );
-
-    // Check if we need to update
-    if self.should_update(&current_version, &latest_release.tag_name, is_nightly) {
-      log::info!("Update available!");
-
-      // Build the release page URL
-      let release_page_url = format!(
-        "https://github.com/zhom/donutbrowser/releases/tag/{}",
-        latest_release.tag_name
-      );
-
-      // Find the appropriate asset for current platform
-      let download_url = self.get_download_url_for_platform(&latest_release.assets);
-
-      // Locate the release's checksums file and the chosen asset's
-      // GitHub-computed digest for post-download verification.
-      let checksums_url = Self::find_checksums_url(&latest_release.assets);
-      let asset_digest = download_url.as_deref().and_then(|url| {
-        latest_release
-          .assets
-          .iter()
-          .find(|a| a.browser_download_url == url)
-          .and_then(|a| a.digest.clone())
-      });
-
-      // Both release workflows upload SHA256SUMS.txt only after every platform
-      // build finishes, so a release without it is still being assembled (or
-      // its pipeline broke). Downloading now is guaranteed to fail closed, so
-      // treat the release as not ready and retry on a later check instead of
-      // surfacing an error for a healthy in-progress release. Applies only to
-      // the auto-download path — manual/repo notifications don't download.
-      let auto_download_possible = download_url.is_some();
-      #[cfg(target_os = "linux")]
-      let auto_download_possible = auto_download_possible && !self.is_repo_configured();
-      if auto_download_possible && checksums_url.is_none() {
-        log::info!(
-          "Release {} has no {} yet; treating as not ready for auto-update",
-          latest_release.tag_name,
-          Self::CHECKSUMS_ASSET_NAME
-        );
-        return Ok(None);
-      }
-
-      // On Linux, when a package repo is configured, notify users to update via
-      // their package manager instead of auto-downloading from GitHub.
-      #[cfg(target_os = "linux")]
-      {
-        let repo_update = self.is_repo_configured();
-        let manual_update_required = download_url.is_none() || repo_update;
-        let update_info = AppUpdateInfo {
-          current_version,
-          new_version: latest_release.tag_name.clone(),
-          release_notes: latest_release.body.clone(),
-          download_url: download_url.unwrap_or_else(|| release_page_url.clone()),
-          is_nightly,
-          published_at: latest_release.published_at.clone(),
-          manual_update_required,
-          release_page_url: Some(release_page_url),
-          repo_update,
-          checksums_url,
-          asset_digest,
-        };
-
-        log::info!(
-          "Update info prepared: {} -> {} (manual_update_required: {}, repo_update: {})",
-          update_info.current_version,
-          update_info.new_version,
-          update_info.manual_update_required,
-          update_info.repo_update
-        );
-        return Ok(Some(update_info));
-      }
-
-      #[cfg(not(target_os = "linux"))]
-      {
-        if let Some(url) = download_url {
-          let update_info = AppUpdateInfo {
-            current_version,
-            new_version: latest_release.tag_name.clone(),
-            release_notes: latest_release.body.clone(),
-            download_url: url,
-            is_nightly,
-            published_at: latest_release.published_at.clone(),
-            manual_update_required: false,
-            release_page_url: Some(release_page_url),
-            repo_update: false,
-            checksums_url,
-            asset_digest,
-          };
-
-          log::info!(
-            "Update info prepared: {} -> {}",
-            update_info.current_version,
-            update_info.new_version
-          );
-          return Ok(Some(update_info));
-        } else {
-          log::info!("No suitable download asset found for current platform");
-        }
-      }
-    } else {
-      log::info!("No update needed");
-    }
-
-    Ok(None)
+    self.check(false).await
   }
 
-  /// Fetch app releases from GitHub
+  /// Runs one check and writes its one result line: at info when the outcome
+  /// differs from the previous check (or the person asked), else at debug.
+  async fn check(
+    &self,
+    manual: bool,
+  ) -> Result<Option<AppUpdateInfo>, Box<dyn std::error::Error + Send + Sync>> {
+    let started = std::time::Instant::now();
+    let current_version = Self::get_current_version();
+    let channel = if Self::is_nightly_build() {
+      "nightly"
+    } else {
+      "stable"
+    };
+    let releases = match self.fetch_app_releases(channel == "nightly").await {
+      Ok(releases) => {
+        APP_UPDATE_CHECK_STREAK.succeeded();
+        releases
+      }
+      Err(e) => {
+        APP_UPDATE_CHECK_STREAK.failed(&e);
+        schedule_next_check(FAILED_RECHECK);
+        return Err(e);
+      }
+    };
+    let (update, latest, result) = self.evaluate_releases(&releases, current_version.clone());
+    schedule_next_check(if result.starts_with("not_ready") {
+      NOT_READY_RECHECK
+    } else {
+      CHECK_INTERVAL
+    });
+
+    let outcome = format!("{latest} {result}");
+    let changed = APP_UPDATE_LAST_OUTCOME
+      .lock()
+      .map(|mut last| last.replace(outcome.clone()) != Some(outcome))
+      .unwrap_or(true);
+    let level = if changed || manual {
+      log::Level::Info
+    } else {
+      log::Level::Debug
+    };
+    log::log!(
+      level,
+      "App update check current={current_version} latest={latest} channel={channel} result={result} manual={manual} elapsed_ms={}",
+      started.elapsed().as_millis()
+    );
+    Ok(update)
+  }
+
+  /// Picks the newest release of this build's channel and decides what the
+  /// check found. Returns the update, the latest tag (`-` when none) and a
+  /// `key=value` result fragment for the log line.
+  fn evaluate_releases(
+    &self,
+    releases: &[AppRelease],
+    current_version: String,
+  ) -> (Option<AppUpdateInfo>, String, String) {
+    let is_nightly = Self::is_nightly_build();
+    let filtered_releases: Vec<&AppRelease> = if is_nightly {
+      releases
+        .iter()
+        .filter(|release| release.tag_name.starts_with("nightly-"))
+        .collect()
+    } else {
+      releases
+        .iter()
+        .filter(|release| release.tag_name.starts_with('v'))
+        .collect()
+    };
+
+    let Some(latest_release) = filtered_releases.first().copied() else {
+      return (
+        None,
+        "-".to_string(),
+        format!("no_releases fetched={}", releases.len()),
+      );
+    };
+    let latest = latest_release.tag_name.clone();
+
+    if !self.should_update(&current_version, &latest_release.tag_name, is_nightly) {
+      return (None, latest, "none".to_string());
+    }
+
+    let release_page_url = format!(
+      "https://github.com/donutbrowser/donutbrowser/releases/tag/{}",
+      latest_release.tag_name
+    );
+
+    let download_url = self.get_download_url_for_platform(&latest_release.assets);
+    let asset = download_url
+      .as_deref()
+      .and_then(|url| url.rsplit('/').next())
+      .unwrap_or("-")
+      .to_string();
+
+    // Locate the release's checksums file and the chosen asset's
+    // GitHub-computed digest for post-download verification.
+    let checksums_url = Self::find_checksums_url(&latest_release.assets);
+    let asset_digest = download_url.as_deref().and_then(|url| {
+      latest_release
+        .assets
+        .iter()
+        .find(|a| a.browser_download_url == url)
+        .and_then(|a| a.digest.clone())
+    });
+
+    // Both release workflows upload SHA256SUMS.txt only after every platform
+    // build finishes, so a release without it is still being assembled (or
+    // its pipeline broke). Downloading now is guaranteed to fail closed, so
+    // treat the release as not ready and retry on a later check instead of
+    // surfacing an error for a healthy in-progress release. Applies only to
+    // the auto-download path — manual/repo notifications don't download.
+    let auto_download_possible = download_url.is_some();
+    #[cfg(target_os = "linux")]
+    let auto_download_possible = auto_download_possible && !self.is_repo_configured();
+    if auto_download_possible && checksums_url.is_none() {
+      return (
+        None,
+        latest,
+        format!("not_ready missing={}", Self::CHECKSUMS_ASSET_NAME),
+      );
+    }
+
+    // On Linux, when a package repo is configured, notify users to update via
+    // their package manager instead of auto-downloading from GitHub.
+    #[cfg(target_os = "linux")]
+    {
+      let repo_update = self.is_repo_configured();
+      let manual_update_required = download_url.is_none() || repo_update;
+      let update_info = AppUpdateInfo {
+        current_version,
+        new_version: latest_release.tag_name.clone(),
+        release_notes: latest_release.body.clone(),
+        download_url: download_url.unwrap_or_else(|| release_page_url.clone()),
+        is_nightly,
+        published_at: latest_release.published_at.clone(),
+        manual_update_required,
+        release_page_url: Some(release_page_url),
+        repo_update,
+        checksums_url,
+        asset_digest,
+        auto_install: !manual_update_required,
+      };
+      let result = format!(
+        "available asset={asset} manual_update_required={manual_update_required} repo_update={repo_update}"
+      );
+      (Some(update_info), latest, result)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+      let Some(url) = download_url else {
+        return (None, latest, "no_asset".to_string());
+      };
+      let update_info = AppUpdateInfo {
+        current_version,
+        new_version: latest_release.tag_name.clone(),
+        release_notes: latest_release.body.clone(),
+        download_url: url,
+        is_nightly,
+        published_at: latest_release.published_at.clone(),
+        manual_update_required: false,
+        release_page_url: Some(release_page_url),
+        repo_update: false,
+        checksums_url,
+        asset_digest,
+        auto_install: true,
+      };
+      (
+        Some(update_info),
+        latest,
+        format!("available asset={asset}"),
+      )
+    }
+  }
+
+  /// The releases of this build's channel from every source that answers,
+  /// newest first: GitHub and Donut's copy, asked at the same time. Fails
+  /// only when neither answers.
   async fn fetch_app_releases(
     &self,
+    nightly: bool,
   ) -> Result<Vec<AppRelease>, Box<dyn std::error::Error + Send + Sync>> {
-    let url = "https://api.github.com/repos/zhom/donutbrowser/releases?per_page=100";
+    let (github, donut) = tokio::join!(
+      self.fetch_github_releases(nightly),
+      self.fetch_donut_releases()
+    );
+    let mut lists = Vec::new();
+    let mut failures = Vec::new();
+    for (source, fetched) in [("github", github), ("donutbrowser.com", donut)] {
+      match fetched {
+        Ok(releases) => lists.push((source, releases)),
+        Err(e) => failures.push((source, e.to_string())),
+      }
+    }
+    if lists.is_empty() {
+      let all = failures
+        .iter()
+        .map(|(source, e)| format!("{source}: {e}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+      return Err(all.into());
+    }
+    for (source, _) in &lists {
+      APP_UPDATE_SOURCE_STREAK.succeeded(source);
+    }
+    for (source, e) in &failures {
+      APP_UPDATE_SOURCE_STREAK.failed(source, e);
+    }
+    Ok(merge_releases(
+      lists.into_iter().map(|(_, releases)| releases),
+    ))
+  }
+
+  /// The latest stable release alone (a few kilobytes), or the newest ten
+  /// for a nightly build, whose tags GitHub does not mark as latest.
+  async fn fetch_github_releases(
+    &self,
+    nightly: bool,
+  ) -> Result<Vec<AppRelease>, Box<dyn std::error::Error + Send + Sync>> {
+    let url = if nightly {
+      format!("{GITHUB_REPO_API}/releases?per_page=10")
+    } else {
+      format!("{GITHUB_REPO_API}/releases/latest")
+    };
     let response = self
       .client
-      .get(url)
+      .get()
+      .get(&url)
       .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
+      .header("Accept", "application/vnd.github+json")
+      .timeout(SOURCE_TIMEOUT)
       .send()
       .await?;
-
     if !response.status().is_success() {
       return Err(format!("GitHub API request failed: {}", response.status()).into());
     }
+    if nightly {
+      Ok(response.json().await?)
+    } else {
+      Ok(vec![response.json().await?])
+    }
+  }
 
-    let releases: Vec<AppRelease> = response.json().await?;
-    Ok(releases)
+  async fn fetch_donut_releases(
+    &self,
+  ) -> Result<Vec<AppRelease>, Box<dyn std::error::Error + Send + Sync>> {
+    let response = self
+      .client
+      .get()
+      .get(DONUT_RELEASES_URL)
+      .header(
+        "User-Agent",
+        format!("DonutBrowser/{}", Self::get_current_version()),
+      )
+      .timeout(SOURCE_TIMEOUT)
+      .send()
+      .await?;
+    if !response.status().is_success() {
+      return Err(format!("Donut releases request failed: {}", response.status()).into());
+    }
+    Ok(response.json().await?)
   }
 
   /// Determine if an update should be performed
@@ -346,10 +523,6 @@ impl AppAutoUpdater {
       return false;
     }
 
-    log::info!(
-      "Comparing versions: current={current_version}, new={new_version}, is_nightly={is_nightly}"
-    );
-
     if is_nightly {
       // For nightly builds, always update if there's a newer nightly
       if let (Some(current_hash), Some(new_hash)) = (
@@ -357,22 +530,17 @@ impl AppAutoUpdater {
         new_version.strip_prefix("nightly-"),
       ) {
         // Different commit hashes mean we should update
-        let should_update = new_hash != current_hash;
-        log::info!("Nightly comparison: current_hash={current_hash}, new_hash={new_hash}, should_update={should_update}");
-        return should_update;
+        return new_hash != current_hash;
       }
 
       // If current version doesn't have nightly prefix but we're in nightly mode,
       // this could be a dev build or stable build upgrading to nightly
       if !current_version.starts_with("nightly-") {
-        log::info!("Upgrading from non-nightly to nightly: {new_version}");
         return true;
       }
     } else {
       // For stable builds, use semantic versioning comparison
-      let should_update = self.is_version_newer(new_version, current_version);
-      log::info!("Stable comparison: {new_version} > {current_version} = {should_update}");
-      return should_update;
+      return self.is_version_newer(new_version, current_version);
     }
 
     false
@@ -439,7 +607,6 @@ impl AppAutoUpdater {
     };
 
     let exe_path_str = exe_path.to_string_lossy();
-    log::info!("Detecting installation method for: {exe_path_str}");
 
     // Check if installed via package manager by querying package databases
     if let Some(exe_name) = exe_path.file_name().and_then(|n| n.to_str()) {
@@ -450,7 +617,6 @@ impl AppAutoUpdater {
         if output.status.success() {
           let stdout = String::from_utf8_lossy(&output.stdout);
           if !stdout.trim().is_empty() && !stdout.contains("no path found") {
-            log::info!("Found DEB package owning the executable");
             return LinuxInstallationMethod::Deb;
           }
         }
@@ -461,7 +627,6 @@ impl AppAutoUpdater {
         if output.status.success() {
           let stdout = String::from_utf8_lossy(&output.stdout);
           if !stdout.trim().is_empty() && !stdout.contains("not owned") {
-            log::info!("Found RPM package owning the executable");
             return LinuxInstallationMethod::Rpm;
           }
         }
@@ -476,7 +641,6 @@ impl AppAutoUpdater {
           if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             if !stdout.trim().is_empty() && stdout.contains(exe_name) {
-              log::info!("Found RPM package via {rpm_cmd}");
               return LinuxInstallationMethod::Rpm;
             }
           }
@@ -487,7 +651,6 @@ impl AppAutoUpdater {
     // Check installation location to infer method
     if exe_path_str.starts_with("/usr/bin/") || exe_path_str.starts_with("/usr/local/bin/") {
       // Likely installed via package manager or system-wide installation
-      log::info!("Executable in system directory, assuming package installation");
 
       // Try to determine which package system is available
       if Command::new("dpkg").arg("--version").output().is_ok() {
@@ -499,11 +662,9 @@ impl AppAutoUpdater {
       return LinuxInstallationMethod::Manual;
     } else if exe_path_str.contains("/.local/") || exe_path_str.starts_with("/home/") {
       // User-local installation
-      log::info!("Executable in user directory, assuming manual installation");
       return LinuxInstallationMethod::Manual;
     }
 
-    log::info!("Could not determine installation method");
     LinuxInstallationMethod::Unknown
   }
 
@@ -523,6 +684,12 @@ impl AppAutoUpdater {
   /// Check if a system package manager repo is configured for this installation.
   #[cfg(target_os = "linux")]
   fn is_repo_configured(&self) -> bool {
+    // flatpak and snapd update these installs. Nothing inside the sandbox can
+    // replace the app, so report the release the way a repository install does
+    // instead of downloading a .deb that cannot be installed from in here.
+    if crate::app_dirs::linux_sandbox().is_some() {
+      return true;
+    }
     let installation_method = self.detect_linux_installation_method();
     match installation_method {
       LinuxInstallationMethod::Deb => Self::is_deb_repo_configured(),
@@ -541,13 +708,11 @@ impl AppAutoUpdater {
       "unknown"
     };
 
-    log::info!("Looking for platform-specific asset for arch: {arch}");
-
     #[cfg(target_os = "linux")]
     {
       // If we're running from an AppImage, disable auto-updates for safety
       if self.is_running_from_appimage() {
-        log::info!("Running from AppImage - auto-updates disabled for safety");
+        log::debug!("No auto-update asset: running from an AppImage");
         return None;
       }
     }
@@ -559,6 +724,9 @@ impl AppAutoUpdater {
 
     #[cfg(target_os = "windows")]
     {
+      if crate::app_dirs::is_portable() {
+        return crate::portable_update::asset_url(assets, arch);
+      }
       self.get_windows_download_url(assets, arch)
     }
 
@@ -569,7 +737,6 @@ impl AppAutoUpdater {
 
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
-      log::info!("Unsupported platform for auto-update");
       None
     }
   }
@@ -585,7 +752,10 @@ impl AppAutoUpdater {
           || asset.name.contains(&format!("-{arch}-"))
           || asset.name.contains(&format!("_{arch}-")))
       {
-        log::info!("Found exact architecture match: {}", asset.name);
+        log::debug!(
+          "Asset picked asset={} rule=\"exact architecture match\"",
+          asset.name
+        );
         return Some(asset.browser_download_url.clone());
       }
     }
@@ -596,7 +766,7 @@ impl AppAutoUpdater {
         if asset.name.contains(".dmg")
           && (asset.name.contains("x86_64") || asset.name.contains("x86-64"))
         {
-          log::info!("Found x86_64 variant: {}", asset.name);
+          log::debug!("Asset picked asset={} rule=\"x86_64 variant\"", asset.name);
           return Some(asset.browser_download_url.clone());
         }
       }
@@ -608,7 +778,7 @@ impl AppAutoUpdater {
         if asset.name.contains(".dmg")
           && (asset.name.contains("arm64") || asset.name.contains("aarch64"))
         {
-          log::info!("Found arm64 variant: {}", asset.name);
+          log::debug!("Asset picked asset={} rule=\"arm64 variant\"", asset.name);
           return Some(asset.browser_download_url.clone());
         }
       }
@@ -621,7 +791,7 @@ impl AppAutoUpdater {
           || asset.name.to_lowercase().contains("darwin")
           || !asset.name.contains(".app.tar.gz"))
       {
-        log::info!("Found fallback DMG: {}", asset.name);
+        log::debug!("Asset picked asset={} rule=\"fallback DMG\"", asset.name);
         return Some(asset.browser_download_url.clone());
       }
     }
@@ -644,7 +814,10 @@ impl AppAutoUpdater {
             || asset.name.contains(&format!("-{arch}-"))
             || asset.name.contains(&format!("_{arch}-")))
         {
-          log::info!("Found Windows {ext} with exact arch match: {}", asset.name);
+          log::debug!(
+            "Asset picked asset={} rule=\"Windows {ext} with exact arch match\"",
+            asset.name
+          );
           return Some(asset.browser_download_url.clone());
         }
       }
@@ -655,7 +828,10 @@ impl AppAutoUpdater {
           if asset.name.to_lowercase().ends_with(&format!(".{ext}"))
             && (asset.name.contains("x86_64") || asset.name.contains("x86-64"))
           {
-            log::info!("Found Windows {ext} with x86_64 variant: {}", asset.name);
+            log::debug!(
+              "Asset picked asset={} rule=\"Windows {ext} with x86_64 variant\"",
+              asset.name
+            );
             return Some(asset.browser_download_url.clone());
           }
         }
@@ -668,7 +844,10 @@ impl AppAutoUpdater {
             || asset.name.to_lowercase().contains("win32")
             || asset.name.to_lowercase().contains("win64"))
         {
-          log::info!("Found Windows {ext} fallback: {}", asset.name);
+          log::debug!(
+            "Asset picked asset={} rule=\"Windows {ext} fallback\"",
+            asset.name
+          );
           return Some(asset.browser_download_url.clone());
         }
       }
@@ -681,7 +860,7 @@ impl AppAutoUpdater {
   fn get_linux_download_url(&self, assets: &[AppReleaseAsset], arch: &str) -> Option<String> {
     // Detect installation method to prioritize appropriate formats
     let installation_method = self.detect_linux_installation_method();
-    log::info!("Detected Linux installation method: {installation_method:?}");
+    log::debug!("Linux install detected method={installation_method:?}");
 
     // Priority order based on installation method
     let extensions = match installation_method {
@@ -689,7 +868,6 @@ impl AppAutoUpdater {
       LinuxInstallationMethod::Rpm => vec!["rpm", "tar.gz"],
       LinuxInstallationMethod::AppImage => {
         // AppImages should not auto-update for safety
-        log::info!("AppImage installation detected - auto-updates disabled");
         return None;
       }
       LinuxInstallationMethod::Manual | LinuxInstallationMethod::Unknown => {
@@ -708,7 +886,10 @@ impl AppAutoUpdater {
             || asset.name.contains(&format!("-{arch}-"))
             || asset.name.contains(&format!("_{arch}-")))
         {
-          log::info!("Found Linux {ext} with exact arch match: {}", asset.name);
+          log::debug!(
+            "Asset picked asset={} rule=\"Linux {ext} with exact arch match\"",
+            asset.name
+          );
           return Some(asset.browser_download_url.clone());
         }
       }
@@ -722,7 +903,10 @@ impl AppAutoUpdater {
               || asset.name.contains("x86-64")
               || asset.name.contains("amd64"))
           {
-            log::info!("Found Linux {ext} with x86_64 variant: {}", asset.name);
+            log::debug!(
+              "Asset picked asset={} rule=\"Linux {ext} with x86_64 variant\"",
+              asset.name
+            );
             return Some(asset.browser_download_url.clone());
           }
         }
@@ -735,7 +919,10 @@ impl AppAutoUpdater {
           if asset_name_lower.ends_with(&format!(".{ext}"))
             && (asset.name.contains("arm64") || asset.name.contains("aarch64"))
           {
-            log::info!("Found Linux {ext} with arm64 variant: {}", asset.name);
+            log::debug!(
+              "Asset picked asset={} rule=\"Linux {ext} with arm64 variant\"",
+              asset.name
+            );
             return Some(asset.browser_download_url.clone());
           }
         }
@@ -749,7 +936,10 @@ impl AppAutoUpdater {
             || asset_name_lower.contains("ubuntu")
             || asset_name_lower.contains("debian"))
         {
-          log::info!("Found Linux {ext} fallback: {}", asset.name);
+          log::debug!(
+            "Asset picked asset={} rule=\"Linux {ext} fallback\"",
+            asset.name
+          );
           return Some(asset.browser_download_url.clone());
         }
       }
@@ -766,42 +956,6 @@ impl AppAutoUpdater {
       .iter()
       .find(|a| a.name == Self::CHECKSUMS_ASSET_NAME)
       .map(|a| a.browser_download_url.clone())
-  }
-
-  /// Extract the hex digest for `filename` from standard `sha256sum` output
-  /// (`<hex>  <name>`, optionally with the `*` binary-mode marker).
-  fn find_checksum_for_file(checksums_text: &str, filename: &str) -> Option<String> {
-    checksums_text.lines().find_map(|line| {
-      let (hash, rest) = line.split_once(char::is_whitespace)?;
-      let name = rest.trim_start().trim_start_matches('*');
-      if name == filename && hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Some(hash.to_ascii_lowercase())
-      } else {
-        None
-      }
-    })
-  }
-
-  fn sha256_file(path: &Path) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-    let mut file = fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 1024 * 1024];
-    loop {
-      let n = file.read(&mut buf)?;
-      if n == 0 {
-        break;
-      }
-      hasher.update(&buf[..n]);
-    }
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-      use std::fmt::Write;
-      let _ = write!(hex, "{byte:02x}");
-    }
-    Ok(hex)
   }
 
   /// Fetch the release's SHA256SUMS.txt and return the expected digest for
@@ -824,15 +978,16 @@ impl AppAutoUpdater {
 
     let Some(checksums_url) = update_info.checksums_url.as_deref() else {
       log::warn!(
-        "No {} asset on release {}",
-        Self::CHECKSUMS_ASSET_NAME,
-        update_info.new_version
+        "App update checksums missing version={} asset={}",
+        update_info.new_version,
+        Self::CHECKSUMS_ASSET_NAME
       );
       return Err(unavailable());
     };
 
     let response = match self
       .client
+      .get()
       .get(checksums_url)
       .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
       .send()
@@ -840,11 +995,18 @@ impl AppAutoUpdater {
     {
       Ok(response) if response.status().is_success() => response,
       Ok(response) => {
-        log::warn!("Checksums file request failed: HTTP {}", response.status());
+        log::warn!(
+          "App update checksums fetch failed version={} status={}",
+          update_info.new_version,
+          response.status().as_u16()
+        );
         return Err(unavailable());
       }
       Err(e) => {
-        log::warn!("Checksums file request failed: {e}");
+        log::warn!(
+          "App update checksums fetch failed version={} err=\"{e}\"",
+          update_info.new_version
+        );
         return Err(unavailable());
       }
     };
@@ -852,14 +1014,17 @@ impl AppAutoUpdater {
     let checksums_text = match response.text().await {
       Ok(text) => text,
       Err(e) => {
-        log::warn!("Failed to read checksums file: {e}");
+        log::warn!(
+          "App update checksums read failed version={} err=\"{e}\"",
+          update_info.new_version
+        );
         return Err(unavailable());
       }
     };
 
-    let Some(expected) = Self::find_checksum_for_file(&checksums_text, filename) else {
+    let Some(expected) = crate::checksum::find_checksum_for_file(&checksums_text, filename) else {
       log::warn!(
-        "No checksum entry for {filename} in {}",
+        "App update checksum entry missing file={filename} in={}",
         Self::CHECKSUMS_ASSET_NAME
       );
       return Err(unavailable());
@@ -877,7 +1042,7 @@ impl AppAutoUpdater {
     expected: &str,
     asset_digest: Option<&str>,
   ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let actual = Self::sha256_file(file_path)?;
+    let actual = crate::checksum::sha256_file(file_path)?;
 
     let mut mismatch = !actual.eq_ignore_ascii_case(expected);
 
@@ -890,8 +1055,9 @@ impl AppAutoUpdater {
     }
 
     if mismatch {
-      log::error!(
-        "Checksum mismatch for {filename}: expected {expected}, got {actual} (asset digest: {asset_digest:?})"
+      log::warn!(
+        "App update checksum mismatch file={filename} expected={expected} actual={actual} asset_digest={}",
+        asset_digest.unwrap_or("-")
       );
       let _ = fs::remove_file(file_path);
       return Err(
@@ -904,11 +1070,20 @@ impl AppAutoUpdater {
       );
     }
 
-    log::info!("Checksum verified for {filename}: {actual}");
+    log::debug!("App update checksum verified file={filename} sha256={actual}");
     Ok(())
   }
 
   /// Download the update file without progress tracking (silent download)
+  /// Where an update is downloaded. A portable copy keeps it on its own drive.
+  fn download_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    if let Some(install_dir) = crate::app_dirs::portable_dir() {
+      return crate::portable_update::update_dir(install_dir);
+    }
+    std::env::temp_dir().join("donut_app_update")
+  }
+
   async fn download_update_silent(
     &self,
     download_url: &str,
@@ -919,6 +1094,7 @@ impl AppAutoUpdater {
 
     let response = self
       .client
+      .get()
       .get(download_url)
       .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
       .send()
@@ -928,8 +1104,6 @@ impl AppAutoUpdater {
       return Err(format!("Download failed with status: {}", response.status()).into());
     }
 
-    let total_size = response.content_length().unwrap_or(0);
-    log::info!("Silent download size: {} bytes", total_size);
     let raw_file = fs::File::create(&file_path)?;
     let mut file = std::io::BufWriter::with_capacity(8 * 1024 * 1024, raw_file);
     let mut stream = response.bytes_stream();
@@ -940,8 +1114,6 @@ impl AppAutoUpdater {
       file.write_all(&chunk)?;
     }
     std::io::Write::flush(&mut file)?;
-
-    log::info!("Silent download completed: {}", file_path.display());
     Ok(file_path)
   }
 
@@ -951,9 +1123,39 @@ impl AppAutoUpdater {
     _app_handle: &tauri::AppHandle,
     update_info: &AppUpdateInfo,
   ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    log::info!("Starting background update download and install");
+    let started = std::time::Instant::now();
+    let mut stage = "checksums";
+    match self.download_and_prepare(update_info, &mut stage).await {
+      Ok((asset, bytes, result)) => {
+        log::info!(
+          "App update ready from={} to={} asset={asset} bytes={bytes} result={result} elapsed_ms={}",
+          update_info.current_version,
+          update_info.new_version,
+          started.elapsed().as_millis()
+        );
+        crate::whats_new::remember(&update_info.new_version, &update_info.release_notes);
+        let _ = events::emit("app-update-ready", update_info.new_version.clone());
+        Ok(())
+      }
+      Err(e) => {
+        log::error!(
+          "App update failed from={} to={} stage={stage} elapsed_ms={} err=\"{e}\"",
+          update_info.current_version,
+          update_info.new_version,
+          started.elapsed().as_millis()
+        );
+        Err(e)
+      }
+    }
+  }
 
-    let temp_dir = std::env::temp_dir().join("donut_app_update");
+  /// Returns the asset name, its size and what was done with it.
+  async fn download_and_prepare(
+    &self,
+    update_info: &AppUpdateInfo,
+    stage: &mut &'static str,
+  ) -> Result<(String, u64, &'static str), Box<dyn std::error::Error + Send + Sync>> {
+    let temp_dir = Self::download_dir();
     fs::create_dir_all(&temp_dir)?;
 
     let filename = update_info
@@ -967,13 +1169,13 @@ impl AppAutoUpdater {
     // rejected before the multi-hundred-MB download, not after.
     let expected_sha256 = self.fetch_expected_checksum(update_info, &filename).await?;
 
-    log::info!("Downloading update");
-
+    *stage = "download";
     let download_path = self
       .download_update_silent(&update_info.download_url, &temp_dir, &filename)
       .await?;
+    let bytes = fs::metadata(&download_path).map(|m| m.len()).unwrap_or(0);
 
-    log::info!("Verifying update checksum...");
+    *stage = "verify";
     Self::verify_update_checksum(
       &download_path,
       &filename,
@@ -981,7 +1183,17 @@ impl AppAutoUpdater {
       update_info.asset_digest.as_deref(),
     )?;
 
-    log::info!("Extracting update...");
+    // The swap needs every Donut process gone, so it waits for the restart.
+    #[cfg(target_os = "windows")]
+    if let Some(install_dir) = crate::app_dirs::portable_dir() {
+      *stage = "extract";
+      let package = crate::portable_update::stage(&download_path, install_dir).await?;
+      let _ = fs::remove_file(&download_path);
+      *PENDING_UPDATE.lock().unwrap() = Some(PendingUpdate::Portable(package));
+      return Ok((filename, bytes, "portable_deferred_to_restart"));
+    }
+
+    *stage = "extract";
     let extracted_app_path = self.extract_update(&download_path, &temp_dir).await?;
 
     // On Windows, MSI/EXE installers close the running app, so running them now
@@ -995,29 +1207,22 @@ impl AppAutoUpdater {
         .unwrap_or("")
         .to_lowercase();
       if ext == "msi" || ext == "exe" {
-        log::info!("Deferring Windows installer execution until user-initiated restart");
-        *PENDING_INSTALLER_PATH.lock().unwrap() = Some(extracted_app_path);
-      } else {
-        log::info!("Installing update (overwriting binary)...");
-        self.install_update(&extracted_app_path).await?;
-        log::info!("Cleaning up temporary files...");
-        let _ = fs::remove_dir_all(&temp_dir);
+        *PENDING_UPDATE.lock().unwrap() = Some(PendingUpdate::Installer(extracted_app_path));
+        return Ok((filename, bytes, "installer_deferred_to_restart"));
       }
+      *stage = "install";
+      self.install_update(&extracted_app_path).await?;
+      let _ = fs::remove_dir_all(&temp_dir);
+      Ok((filename, bytes, "installed"))
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-      log::info!("Installing update (overwriting binary)...");
+      *stage = "install";
       self.install_update(&extracted_app_path).await?;
-      log::info!("Cleaning up temporary files...");
       let _ = fs::remove_dir_all(&temp_dir);
+      Ok((filename, bytes, "installed"))
     }
-
-    log::info!("Update ready, emitting app-update-ready event");
-
-    let _ = events::emit("app-update-ready", update_info.new_version.clone());
-
-    Ok(())
   }
 
   /// Extract the update using the extraction module
@@ -1168,13 +1373,14 @@ impl AppAutoUpdater {
         }
       };
       if needs_quarantine_removal {
-        let _ = Command::new("xattr")
-          .args([
+        let _ = output_logged(
+          Command::new("xattr").args([
             "-dr",
             "com.apple.quarantine",
             current_app_path.to_str().unwrap(),
-          ])
-          .output();
+          ]),
+          "clear quarantine on updated app",
+        );
       }
 
       // Clean up backup after successful installation
@@ -1184,14 +1390,15 @@ impl AppAutoUpdater {
       if let Some(parent_dir) = current_app_path.parent() {
         let old_app_path = parent_dir.join("Donut Browser.app");
         if old_app_path.exists() && old_app_path != current_app_path {
-          log::info!(
-            "Removing old 'Donut Browser.app' from: {}",
-            old_app_path.display()
-          );
-          if let Err(e) = fs::remove_dir_all(&old_app_path) {
-            log::warn!("Warning: Failed to remove old 'Donut Browser.app': {e}");
-          } else {
-            log::info!("Successfully removed old 'Donut Browser.app'");
+          match fs::remove_dir_all(&old_app_path) {
+            Ok(()) => log::info!(
+              "Removed pre-rename app bundle path=\"{}\"",
+              old_app_path.display()
+            ),
+            Err(e) => log::warn!(
+              "Pre-rename app bundle removal failed path=\"{}\" err=\"{e}\"",
+              old_app_path.display()
+            ),
           }
         }
       }
@@ -1206,13 +1413,8 @@ impl AppAutoUpdater {
         .and_then(|ext| ext.to_str())
         .unwrap_or("");
 
-      log::info!("Installing Windows update with extension: {extension}");
-
       match extension {
         "msi" => {
-          // Install MSI silently with enhanced error handling
-          log::info!("Running MSI installer: {}", installer_path.display());
-
           let mut cmd = Command::new("msiexec");
           cmd.args([
             "/i",
@@ -1228,43 +1430,30 @@ impl AppAutoUpdater {
           const CREATE_NO_WINDOW: u32 = 0x08000000;
           cmd.creation_flags(CREATE_NO_WINDOW);
 
-          let output = cmd.output()?;
+          let output = output_logged(&mut cmd, "msi update installer")?;
 
           if !output.status.success() {
             let error_msg = String::from_utf8_lossy(&output.stderr);
             let exit_code = output.status.code().unwrap_or(-1);
 
-            // Try to read the log file for more details
             let log_path = format!("{}.log", installer_path.to_str().unwrap());
             let log_content = fs::read_to_string(&log_path).unwrap_or_default();
-
-            log::info!("MSI installation failed with exit code: {exit_code}");
-            log::info!("Error output: {error_msg}");
-            if !log_content.is_empty() {
-              log::info!(
-                "Log file content (last 500 chars): {}",
-                log_content
-                  .chars()
-                  .rev()
-                  .take(500)
-                  .collect::<String>()
-                  .chars()
-                  .rev()
-                  .collect::<String>()
-              );
-            }
+            let log_tail = log_content
+              .chars()
+              .rev()
+              .take(500)
+              .collect::<String>()
+              .chars()
+              .rev()
+              .collect::<String>();
+            log::warn!("MSI install log tail code={exit_code} tail={log_tail:?}");
 
             return Err(
               format!("MSI installation failed (exit code {exit_code}): {error_msg}").into(),
             );
           }
-
-          log::info!("MSI installation completed successfully");
         }
         "exe" => {
-          // Run exe installer silently with multiple fallback options
-          log::info!("Running EXE installer: {}", installer_path.display());
-
           // Try NSIS silent flag first (most common for Tauri)
           let mut success = false;
           let mut last_error = String::new();
@@ -1278,15 +1467,11 @@ impl AppAutoUpdater {
           ];
 
           for args in nsis_args {
-            log::info!("Trying installer with args: {:?}", args);
-            let output = Command::new(installer_path).args(&args).output();
+            let purpose = format!("exe update installer args={}", args.join(" "));
+            let output = output_logged(Command::new(installer_path).args(&args), &purpose);
 
             match output {
               Ok(output) if output.status.success() => {
-                log::info!(
-                  "EXE installation completed successfully with args: {:?}",
-                  args
-                );
                 success = true;
                 break;
               }
@@ -1297,15 +1482,9 @@ impl AppAutoUpdater {
                   output.status.code().unwrap_or(-1),
                   error_msg
                 );
-                log::info!("Installer failed with args {:?}: {}", args, last_error);
               }
               Err(e) => {
                 last_error = format!("Failed to execute installer: {e}");
-                log::info!(
-                  "Failed to execute installer with args {:?}: {}",
-                  args,
-                  last_error
-                );
               }
             }
           }
@@ -1321,8 +1500,6 @@ impl AppAutoUpdater {
         }
         "zip" => {
           // Handle ZIP files by extracting and replacing the current executable
-          log::info!("Handling ZIP update: {}", installer_path.display());
-
           let temp_extract_dir = installer_path.parent().unwrap().join("extracted");
           fs::create_dir_all(&temp_extract_dir)?;
 
@@ -1367,8 +1544,6 @@ impl AppAutoUpdater {
 
           // Clean up
           let _ = fs::remove_dir_all(&temp_extract_dir);
-
-          log::info!("ZIP update completed successfully");
         }
         _ => {
           return Err(format!("Unsupported installer format: {extension}").into());
@@ -1384,8 +1559,6 @@ impl AppAutoUpdater {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("");
-
-      log::info!("Installing Linux update: {}", installer_path.display());
 
       // Handle compound extensions like .tar.gz
       if file_name.ends_with(".tar.gz") {
@@ -1417,7 +1590,6 @@ impl AppAutoUpdater {
     &self,
     deb_path: &Path,
   ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    log::info!("Installing DEB package: {}", deb_path.display());
     Self::install_linux_package_with_privileges(deb_path, "dpkg", "-i")
   }
 
@@ -1427,7 +1599,6 @@ impl AppAutoUpdater {
     &self,
     rpm_path: &Path,
   ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    log::info!("Installing RPM package: {}", rpm_path.display());
     Self::install_linux_package_with_privileges(rpm_path, "rpm", "-Uvh")
   }
 
@@ -1444,12 +1615,11 @@ impl AppAutoUpdater {
     let pkg = pkg_path.to_str().unwrap_or_default();
 
     // 1. Try pkexec (graphical PolicyKit prompt)
-    if let Ok(status) = Command::new("pkexec")
-      .args([install_cmd, install_arg, pkg])
-      .status()
-    {
+    if let Ok(status) = status_logged(
+      Command::new("pkexec").args([install_cmd, install_arg, pkg]),
+      &format!("{install_cmd} update package via pkexec"),
+    ) {
       if status.success() {
-        log::info!("Installed {pkg} with pkexec");
         return Ok(());
       }
     }
@@ -1457,18 +1627,16 @@ impl AppAutoUpdater {
     // 2. Try graphical password dialog → sudo -S
     if let Some(password) = Self::get_password_graphically() {
       if Self::install_with_sudo_stdin(pkg_path, &password, install_cmd, install_arg) {
-        log::info!("Installed {pkg} with graphical sudo");
         return Ok(());
       }
     }
 
     // 3. Terminal sudo fallback
-    if let Ok(status) = Command::new("sudo")
-      .args([install_cmd, install_arg, pkg])
-      .status()
-    {
+    if let Ok(status) = status_logged(
+      Command::new("sudo").args([install_cmd, install_arg, pkg]),
+      &format!("{install_cmd} update package via sudo"),
+    ) {
       if status.success() {
-        log::info!("Installed {pkg} with sudo");
         return Ok(());
       }
     }
@@ -1536,10 +1704,19 @@ impl AppAutoUpdater {
 
     match child {
       Ok(mut child) => {
+        let pid = child.id();
+        log::info!(
+          "Process spawned pid={pid} purpose=\"{install_cmd} update package via sudo -S\""
+        );
         if let Some(mut stdin) = child.stdin.take() {
           let _ = writeln!(stdin, "{password}");
         }
-        child.wait().map(|s| s.success()).unwrap_or(false)
+        let status = child.wait();
+        log::info!(
+          "Process exited pid={pid} purpose=\"{install_cmd} update package via sudo -S\" code={}",
+          status.as_ref().map_or("wait_failed".to_string(), exit_code)
+        );
+        status.map(|s| s.success()).unwrap_or(false)
       }
       Err(_) => false,
     }
@@ -1551,8 +1728,6 @@ impl AppAutoUpdater {
     &self,
     appimage_path: &Path,
   ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    log::info!("Installing AppImage: {}", appimage_path.display());
-
     // This function should not be called for AppImages since we disable auto-updates for them
     // But if it somehow gets called, we'll handle it safely
 
@@ -1578,14 +1753,13 @@ impl AppAutoUpdater {
     fs::copy(&current_appimage, &backup_path)?;
 
     // Make new AppImage executable
-    let _ = Command::new("chmod")
-      .args(["+x", appimage_path.to_str().unwrap()])
-      .output();
+    let _ = output_logged(
+      Command::new("chmod").args(["+x", appimage_path.to_str().unwrap()]),
+      "chmod updated AppImage",
+    );
 
     // Replace the AppImage
     fs::copy(appimage_path, &current_appimage)?;
-
-    log::info!("AppImage replacement completed successfully");
     Ok(())
   }
 
@@ -1595,8 +1769,6 @@ impl AppAutoUpdater {
     &self,
     tarball_path: &Path,
   ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    log::info!("Installing tarball: {}", tarball_path.display());
-
     let current_exe = self.get_current_app_path()?;
     let temp_extract_dir = tarball_path.parent().unwrap().join("extracted");
     fs::create_dir_all(&temp_extract_dir)?;
@@ -1650,14 +1822,13 @@ impl AppAutoUpdater {
     fs::copy(&new_exe_path, &current_exe)?;
 
     // Make sure it's executable
-    let _ = Command::new("chmod")
-      .args(["+x", current_exe.to_str().unwrap()])
-      .output();
+    let _ = output_logged(
+      Command::new("chmod").args(["+x", current_exe.to_str().unwrap()]),
+      "chmod updated binary",
+    );
 
     // Clean up
     let _ = fs::remove_dir_all(&temp_extract_dir);
-
-    log::info!("Tarball installation completed successfully");
     Ok(())
   }
 
@@ -1703,7 +1874,7 @@ impl AppAutoUpdater {
     let profiles = match crate::profile::ProfileManager::instance().list_profiles() {
       Ok(profiles) => profiles,
       Err(e) => {
-        log::error!("Failed to inspect running profiles before app update: {e}");
+        log::error!("App update preparation failed step=list_profiles err=\"{e}\"");
         return Err(
           serde_json::json!({
             "code": "UPDATE_PREPARATION_FAILED"
@@ -1756,7 +1927,7 @@ impl AppAutoUpdater {
 
     for result in proxy_results.into_iter().chain(vpn_results) {
       if let Err(e) = result {
-        log::warn!("Failed to stop a network worker before app update: {e}");
+        log::warn!("Worker stop before app update failed err=\"{e}\"");
       }
     }
 
@@ -1774,10 +1945,7 @@ impl AppAutoUpdater {
       .into_iter()
       .filter(|pid| crate::proxy_storage::is_process_running(*pid))
       .collect();
-    log::error!(
-      "App update aborted because donut-proxy worker PIDs are still running: {:?}",
-      remaining
-    );
+    log::error!("App update aborted: workers still running pids={remaining:?}");
     Err(
       serde_json::json!({
         "code": "UPDATE_PREPARATION_FAILED"
@@ -1785,6 +1953,73 @@ impl AppAutoUpdater {
       .to_string()
       .into(),
     )
+  }
+
+  /// Moves the staged portable update into place once no Donut process runs
+  /// from the old files. On failure the current version stays.
+  #[cfg(target_os = "windows")]
+  async fn install_portable_update(
+    package: &Path,
+    exe: &Path,
+  ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    Self::prepare_windows_installer().await?;
+    let started = std::time::Instant::now();
+    let (Some(install_dir), Some(exe_name)) = (exe.parent(), exe.file_name()) else {
+      return Err("The portable executable has no folder".into());
+    };
+    let package = package.to_path_buf();
+    let install_dir = install_dir.to_path_buf();
+    let exe_name = exe_name.to_os_string();
+    let applied = tokio::task::spawn_blocking(move || {
+      crate::portable_update::apply(&package, &install_dir, &exe_name)
+    })
+    .await?;
+    match applied {
+      Ok(files) => {
+        log::info!(
+          "Portable update installed files={files} elapsed_ms={}",
+          started.elapsed().as_millis()
+        );
+        Ok(())
+      }
+      Err(e) => {
+        log::error!("Portable update failed, current version kept err=\"{e}\"");
+        Err(
+          serde_json::json!({ "code": "PORTABLE_UPDATE_FAILED" })
+            .to_string()
+            .into(),
+        )
+      }
+    }
+  }
+
+  /// Starts `app_path` once this process has exited, from a detached script.
+  #[cfg(target_os = "windows")]
+  fn relaunch_after_exit(app_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let current_pid = std::process::id();
+    let script_path = std::env::temp_dir().join("donut_restart.bat");
+    let script_content = format!(
+      "@echo off\n\
+       :w\n\
+       tasklist /fi \"PID eq {current_pid}\" 2>nul | find \"{current_pid}\" >nul && (timeout /t 1 /nobreak >nul & goto w)\n\
+       timeout /t 1 /nobreak >nul\n\
+       start \"\" \"{app}\"\n\
+       del \"%~f0\"\n",
+      app = app_path.to_str().unwrap(),
+    );
+    fs::write(&script_path, script_content)?;
+
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let child = Command::new("cmd")
+      .args(["/C", script_path.to_str().unwrap()])
+      .creation_flags(CREATE_NO_WINDOW)
+      .spawn()?;
+    log::info!(
+      "Process spawned pid={} purpose=\"relaunch after exit\" waits_for_pid={current_pid}",
+      child.id()
+    );
+    Ok(())
   }
 
   /// Restart the application
@@ -1836,7 +2071,11 @@ rm "{}"
       use std::os::unix::process::CommandExt;
       cmd.process_group(0);
 
-      let _child = cmd.spawn()?;
+      let child = cmd.spawn()?;
+      log::info!(
+        "Process spawned pid={} purpose=\"relaunch after exit\" waits_for_pid={current_pid}",
+        child.id()
+      );
 
       // Give the script a moment to start
       tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -1850,11 +2089,19 @@ rm "{}"
       use std::ffi::OsStr;
       use std::os::windows::ffi::OsStrExt;
 
-      let pending = PENDING_INSTALLER_PATH.lock().unwrap().take();
+      let pending = PENDING_UPDATE.lock().unwrap().take();
 
-      if let Some(installer_path) = pending {
+      if let Some(PendingUpdate::Portable(package)) = pending {
+        // Read before the swap gives the running file another name.
+        let exe = std::env::current_exe()?;
+        if let Err(e) = Self::install_portable_update(&package, &exe).await {
+          *PENDING_UPDATE.lock().unwrap() = Some(PendingUpdate::Portable(package));
+          return Err(e);
+        }
+        Self::relaunch_after_exit(&exe)?;
+      } else if let Some(PendingUpdate::Installer(installer_path)) = pending {
         if let Err(e) = Self::prepare_windows_installer().await {
-          *PENDING_INSTALLER_PATH.lock().unwrap() = Some(installer_path);
+          *PENDING_UPDATE.lock().unwrap() = Some(PendingUpdate::Installer(installer_path));
           return Err(e);
         }
 
@@ -1902,68 +2149,42 @@ rm "{}"
         let file_w = encode_wide(&file);
         let params_w = encode_wide(&parameters);
 
-        log::info!(
-          "Running installer via ShellExecuteW: {:?} {:?}",
-          file,
-          parameters
-        );
-
-        // windows-sys is not a direct dep, so use the raw FFI via the
-        // windows crate that Tauri pulls in. ShellExecuteW returns an
-        // HINSTANCE > 32 on success.
-        #[link(name = "shell32")]
-        extern "system" {
-          fn ShellExecuteW(
-            hwnd: *mut std::ffi::c_void,
-            operation: *const u16,
-            file: *const u16,
-            parameters: *const u16,
-            directory: *const u16,
-            show_cmd: i32,
-          ) -> isize;
-        }
-        const SW_SHOWNORMAL: i32 = 1;
-        let open: Vec<u16> = "open\0".encode_utf16().collect();
+        // Take the binding from the `windows` crate rather than writing the
+        // declaration here. A hand-written one is what put the wrong width on
+        // `SendMessageTimeoutA`'s out-parameter in `default_browser.rs`, and
+        // that killed the process on every click of "Set as default browser".
+        // No compiler and no lint can see such a mistake. The generated binding
+        // cannot drift from the real ABI, so there is nothing to get wrong.
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
         let result = unsafe {
           ShellExecuteW(
-            std::ptr::null_mut(),
-            open.as_ptr(),
-            file_w.as_ptr(),
-            params_w.as_ptr(),
-            std::ptr::null(),
+            None,
+            w!("open"),
+            PCWSTR(file_w.as_ptr()),
+            PCWSTR(params_w.as_ptr()),
+            PCWSTR::null(),
             SW_SHOWNORMAL,
           )
         };
 
-        if result as usize <= 32 {
-          return Err(format!("ShellExecuteW failed with code {result}").into());
+        // ShellExecuteW reports success as a value above 32. Anything at or
+        // below that is an error code wearing a handle's type. Read it as a
+        // signed value: the old `as usize` turned every negative code into a
+        // very large number, which read as success.
+        let code = result.0 as isize;
+        if code <= 32 {
+          return Err(format!("ShellExecuteW failed with code {code}").into());
         }
-      } else {
-        // No pending installer — just restart the app. Use a minimal
-        // detached process to relaunch after we exit.
-        let app_path = self.get_current_app_path()?;
-        let current_pid = std::process::id();
-        let temp_dir = std::env::temp_dir();
-        let script_path = temp_dir.join("donut_restart.bat");
-
-        let script_content = format!(
-          "@echo off\n\
-           :w\n\
-           tasklist /fi \"PID eq {current_pid}\" 2>nul | find \"{current_pid}\" >nul && (timeout /t 1 /nobreak >nul & goto w)\n\
-           timeout /t 1 /nobreak >nul\n\
-           start \"\" \"{app}\"\n\
-           del \"%~f0\"\n",
-          app = app_path.to_str().unwrap(),
+        log::info!(
+          "Update installer launched via ShellExecuteW file={:?} params={:?}; exiting so it can replace the app",
+          file,
+          parameters
         );
-        fs::write(&script_path, script_content)?;
-
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let _child = Command::new("cmd")
-          .args(["/C", script_path.to_str().unwrap()])
-          .creation_flags(CREATE_NO_WINDOW)
-          .spawn()?;
+      } else {
+        Self::relaunch_after_exit(&self.get_current_app_path()?)?;
       }
 
       tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -2017,7 +2238,11 @@ rm "{}"
       use std::os::unix::process::CommandExt;
       cmd.process_group(0);
 
-      let _child = cmd.spawn()?;
+      let child = cmd.spawn()?;
+      log::info!(
+        "Process spawned pid={} purpose=\"relaunch after exit\" waits_for_pid={current_pid}",
+        child.id()
+      );
 
       // Give the script a moment to start
       tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -2041,21 +2266,7 @@ pub async fn check_for_app_updates() -> Result<Option<AppUpdateInfo>, String> {
   if crate::e2e_automation_enabled()
     && std::env::var_os("DONUT_E2E_DISABLE_STARTUP_NETWORK").is_some()
   {
-    log::info!("E2E: skipping automatic app update check");
-    return Ok(None);
-  }
-
-  if crate::app_dirs::is_portable() {
-    log::info!("App auto-updates disabled in portable mode");
-    return Ok(None);
-  }
-  // The disable_auto_updates setting controls app self-updates only
-  let disabled = crate::settings_manager::SettingsManager::instance()
-    .load_settings()
-    .map(|s| s.disable_auto_updates)
-    .unwrap_or(false);
-  if disabled {
-    log::info!("App auto-updates disabled by user setting");
+    log::debug!("App update check skipped reason=e2e");
     return Ok(None);
   }
 
@@ -2063,7 +2274,22 @@ pub async fn check_for_app_updates() -> Result<Option<AppUpdateInfo>, String> {
   updater
     .check_for_updates()
     .await
+    .map(with_install_policy)
     .map_err(|e| format!("Failed to check for app updates: {e}"))
+}
+
+/// Every install hears about a new version, also a portable one and one with
+/// automatic updates off; only how it installs differs.
+fn with_install_policy(update: Option<AppUpdateInfo>) -> Option<AppUpdateInfo> {
+  // The disable_auto_updates setting controls app self-updates only.
+  let auto_updates_disabled = crate::settings_manager::SettingsManager::instance()
+    .load_settings()
+    .map(|s| s.disable_auto_updates)
+    .unwrap_or(false);
+  // Releases ship a portable ZIP for Windows only. Anywhere else a `.portable`
+  // copy would lose its marker to the installer.
+  let replaced_by_hand = crate::app_dirs::is_portable() && !cfg!(target_os = "windows");
+  update.map(|info| info.with_install_policy(replaced_by_hand, auto_updates_disabled))
 }
 
 #[tauri::command]
@@ -2102,17 +2328,137 @@ pub async fn check_for_app_updates_manual() -> Result<Option<AppUpdateInfo>, Str
   if crate::e2e_automation_enabled()
     && std::env::var_os("DONUT_E2E_DISABLE_STARTUP_NETWORK").is_some()
   {
-    log::info!("E2E: skipping manual app update check");
+    log::debug!("App update check skipped reason=e2e manual=true");
     return Ok(None);
   }
 
-  log::info!("Manual app update check triggered");
   let updater = AppAutoUpdater::instance();
   updater
-    .check_for_updates()
+    .check(true)
     .await
+    .map(with_install_policy)
     .map_err(|e| format!("Failed to check for app updates: {e}"))
 }
+
+// Global singleton instance
+static APP_AUTO_UPDATER: std::sync::LazyLock<AppAutoUpdater> =
+  std::sync::LazyLock::new(AppAutoUpdater::new);
+static APP_UPDATE_CHECK_STREAK: crate::log_streak::Streak =
+  crate::log_streak::Streak::new(module_path!(), "App update check");
+/// One source failing while the other answers; keyed by source.
+static APP_UPDATE_SOURCE_STREAK: crate::log_streak::KeyedStreak =
+  crate::log_streak::KeyedStreak::new(module_path!(), "App update source");
+/// `<latest> <result>` of the previous check, so an unchanged outcome logs at debug.
+static APP_UPDATE_LAST_OUTCOME: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// When the periodic check runs next; any check, also one the window asked
+/// for, moves it.
+static NEXT_CHECK_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+fn schedule_next_check(after: std::time::Duration) {
+  if let Ok(mut next) = NEXT_CHECK_AT.lock() {
+    *next = Some(std::time::Instant::now() + after);
+  }
+}
+
+/// Every release the sources listed, once, newest first. When both list a
+/// release, the copy that already carries SHA256SUMS.txt wins, so the source
+/// that saw it first is not held back by the other.
+fn merge_releases(lists: impl IntoIterator<Item = Vec<AppRelease>>) -> Vec<AppRelease> {
+  let mut merged: Vec<AppRelease> = Vec::new();
+  for release in lists.into_iter().flatten() {
+    match merged.iter_mut().find(|r| r.tag_name == release.tag_name) {
+      Some(known) => {
+        let has_sums = |r: &AppRelease| AppAutoUpdater::find_checksums_url(&r.assets).is_some();
+        if !has_sums(known) && has_sums(&release) {
+          *known = release;
+        }
+      }
+      None => merged.push(release),
+    }
+  }
+  // RFC 3339 times of one format sort as text.
+  merged.sort_by(|a, b| b.published_at.cmp(&a.published_at));
+  merged
+}
+
+/// Checks for an update once an hour, or sooner after a check that found
+/// the newest release not ready yet or reached no source, and tells the
+/// window about an update it finds. The window's own check at startup
+/// counts, so the two do not ask twice.
+pub async fn run_periodic_checks() {
+  const TICK: std::time::Duration = std::time::Duration::from_secs(60);
+  // The window checks at startup; this check runs only if it has not.
+  schedule_next_check(std::time::Duration::from_secs(2 * 60));
+  loop {
+    tokio::time::sleep(TICK).await;
+    let due = NEXT_CHECK_AT
+      .lock()
+      .map(|next| next.is_none_or(|at| std::time::Instant::now() >= at))
+      .unwrap_or(true);
+    if !due {
+      continue;
+    }
+    // Moves the schedule itself; the line after a failure is the check's.
+    if let Ok(Some(update_info)) = check_for_app_updates().await {
+      if let Err(e) = events::emit("app-update-available", &update_info) {
+        log::error!("Emit app-update-available failed err=\"{e}\"");
+      }
+    }
+  }
+}
+
+fn exit_code(status: &std::process::ExitStatus) -> String {
+  status
+    .code()
+    .map_or_else(|| "signal".to_string(), |code| code.to_string())
+}
+
+/// `Command::output`, with the spawn and the exit logged by pid.
+fn output_logged(cmd: &mut Command, purpose: &str) -> std::io::Result<std::process::Output> {
+  let started = std::time::Instant::now();
+  let child = cmd
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()?;
+  let pid = child.id();
+  log::info!("Process spawned pid={pid} purpose=\"{purpose}\"");
+  let output = child.wait_with_output()?;
+  log::info!(
+    "Process exited pid={pid} purpose=\"{purpose}\" code={} elapsed_ms={}",
+    exit_code(&output.status),
+    started.elapsed().as_millis()
+  );
+  Ok(output)
+}
+
+/// `Command::status`, with the spawn and the exit logged by pid.
+#[cfg(target_os = "linux")]
+fn status_logged(cmd: &mut Command, purpose: &str) -> std::io::Result<std::process::ExitStatus> {
+  let started = std::time::Instant::now();
+  let mut child = cmd.spawn()?;
+  let pid = child.id();
+  log::info!("Process spawned pid={pid} purpose=\"{purpose}\"");
+  let status = child.wait()?;
+  log::info!(
+    "Process exited pid={pid} purpose=\"{purpose}\" code={} elapsed_ms={}",
+    exit_code(&status),
+    started.elapsed().as_millis()
+  );
+  Ok(status)
+}
+
+/// A downloaded Windows update that runs at "Restart now".
+#[cfg(target_os = "windows")]
+enum PendingUpdate {
+  /// An NSIS or MSI installer.
+  Installer(PathBuf),
+  /// The unpacked files of the portable ZIP.
+  Portable(PathBuf),
+}
+
+#[cfg(target_os = "windows")]
+static PENDING_UPDATE: std::sync::Mutex<Option<PendingUpdate>> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
 mod tests {
@@ -2223,48 +2569,6 @@ mod tests {
         || error_msg.contains("unknown")
         || error_msg.contains("unsupported"),
       "Error should mention unsupported format, got: {error_msg}"
-    );
-  }
-
-  #[test]
-  fn test_find_checksum_for_file() {
-    let sums = "\
-0e5a4601745092b7d1c93c1e7e1c30d923be3d1e916b661bd53d1c0c9c7f0a11  Donut_0.29.0_aarch64.dmg
-ABCDEF01745092B7D1C93C1E7E1C30D923BE3D1E916B661BD53D1C0C9C7F0A22 *Donut_0.29.0_x64.dmg
-not-a-hash  Donut_0.29.0_amd64.deb
-";
-
-    // Plain entry.
-    assert_eq!(
-      AppAutoUpdater::find_checksum_for_file(sums, "Donut_0.29.0_aarch64.dmg").as_deref(),
-      Some("0e5a4601745092b7d1c93c1e7e1c30d923be3d1e916b661bd53d1c0c9c7f0a11")
-    );
-    // Binary-mode marker is stripped; hash is normalized to lowercase.
-    assert_eq!(
-      AppAutoUpdater::find_checksum_for_file(sums, "Donut_0.29.0_x64.dmg").as_deref(),
-      Some("abcdef01745092b7d1c93c1e7e1c30d923be3d1e916b661bd53d1c0c9c7f0a22")
-    );
-    // Entries with malformed hashes are rejected rather than trusted.
-    assert_eq!(
-      AppAutoUpdater::find_checksum_for_file(sums, "Donut_0.29.0_amd64.deb"),
-      None
-    );
-    // Missing file.
-    assert_eq!(
-      AppAutoUpdater::find_checksum_for_file(sums, "Donut_0.29.0_arm64.deb"),
-      None
-    );
-  }
-
-  #[test]
-  fn test_sha256_file_matches_known_digest() {
-    let temp_dir = tempfile::TempDir::new().unwrap();
-    let path = temp_dir.path().join("data.bin");
-    std::fs::write(&path, b"hello world").unwrap();
-    assert_eq!(
-      AppAutoUpdater::sha256_file(&path).unwrap(),
-      // sha256 of "hello world"
-      "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
     );
   }
 
@@ -2591,10 +2895,101 @@ not-a-hash  Donut_0.29.0_amd64.deb
     let _deb = AppAutoUpdater::is_deb_repo_configured();
     let _rpm = AppAutoUpdater::is_rpm_repo_configured();
   }
-}
 
-// Global singleton instance
-lazy_static::lazy_static! {
-  static ref APP_AUTO_UPDATER: AppAutoUpdater = AppAutoUpdater::new();
-  static ref PENDING_INSTALLER_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+  fn update_info(manual_update_required: bool) -> AppUpdateInfo {
+    AppUpdateInfo {
+      current_version: "v0.34.0".to_string(),
+      new_version: "v0.35.0".to_string(),
+      release_notes: String::new(),
+      download_url: "https://example.invalid/Donut.msi".to_string(),
+      is_nightly: false,
+      published_at: String::new(),
+      manual_update_required,
+      release_page_url: None,
+      repo_update: false,
+      checksums_url: None,
+      asset_digest: None,
+      auto_install: !manual_update_required,
+    }
+  }
+
+  #[test]
+  fn an_installed_app_with_automatic_updates_installs_by_itself() {
+    let info = update_info(false).with_install_policy(false, false);
+    assert!(info.auto_install);
+    assert!(!info.manual_update_required);
+  }
+
+  #[test]
+  fn automatic_updates_off_still_reports_the_update_and_waits() {
+    let info = update_info(false).with_install_policy(false, true);
+    assert!(!info.auto_install);
+    assert!(!info.manual_update_required);
+    assert_eq!(info.new_version, "v0.35.0");
+  }
+
+  #[test]
+  fn a_copy_replaced_by_hand_is_told_to_download() {
+    for disabled in [false, true] {
+      let info = update_info(false).with_install_policy(true, disabled);
+      assert!(info.manual_update_required);
+      assert!(!info.auto_install);
+    }
+  }
+
+  #[test]
+  fn a_manual_update_never_installs_by_itself() {
+    let info = update_info(true).with_install_policy(false, false);
+    assert!(!info.auto_install);
+  }
+
+  fn listed(tag: &str, published_at: &str, with_sums: bool) -> AppRelease {
+    let mut assets = vec![AppReleaseAsset {
+      name: "Donut_aarch64.dmg".to_string(),
+      browser_download_url: format!("https://example.com/{tag}/Donut_aarch64.dmg"),
+      size: 1,
+      digest: None,
+    }];
+    if with_sums {
+      assets.push(AppReleaseAsset {
+        name: "SHA256SUMS.txt".to_string(),
+        browser_download_url: format!("https://example.com/{tag}/SHA256SUMS.txt"),
+        size: 1,
+        digest: None,
+      });
+    }
+    AppRelease {
+      tag_name: tag.to_string(),
+      name: tag.to_string(),
+      body: String::new(),
+      published_at: published_at.to_string(),
+      prerelease: tag.starts_with("nightly-"),
+      assets,
+    }
+  }
+
+  #[test]
+  fn releases_from_both_sources_are_merged_newest_first() {
+    let github = vec![
+      listed("v0.35.2", "2026-10-24T10:00:00Z", false),
+      listed("v0.35.1", "2026-10-23T04:39:59Z", true),
+    ];
+    let donut = vec![
+      listed("nightly-2026-10-24-abc1234", "2026-10-24T12:00:00Z", true),
+      listed("v0.35.2", "2026-10-24T10:00:00Z", true),
+    ];
+    let merged = merge_releases([github, donut]);
+    let tags: Vec<&str> = merged.iter().map(|r| r.tag_name.as_str()).collect();
+    assert_eq!(tags, ["nightly-2026-10-24-abc1234", "v0.35.2", "v0.35.1"]);
+    // The source that already lists SHA256SUMS.txt wins for v0.35.2.
+    assert!(AppAutoUpdater::find_checksums_url(&merged[1].assets).is_some());
+  }
+
+  #[test]
+  fn a_release_github_lists_without_notes_still_parses() {
+    let json = r#"{"tag_name":"v0.35.2","name":null,"body":null,"published_at":null,"prerelease":false,"assets":[]}"#;
+    let release: AppRelease = serde_json::from_str(json).unwrap();
+    assert_eq!(release.tag_name, "v0.35.2");
+    assert!(release.body.is_empty() && release.name.is_empty());
+  }
 }

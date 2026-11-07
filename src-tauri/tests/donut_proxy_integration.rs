@@ -104,6 +104,320 @@ struct ProxyTestTracker {
   binary_path: std::path::PathBuf,
 }
 
+struct ProxyWorkerProcess {
+  child: std::process::Child,
+  config_id: String,
+}
+
+#[tokio::test]
+#[serial]
+#[cfg(unix)]
+async fn test_worker_connection_pressure_respects_its_descriptor_limit(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+  use donutbrowser_lib::proxy_storage::{
+    generate_proxy_id, get_proxy_config, save_proxy_config, ProxyConfig,
+  };
+  use std::os::unix::process::CommandExt;
+
+  let isolated_root = tempfile::tempdir()?;
+  let _data_root = EnvironmentRestore::set_path("DONUTBROWSER_DATA_ROOT", isolated_root.path());
+  let binary_path = setup_test().await?;
+  let id = generate_proxy_id();
+  let config = ProxyConfig::new(id.clone(), "DIRECT".to_string(), Some(0))
+    .with_local_protocol(Some("socks5".to_string()));
+  save_proxy_config(&config).map_err(|error| error.to_string())?;
+  let log_path = isolated_root.path().join("worker.log");
+  let mut command = std::process::Command::new(binary_path);
+  command
+    .args(["proxy-worker", "start", "--id", &id])
+    .stdout(std::process::Stdio::null())
+    .stderr(std::fs::File::create(&log_path)?);
+  unsafe {
+    command.pre_exec(|| {
+      let limit = libc::rlimit {
+        rlim_cur: 128,
+        rlim_max: 128,
+      };
+      if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+        return Err(std::io::Error::last_os_error());
+      }
+      Ok(())
+    });
+  }
+  let _worker = ProxyWorkerProcess {
+    child: command.spawn()?,
+    config_id: id.clone(),
+  };
+  let ready = tokio::time::timeout(Duration::from_secs(10), async {
+    loop {
+      if let Some(ready) = get_proxy_config(&id).filter(|config| config.local_url.is_some()) {
+        break ready;
+      }
+      sleep(Duration::from_millis(20)).await;
+    }
+  })
+  .await?;
+  let port = ready.local_port.unwrap();
+  let mut clients = Vec::new();
+  // Fill the descriptor limit without exceeding macOS's 128-entry listen
+  // backlog: queued connections must wait outside the worker's descriptor set.
+  for index in 0..128 {
+    let mut stream = tokio::time::timeout(
+      Duration::from_secs(5),
+      TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    .map_err(|error| format!("queued connection {index}: {error}"))??;
+    stream.write_all(&[5, 1, 0]).await?;
+    clients.push(stream);
+  }
+  let mut greeting = [0; 2];
+  tokio::time::timeout(Duration::from_secs(5), clients[0].read_exact(&mut greeting)).await??;
+  assert_eq!(greeting, [5, 0]);
+  sleep(Duration::from_millis(500)).await;
+  drop(clients);
+  let log = std::fs::read_to_string(log_path)?;
+  assert!(
+    !log.contains("Too many open files"),
+    "worker exhausted its descriptors: {log}"
+  );
+  assert!(
+    log.contains("connections=10"),
+    "worker must use its actual hard limit"
+  );
+
+  let (target_port, target) = start_mock_http_server("AFTER-CONNECTION-PRESSURE").await;
+  let response = reqwest::Client::builder()
+    .proxy(reqwest::Proxy::all(ready.local_url.as_ref().unwrap())?)
+    .timeout(Duration::from_secs(5))
+    .build()?
+    .get(format!("http://127.0.0.1:{target_port}/"))
+    .send()
+    .await?;
+  assert_eq!(response.text().await?, "AFTER-CONNECTION-PRESSURE");
+  target.abort();
+  Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_dead_worker_recovers_its_route_and_retries_an_occupied_port(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+  use donutbrowser_lib::proxy_runner::recover_proxy_process;
+  use donutbrowser_lib::proxy_storage::{
+    generate_proxy_id, get_proxy_config, process_start_time, save_proxy_config, ProxyConfig,
+  };
+
+  let isolated_root = tempfile::tempdir()?;
+  let _data_root = EnvironmentRestore::set_path("DONUTBROWSER_DATA_ROOT", isolated_root.path());
+  let binary_path = setup_test().await?;
+  let mut tracker = ProxyTestTracker::new(binary_path.clone());
+  let (upstream_port, upstream) = start_mock_http_server("RECOVERED-UPSTREAM").await;
+  let blocklist = isolated_root.path().join("allowlist.txt");
+  std::fs::write(&blocklist, "recovery.invalid\n")?;
+  let id = generate_proxy_id();
+  let mut config = ProxyConfig::new(
+    id.clone(),
+    format!("http://user:password@127.0.0.1:{upstream_port}"),
+    Some(0),
+  )
+  .with_profile_id(Some("recovery-test".to_string()))
+  .with_bypass_rules(vec!["bypass.invalid".to_string()])
+  .with_blocklist_file(Some(blocklist.to_string_lossy().to_string()))
+  .with_dns_allowlist_mode(true)
+  .with_local_protocol(Some("http".to_string()))
+  .with_record_domains(false);
+  config.browser_pid = Some(std::process::id());
+  config.browser_pid_start_time = process_start_time(std::process::id());
+  config.ignore_proxy_certificate = Some(true);
+  save_proxy_config(&config).map_err(|error| error.to_string())?;
+  tracker.track_proxy(id.clone());
+  let mut worker = ProxyWorkerProcess {
+    child: std::process::Command::new(&binary_path)
+      .args(["proxy-worker", "start", "--id", &id])
+      .stdout(std::process::Stdio::null())
+      .stderr(std::process::Stdio::null())
+      .spawn()?,
+    config_id: id.clone(),
+  };
+  let original = tokio::time::timeout(Duration::from_secs(10), async {
+    loop {
+      if let Some(ready) = get_proxy_config(&id).filter(|config| config.local_url.is_some()) {
+        break ready;
+      }
+      sleep(Duration::from_millis(20)).await;
+    }
+  })
+  .await?;
+  assert!(recover_proxy_process(&id)
+    .await
+    .map_err(|error| error.to_string())?
+    .is_none());
+  worker.child.kill()?;
+  worker.child.wait()?;
+
+  let mut wrong_owner = original.clone();
+  wrong_owner.browser_pid_start_time = Some(1);
+  save_proxy_config(&wrong_owner).map_err(|error| error.to_string())?;
+  assert!(recover_proxy_process(&id)
+    .await
+    .map_err(|error| error.to_string())?
+    .is_none());
+  save_proxy_config(&original).map_err(|error| error.to_string())?;
+
+  let port = original.local_port.unwrap();
+  let occupied = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+  assert!(recover_proxy_process(&id).await.is_err());
+  assert!(
+    get_proxy_config(&id).is_some(),
+    "a failed restart must keep its route"
+  );
+  drop(occupied);
+
+  let recovered = recover_proxy_process(&id)
+    .await
+    .map_err(|error| error.to_string())?
+    .expect("worker recovered");
+  assert_ne!(recovered.pid, original.pid);
+  let mut expected = original.clone();
+  expected.pid = recovered.pid;
+  assert_eq!(
+    serde_json::to_value(&recovered)?,
+    serde_json::to_value(expected)?
+  );
+
+  let client = reqwest::Client::builder()
+    .proxy(reqwest::Proxy::all(recovered.local_url.as_ref().unwrap())?)
+    .timeout(Duration::from_secs(5))
+    .build()?;
+  let response = client.get("http://recovery.invalid/").send().await?;
+  assert_eq!(response.text().await?, "RECOVERED-UPSTREAM");
+  assert_eq!(
+    client.get("http://blocked.invalid/").send().await?.status(),
+    reqwest::StatusCode::FORBIDDEN
+  );
+
+  let stopped = TestUtils::execute_command(&binary_path, &["proxy", "stop", "--id", &id]).await?;
+  assert!(stopped.status.success());
+  assert!(
+    recover_proxy_process(&id)
+      .await
+      .map_err(|error| error.to_string())?
+      .is_none(),
+    "a requested stop must stay stopped"
+  );
+  upstream.abort();
+  Ok(())
+}
+
+impl Drop for ProxyWorkerProcess {
+  fn drop(&mut self) {
+    let _ = self.child.kill();
+    let _ = self.child.wait();
+    donutbrowser_lib::proxy_storage::delete_proxy_config(&self.config_id);
+  }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_worker_publishes_its_pid_with_readiness(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+  use donutbrowser_lib::proxy_storage::{
+    generate_proxy_id, get_proxy_config, save_proxy_config, ProxyConfig,
+  };
+
+  let binary_path = setup_test().await?;
+  let config_id = generate_proxy_id();
+  let config = ProxyConfig::new(config_id.clone(), "DIRECT".to_string(), Some(0))
+    .with_local_protocol(Some("socks5".to_string()));
+  save_proxy_config(&config).map_err(|error| error.to_string())?;
+  let worker = ProxyWorkerProcess {
+    child: std::process::Command::new(&binary_path)
+      .args(["proxy-worker", "start", "--id", &config_id])
+      .stdin(std::process::Stdio::null())
+      .stdout(std::process::Stdio::null())
+      .stderr(std::process::Stdio::null())
+      .spawn()?,
+    config_id: config_id.clone(),
+  };
+
+  let ready = tokio::time::timeout(Duration::from_secs(10), async {
+    loop {
+      if let Some(config) = get_proxy_config(&config_id) {
+        if config.local_url.is_some() {
+          break config;
+        }
+      }
+      sleep(Duration::from_millis(20)).await;
+    }
+  })
+  .await?;
+
+  assert_eq!(ready.pid, Some(worker.child.id()));
+  let port = ready.local_port.unwrap();
+  assert_eq!(ready.local_url, Some(format!("socks5://127.0.0.1:{port}")));
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
+  stream.write_all(&[5, 1, 0]).await?;
+  let mut response = [0; 2];
+  tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut response)).await??;
+  assert_eq!(response, [5, 0]);
+
+  let stopped =
+    TestUtils::execute_command(&binary_path, &["proxy", "stop", "--id", &config_id]).await?;
+  assert!(stopped.status.success());
+  assert!(wait_for_port_closed(port, Duration::from_secs(5)).await);
+  assert!(get_proxy_config(&config_id).is_none());
+  Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_concurrent_proxy_starts_keep_worker_state(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+  use donutbrowser_lib::proxy_storage::{get_proxy_config, is_process_running};
+
+  let binary_path = setup_test().await?;
+  let mut tracker = ProxyTestTracker::new(binary_path.clone());
+  let results = futures_util::future::join_all((0..8).map(|_| {
+    TestUtils::execute_command(
+      &binary_path,
+      &["proxy", "start", "--local-protocol", "socks5"],
+    )
+  }))
+  .await;
+  let mut failures = Vec::new();
+  let mut workers = Vec::new();
+  for result in results {
+    match result {
+      Ok(output) if output.status.success() => {
+        let config: Value = serde_json::from_slice(&output.stdout)?;
+        let id = config["id"].as_str().unwrap().to_string();
+        tracker.track_proxy(id.clone());
+        workers.push(id);
+      }
+      Ok(output) => failures.push(String::from_utf8_lossy(&output.stderr).into_owned()),
+      Err(error) => failures.push(error.to_string()),
+    }
+  }
+  assert!(failures.is_empty(), "{}", failures.join("\n"));
+  let mut pids = std::collections::HashSet::new();
+  for id in workers {
+    let config = get_proxy_config(&id).unwrap();
+    let pid = config.pid.unwrap();
+    assert!(pids.insert(pid));
+    assert!(is_process_running(pid));
+    let port = config.local_port.unwrap();
+    assert_eq!(config.local_url, Some(format!("socks5://127.0.0.1:{port}")));
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
+    stream.write_all(&[5, 1, 0]).await?;
+    let mut response = [0; 2];
+    tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut response)).await??;
+    assert_eq!(response, [5, 0]);
+  }
+  tracker.cleanup_all().await;
+  Ok(())
+}
+
 impl ProxyTestTracker {
   fn new(binary_path: std::path::PathBuf) -> Self {
     Self {
@@ -260,7 +574,7 @@ async fn test_xray_reality_chain_and_local_traffic_monitoring(
     return Ok(());
   };
 
-  let parsed = donutbrowser_lib::xray::parse_vless_uri(&vless_uri)?;
+  let parsed = donutbrowser_lib::xray::parse_share_link(&vless_uri)?;
   let endpoint_is_loopback = parsed.config.address == "localhost"
     || parsed
       .config
@@ -325,7 +639,9 @@ async fn test_xray_reality_chain_and_local_traffic_monitoring(
     Vec::new(),
     None,
     false,
+    None,
     Some("http".to_string()),
+    true,
   )
   .await?;
   cleanup.outer_id = Some(outer.id.clone());
@@ -1413,11 +1729,23 @@ async fn test_no_bypass_rules_all_through_upstream(
 /// Start a minimal SOCKS5 proxy that tunnels connections to the real destination.
 /// Returns (port, JoinHandle).
 async fn start_mock_socks5_server() -> (u16, tokio::task::JoinHandle<()>) {
+  let (port, _, handle) = start_recording_socks5_server().await;
+  (port, handle)
+}
+
+type SeenTargets = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// `start_mock_socks5_server`, also recording every requested target as
+/// `host:port`, exactly as the client named it.
+async fn start_recording_socks5_server() -> (u16, SeenTargets, tokio::task::JoinHandle<()>) {
   let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
   let port = listener.local_addr().unwrap().port();
+  let seen = SeenTargets::default();
+  let recorder = seen.clone();
 
   let handle = tokio::spawn(async move {
     while let Ok((mut client, _)) = listener.accept().await {
+      let recorder = recorder.clone();
       tokio::spawn(async move {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1463,6 +1791,10 @@ async fn start_mock_socks5_server() -> (u16, tokio::task::JoinHandle<()>) {
           }
           _ => return,
         };
+        recorder
+          .lock()
+          .unwrap()
+          .push(format!("{target_host}:{target_port}"));
 
         // Connect to target
         let target =
@@ -1495,7 +1827,7 @@ async fn start_mock_socks5_server() -> (u16, tokio::task::JoinHandle<()>) {
   });
 
   sleep(Duration::from_millis(100)).await;
-  (port, handle)
+  (port, seen, handle)
 }
 
 /// Test that a SOCKS5 upstream proxy works end-to-end through donut-proxy.
@@ -1831,7 +2163,9 @@ async fn start_lifecycle_worker(
     Vec::new(),
     None,
     false,
+    None,
     Some("http".to_string()),
+    true,
   )
   .await
   .map_err(|error| error.to_string().into())
@@ -1970,5 +2304,518 @@ async fn worker_exits_when_its_config_is_deleted(
   );
 
   tracker.cleanup_all().await;
+  Ok(())
+}
+
+/// The Xray-core binary that `download-xray.mjs` placed in `src-tauri/binaries`,
+/// which is also the one `donut-proxy` finds from a test build.
+fn bundled_xray_binary() -> std::path::PathBuf {
+  let binaries = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries");
+  std::fs::read_dir(&binaries)
+    .ok()
+    .into_iter()
+    .flatten()
+    .flatten()
+    .map(|entry| entry.path())
+    .find(|path| {
+      path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+          name.starts_with("xray-") && !name.contains("LICENSE") && !name.contains(".source")
+        })
+    })
+    .unwrap_or_else(|| {
+      panic!(
+        "no Xray-core binary in {}; run `node src-tauri/download-xray.mjs`",
+        binaries.display()
+      )
+    })
+}
+
+/// One HTTP GET through an authenticated SOCKS5 endpoint, returning the body.
+async fn get_through_authenticated_socks5(
+  socks_port: u16,
+  username: &str,
+  password: &str,
+  target_port: u16,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+  let mut stream = TcpStream::connect(("127.0.0.1", socks_port)).await?;
+  stream.write_all(&[5, 1, 2]).await?;
+  let mut method = [0_u8; 2];
+  stream.read_exact(&mut method).await?;
+  if method != [5, 2] {
+    return Err(format!("SOCKS5 endpoint chose method {method:?}, not password").into());
+  }
+  let mut auth = vec![1, username.len() as u8];
+  auth.extend_from_slice(username.as_bytes());
+  auth.push(password.len() as u8);
+  auth.extend_from_slice(password.as_bytes());
+  stream.write_all(&auth).await?;
+  let mut auth_reply = [0_u8; 2];
+  stream.read_exact(&mut auth_reply).await?;
+  if auth_reply != [1, 0] {
+    return Err("SOCKS5 endpoint rejected the credentials".into());
+  }
+  let mut connect = vec![5, 1, 0, 1, 127, 0, 0, 1];
+  connect.extend_from_slice(&target_port.to_be_bytes());
+  stream.write_all(&connect).await?;
+  let mut reply = [0_u8; 10];
+  stream.read_exact(&mut reply).await?;
+  if reply[1] != 0 {
+    return Err(format!("SOCKS5 CONNECT failed with reply {}", reply[1]).into());
+  }
+  stream
+    .write_all(
+      format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{target_port}\r\nConnection: close\r\n\r\n")
+        .as_bytes(),
+    )
+    .await?;
+  let mut response = Vec::new();
+  tokio::time::timeout(Duration::from_secs(15), stream.read_to_end(&mut response)).await??;
+  let body_start = response
+    .windows(4)
+    .position(|window| window == b"\r\n\r\n")
+    .ok_or("no HTTP response through the SOCKS5 endpoint")?
+    + 4;
+  Ok(response[body_start..].to_vec())
+}
+
+async fn port_refuses_connections(port: u16) -> bool {
+  for _ in 0..100 {
+    if TcpStream::connect(("127.0.0.1", port)).await.is_err() {
+      return true;
+    }
+    sleep(Duration::from_millis(100)).await;
+  }
+  false
+}
+
+/// Runs `donut-proxy xray ...` with `input` on stdin, where `start` reads the
+/// share link.
+async fn run_xray_cli(
+  binary: std::path::PathBuf,
+  cache: std::path::PathBuf,
+  args: Vec<String>,
+  input: String,
+) -> std::io::Result<std::process::Output> {
+  let mut child = tokio::process::Command::new(binary)
+    .arg("xray")
+    .args(args)
+    .env("DONUTBROWSER_CACHE_DIR", cache)
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()?;
+  let mut stdin = child.stdin.take().expect("stdin is piped");
+  stdin.write_all(input.as_bytes()).await?;
+  drop(stdin);
+  child.wait_with_output().await
+}
+
+/// `donut-proxy xray start|bind|stop` is what a remote host without the app
+/// drives, so its exit codes and output shape are a contract. This runs it
+/// against a real Xray-core VLESS server on loopback.
+#[tokio::test]
+#[serial]
+async fn test_xray_cli_contract() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+  let binary_path = setup_test().await?;
+  let xray = bundled_xray_binary();
+  let cache = tempfile::tempdir()?;
+  let (origin_port, _origin) = start_mock_http_server("XRAY-CLI-OK").await;
+
+  let server_port = {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    listener.local_addr()?.port()
+  };
+  let client_id = uuid::Uuid::new_v4().to_string();
+  let server_config = cache.path().join("server.json");
+  std::fs::write(
+    &server_config,
+    serde_json::json!({
+      "log": { "loglevel": "warning" },
+      "inbounds": [{
+        "listen": "127.0.0.1",
+        "port": server_port,
+        "protocol": "vless",
+        "settings": { "clients": [{ "id": client_id }], "decryption": "none" },
+        "streamSettings": { "network": "tcp" },
+      }],
+      "outbounds": [{ "protocol": "freedom" }],
+    })
+    .to_string(),
+  )?;
+  let mut server = std::process::Command::new(&xray)
+    .args(["run", "-c"])
+    .arg(&server_config)
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .spawn()?;
+  struct KillOnDrop(std::process::Child);
+  impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+      let _ = self.0.kill();
+      let _ = self.0.wait();
+    }
+  }
+  let mut server_ready = false;
+  for _ in 0..100 {
+    if TcpStream::connect(("127.0.0.1", server_port)).await.is_ok() {
+      server_ready = true;
+      break;
+    }
+    if server.try_wait()?.is_some() {
+      break;
+    }
+    sleep(Duration::from_millis(100)).await;
+  }
+  let _server = KillOnDrop(server);
+  assert!(server_ready, "the Xray-core test server did not listen");
+
+  let xray_cli = |args: &[&str], share_link: Option<&str>| {
+    run_xray_cli(
+      binary_path.clone(),
+      cache.path().to_path_buf(),
+      args.iter().map(|arg| arg.to_string()).collect(),
+      share_link
+        .map(|link| format!("{link}\n"))
+        .unwrap_or_default(),
+    )
+  };
+  let owner = std::process::id().to_string();
+
+  let missing = xray_cli(&["start", "--owner-pid", &owner], None).await?;
+  assert_eq!(missing.status.code(), Some(2));
+  assert!(String::from_utf8_lossy(&missing.stderr).contains("stdin"));
+
+  let malformed = xray_cli(
+    &["start", "--owner-pid", &owner],
+    Some("vless://not-a-uuid@127.0.0.1:1"),
+  )
+  .await?;
+  assert_eq!(malformed.status.code(), Some(1));
+  assert!(String::from_utf8_lossy(&malformed.stderr).contains("VLESS_CONFIG_INVALID"));
+
+  let link = format!("vless://{client_id}@127.0.0.1:{server_port}?type=tcp&security=none#cli");
+  let started = xray_cli(&["start", "--owner-pid", &owner], Some(&link)).await?;
+  assert!(
+    started.status.success(),
+    "xray start failed: {}",
+    String::from_utf8_lossy(&started.stderr)
+  );
+  let worker: Value = serde_json::from_slice(&started.stdout)?;
+  let id = worker["id"].as_str().ok_or("no id")?.to_string();
+  let local_port = worker["localPort"].as_u64().ok_or("no localPort")? as u16;
+  let username = worker["username"]
+    .as_str()
+    .ok_or("no username")?
+    .to_string();
+  let password = worker["password"]
+    .as_str()
+    .ok_or("no password")?
+    .to_string();
+  assert_eq!(
+    worker["localUrl"].as_str(),
+    Some(format!("socks5://127.0.0.1:{local_port}").as_str())
+  );
+  assert!(!username.is_empty() && !password.is_empty());
+  assert!(
+    !String::from_utf8_lossy(&started.stdout).contains(&client_id),
+    "the share link's secret must not be echoed"
+  );
+
+  let body =
+    get_through_authenticated_socks5(local_port, &username, &password, origin_port).await?;
+  assert_eq!(body, b"XRAY-CLI-OK");
+  assert!(
+    get_through_authenticated_socks5(local_port, &username, "wrong", origin_port)
+      .await
+      .is_err(),
+    "the worker accepted the wrong password"
+  );
+
+  // A rebound worker follows its new owner and exits with it.
+  #[cfg(unix)]
+  let mut new_owner = std::process::Command::new("sleep").arg("60").spawn()?;
+  #[cfg(windows)]
+  let mut new_owner = std::process::Command::new("ping")
+    .args(["-n", "60", "127.0.0.1"])
+    .stdout(std::process::Stdio::null())
+    .spawn()?;
+  let bound = xray_cli(
+    &["bind", "--id", &id, "--pid", &new_owner.id().to_string()],
+    None,
+  )
+  .await?;
+  assert!(bound.status.success());
+  assert_eq!(
+    serde_json::from_slice::<Value>(&bound.stdout)?["success"],
+    true
+  );
+  new_owner.kill()?;
+  new_owner.wait()?;
+  assert!(
+    port_refuses_connections(local_port).await,
+    "the worker outlived the owner it was bound to"
+  );
+
+  let restarted = xray_cli(&["start", "--owner-pid", &owner], Some(&link)).await?;
+  assert!(restarted.status.success());
+  let worker: Value = serde_json::from_slice(&restarted.stdout)?;
+  let id = worker["id"].as_str().ok_or("no id")?.to_string();
+  let local_port = worker["localPort"].as_u64().ok_or("no localPort")? as u16;
+  let stopped = xray_cli(&["stop", "--id", &id], None).await?;
+  assert!(stopped.status.success());
+  assert_eq!(
+    serde_json::from_slice::<Value>(&stopped.stdout)?["success"],
+    true
+  );
+  assert!(
+    port_refuses_connections(local_port).await,
+    "the worker survived stop"
+  );
+  let stopped_again = xray_cli(&["stop", "--id", &id], None).await?;
+  assert_eq!(
+    serde_json::from_slice::<Value>(&stopped_again.stdout)?["success"],
+    false
+  );
+  let bind_missing = xray_cli(&["bind", "--id", &id, "--pid", &owner], None).await?;
+  assert_eq!(
+    serde_json::from_slice::<Value>(&bind_missing.stdout)?["success"],
+    false
+  );
+
+  Ok(())
+}
+
+/// A DNS-over-TCP server that answers every A query with 127.0.0.1 and every
+/// other query with no records.
+async fn start_mock_dns_server() -> (u16, tokio::task::JoinHandle<()>) {
+  let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let port = listener.local_addr().unwrap().port();
+  let handle = tokio::spawn(async move {
+    while let Ok((mut stream, _)) = listener.accept().await {
+      tokio::spawn(async move {
+        loop {
+          let mut len = [0u8; 2];
+          if stream.read_exact(&mut len).await.is_err() {
+            return;
+          }
+          let mut query = vec![0u8; usize::from(u16::from_be_bytes(len))];
+          if stream.read_exact(&mut query).await.is_err() {
+            return;
+          }
+          let mut end = 12;
+          while query[end] != 0 {
+            end += 1 + query[end] as usize;
+          }
+          let qtype = u16::from_be_bytes([query[end + 1], query[end + 2]]);
+          let mut reply = query[..end + 5].to_vec();
+          reply[2] = 0x81;
+          reply[3] = 0x80;
+          reply[10..12].copy_from_slice(&[0, 0]);
+          if qtype == 1 {
+            reply[6..8].copy_from_slice(&1u16.to_be_bytes());
+            reply.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1]);
+          }
+          let mut framed = (reply.len() as u16).to_be_bytes().to_vec();
+          framed.extend_from_slice(&reply);
+          if stream.write_all(&framed).await.is_err() {
+            return;
+          }
+        }
+      });
+    }
+  });
+  (port, handle)
+}
+
+async fn start_worker_with_dns_server(
+  binary_path: &std::path::PathBuf,
+  socks_port: u16,
+  dns_server: &str,
+  local_protocol: &str,
+) -> Result<(String, u16), Box<dyn std::error::Error + Send + Sync>> {
+  let output = TestUtils::execute_command(
+    binary_path,
+    &[
+      "proxy",
+      "start",
+      "--host",
+      "127.0.0.1",
+      "--proxy-port",
+      &socks_port.to_string(),
+      "--type",
+      "socks5",
+      "--dns-server",
+      dns_server,
+      "--local-protocol",
+      local_protocol,
+    ],
+  )
+  .await?;
+  if !output.status.success() {
+    return Err(
+      format!(
+        "Proxy start failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+      )
+      .into(),
+    );
+  }
+  let config: Value = serde_json::from_str(&String::from_utf8(output.stdout)?)?;
+  let id = config["id"].as_str().unwrap().to_string();
+  let port = config["localPort"].as_u64().unwrap() as u16;
+  if !wait_for_port_open(port, Duration::from_secs(5)).await {
+    return Err("worker did not start listening".into());
+  }
+  Ok((id, port))
+}
+
+/// Everything the stream sends until it closes, or what arrived in 10s.
+async fn read_until_closed(stream: &mut TcpStream) -> String {
+  let mut response = Vec::new();
+  let _ = tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut response)).await;
+  String::from_utf8_lossy(&response).to_string()
+}
+
+/// A profile DNS server resolves every destination, and both the query and
+/// the connection go through the upstream: the upstream sees addresses only,
+/// never the name. A server that does not answer fails the request closed.
+#[tokio::test]
+#[serial]
+async fn test_profile_dns_server_resolves_through_the_upstream(
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+  let binary_path = setup_test().await?;
+  let mut tracker = ProxyTestTracker::new(binary_path.clone());
+  let (target_port, target_handle) = start_mock_http_server("PROFILE-DNS-TARGET").await;
+  let (dns_port, dns_handle) = start_mock_dns_server().await;
+  let (socks_port, seen, socks_handle) = start_recording_socks5_server().await;
+  let name = "profile-dns.test";
+  let dns_server = format!("tcp://127.0.0.1:{dns_port}");
+  let request =
+    format!("GET / HTTP/1.1\r\nHost: {name}:{target_port}\r\nConnection: close\r\n\r\n");
+
+  // HTTP front end, plain HTTP.
+  let (id, http_port) =
+    start_worker_with_dns_server(&binary_path, socks_port, &dns_server, "http").await?;
+  tracker.track_proxy(id);
+  let mut stream = TcpStream::connect(("127.0.0.1", http_port)).await?;
+  stream
+    .write_all(
+      format!(
+        "GET http://{name}:{target_port}/ HTTP/1.1\r\nHost: {name}:{target_port}\r\nConnection: close\r\n\r\n"
+      )
+      .as_bytes(),
+    )
+    .await?;
+  let response = read_until_closed(&mut stream).await;
+  assert!(
+    response.contains("PROFILE-DNS-TARGET"),
+    "plain HTTP must reach the resolved address, got: {response}"
+  );
+
+  // HTTP front end, CONNECT.
+  let mut stream = TcpStream::connect(("127.0.0.1", http_port)).await?;
+  stream
+    .write_all(
+      format!("CONNECT {name}:{target_port} HTTP/1.1\r\nHost: {name}:{target_port}\r\n\r\n")
+        .as_bytes(),
+    )
+    .await?;
+  let mut established = [0u8; 39];
+  stream.read_exact(&mut established).await?;
+  assert!(String::from_utf8_lossy(&established).starts_with("HTTP/1.1 200"));
+  stream.write_all(request.as_bytes()).await?;
+  let response = read_until_closed(&mut stream).await;
+  assert!(
+    response.contains("PROFILE-DNS-TARGET"),
+    "CONNECT must reach the resolved address, got: {response}"
+  );
+
+  // SOCKS5 front end, as Wayfern uses it.
+  let (id, socks5_local_port) =
+    start_worker_with_dns_server(&binary_path, socks_port, &dns_server, "socks5").await?;
+  tracker.track_proxy(id);
+  let mut stream = TcpStream::connect(("127.0.0.1", socks5_local_port)).await?;
+  stream.write_all(&[0x05, 0x01, 0x00]).await?;
+  let mut method = [0u8; 2];
+  stream.read_exact(&mut method).await?;
+  assert_eq!(method, [0x05, 0x00]);
+  let mut connect = vec![0x05, 0x01, 0x00, 0x03, name.len() as u8];
+  connect.extend_from_slice(name.as_bytes());
+  connect.extend_from_slice(&target_port.to_be_bytes());
+  stream.write_all(&connect).await?;
+  let mut reply = [0u8; 10];
+  stream.read_exact(&mut reply).await?;
+  assert_eq!(reply[1], 0x00, "SOCKS5 CONNECT to the name must succeed");
+  stream.write_all(request.as_bytes()).await?;
+  let response = read_until_closed(&mut stream).await;
+  assert!(
+    response.contains("PROFILE-DNS-TARGET"),
+    "SOCKS5 CONNECT must reach the resolved address, got: {response}"
+  );
+
+  let targets = seen.lock().unwrap().clone();
+  assert!(
+    targets.contains(&format!("127.0.0.1:{dns_port}")),
+    "the DNS query must travel through the upstream: {targets:?}"
+  );
+  assert!(
+    targets.contains(&format!("127.0.0.1:{target_port}")),
+    "the upstream must be asked for the resolved address: {targets:?}"
+  );
+  assert!(
+    !targets.iter().any(|target| target.contains(name)),
+    "the upstream must never see the name: {targets:?}"
+  );
+
+  // A DNS server that does not answer: no fallback to the upstream's resolver.
+  let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+  let closed_port = closed.local_addr()?.port();
+  drop(closed);
+  let (id, failing_port) = start_worker_with_dns_server(
+    &binary_path,
+    socks_port,
+    &format!("tcp://127.0.0.1:{closed_port}"),
+    "http",
+  )
+  .await?;
+  tracker.track_proxy(id);
+  let mut stream = TcpStream::connect(("127.0.0.1", failing_port)).await?;
+  stream
+    .write_all(
+      format!(
+        "GET http://{name}:{target_port}/ HTTP/1.1\r\nHost: {name}:{target_port}\r\nConnection: close\r\n\r\n"
+      )
+      .as_bytes(),
+    )
+    .await?;
+  let response = read_until_closed(&mut stream).await;
+  assert!(
+    response.starts_with("HTTP/1.1 502") && !response.contains("PROFILE-DNS-TARGET"),
+    "a dead DNS server must fail the request, got: {response}"
+  );
+  assert!(
+    !seen
+      .lock()
+      .unwrap()
+      .iter()
+      .any(|target| target.contains(name)),
+    "a dead DNS server must not hand the name to the upstream"
+  );
+
+  // An unusable value is refused before a worker starts.
+  let output = TestUtils::execute_command(
+    &binary_path,
+    &["proxy", "start", "--dns-server", "udp://1.1.1.1"],
+  )
+  .await?;
+  assert!(!output.status.success(), "udp:// must be rejected");
+
+  tracker.cleanup_all().await;
+  target_handle.abort();
+  dns_handle.abort();
+  socks_handle.abort();
   Ok(())
 }

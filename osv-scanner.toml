@@ -1,0 +1,62 @@
+# Advisories the scan may pass over, and why. This list is NOT a way to quiet a
+# real finding: every entry here is a transitive crate this repository cannot
+# move on its own, and every one carries a date at which it has to be looked at
+# again. Anything actionable must be fixed, not listed.
+#
+# `ignoreUntil` is a deadline, not a dismissal: once it passes the advisory
+# fails the scan again, which is the point. Re-check with
+#   docker run --rm -v "$PWD":/src -w /src ghcr.io/google/osv-scanner-action:v2.6.0 \
+#     --format=table -r --lockfile=pnpm-lock.yaml --lockfile=src-tauri/Cargo.lock \
+#     --lockfile=donut-sync/Cargo.lock ./
+
+# Fixed in glib 0.20, which the GTK stack under Tauri does not use yet. Pulled
+# in on Linux targets only, through tauri -> gtk -> glib, so it moves when Tauri
+# moves and not before.
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0429"
+reason = "Transitive through Tauri's GTK stack; no version of Tauri ships glib 0.20 yet."
+ignoreUntil = 2026-12-31
+
+# The rest are RUSTSEC unmaintained notices, not exploitable defects. None has a
+# fixed version to move to, and all are transitive.
+
+# paste <- utoipa-axum, and <- rav1e/pulp in the image decoding stack.
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0436"
+reason = "Unmaintained crate, no fix published; transitive through utoipa-axum and the image codecs."
+ignoreUntil = 2026-12-31
+
+# proc-macro-error <- Linux-only build dependencies under Tauri.
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0370"
+reason = "Unmaintained crate, no fix published; transitive build dependency on Linux targets."
+ignoreUntil = 2026-12-31
+
+# zvariant, zbus_names and zvariant_derive moved into zbus 6. zbus 5 comes in
+# through tauri-plugin-opener, tauri-plugin-single-instance, tauri-plugin-notification
+# (notify-rust) and secret-service, and none of them has a release on zbus 6 yet.
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0370"
+reason = "zvariant merged into zbus 6; every crate that pulls in zbus still requires zbus 5."
+ignoreUntil = 2026-12-31
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0371"
+reason = "zbus_names merged into zbus 6; every crate that pulls in zbus still requires zbus 5."
+ignoreUntil = 2026-12-31
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0372"
+reason = "zvariant_derive merged into zbus 6; every crate that pulls in zbus still requires zbus 5."
+ignoreUntil = 2026-12-31
+
+# block-buffer 0.10.4 <- digest 0.10, through axum 0.8 (sha1), boringtun 0.7
+# (blake2, hmac) and tauri-codegen 2.7 (sha2). Only block-buffer 0.12.1 has the
+# fix, and the newest release of each of those crates still requires digest
+# 0.10. The defect needs a panic inside the hash compression function that is
+# caught and followed by more use of the same hasher; the SHA-1, SHA-2, BLAKE2
+# and MD5 compression functions do not panic.
+[[IgnoredVulns]]
+id = "GHSA-qwgh-2vcv-g2f7"
+reason = "block-buffer 0.10 has no fix; axum, boringtun and tauri-codegen still require digest 0.10."
+ignoreUntil = 2026-12-31

@@ -1,7 +1,7 @@
 [package]
 name = "donutbrowser"
-version = "0.29.5"
-description = "Simple Yet Powerful Anti-Detect Browser"
+version = "0.36.0"
+description = "The Most Private Anti-Detect Browser"
 authors = ["zhom@github"]
 edition = "2021"
 default-run = "donutbrowser"
@@ -26,10 +26,12 @@ path = "src/bin/proxy_server.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
-resvg = "0.47"
+resvg = "0.49"
 
 [dependencies]
 serde_json = "1"
+# Runtime as well as build time: the per-profile window badge is rendered at launch.
+resvg = "0.49"
 serde = { version = "1", features = ["derive"] }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
@@ -42,50 +44,66 @@ tauri-plugin-macos-permissions = "2"
 tauri-plugin-log = "2"
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-window-state = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-autostart = "2"
 log = "0.4"
 env_logger = "0.11"
 
 directories = "6"
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "json", "stream", "socks", "charset", "http2", "system-proxy"] }
+# The `httpstls` upstream type wraps the hop to the proxy in TLS before a single
+# byte of CONNECT or Proxy-Authorization is written. native-tls (not rustls) on
+# purpose: reqwest above already terminates its proxy TLS through native-tls, so
+# both the browser tunnel and the check-button probe consult the same platform
+# trust store. A rustls tunnel plus a native-tls probe would mean a proxy that
+# passes the check and then fails in the browser. Both crates already build
+# today as transitive deps of reqwest and tokio-tungstenite; this adds an edge,
+# not a crate.
+native-tls = "0.2"
+tokio-native-tls = "0.3"
 tokio = { version = "1", features = ["full", "sync"] }
 tokio-util = "0.7"
-sysinfo = "0.39"
-lazy_static = "1.5"
-base64 = "0.22"
+sysinfo = "0.40"
+# 0.23 turns on `simd-unsafe` by default, decoding via hand-written unsafe
+# AVX2/NEON. This crate decodes attacker-influenced input (proxy CONNECT auth,
+# extension payloads, os_crypt key blobs), and none of those paths are hot
+# enough to be worth it, so stay on the scalar engine.
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 libc = "0.2"
 async-trait = "0.1"
 futures-util = "0.3"
-zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 tar = "0"
 bzip2 = "0"
 flate2 = "1"
-lzma-rs = "0"
+lzma-rust2 = { version = "0.25", default-features = false, features = ["std", "optimization", "xz"] }
 msi-extract = "0"
 
-uuid = { version = "1.23", features = ["v4", "serde"] }
+uuid = { version = "1.29", features = ["v4", "serde"] }
 url = "2.5"
 blake3 = "1"
 globset = "0.4"
 mime_guess = "2"
-once_cell = "1"
 urlencoding = "2.1"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 axum = { version = "0.8.9", features = ["ws"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["cors"] }
-rand = "0.10.2"
-utoipa = { version = "5", features = ["axum_extras", "chrono"] }
-utoipa-axum = "0.2"
-argon2 = "0.5"
+rand = "0.10.3"
+utoipa = { version = "6", features = ["axum_extras", "chrono"] }
+utoipa-axum = "0.3"
+argon2 = "0.6"
 aes-gcm = "0.11"
 aes = "0.9"
 cbc = "0.2"
 ring = "0.17"
 subtle = "2"
 sha2 = "0.11"
-shadowsocks = { version = "1.24", default-features = false, features = ["aead-cipher"] }
-hyper = { version = "1.10", features = ["full"] }
+# From 1.25 the `aead-cipher` feature builds the aws-lc crypto backend, next to
+# the `ring` that boringtun brings. On Windows it needs `prebuilt-nasm`, below.
+shadowsocks = { version = "1.25", default-features = false, features = ["aead-cipher"] }
+hyper = { version = "1.12", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 clap = { version = "4", features = ["derive"] }
@@ -93,31 +111,37 @@ async-socks5 = "0.6"
 
 
 # Wayfern CDP integration
-tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
-rusqlite = { version = "0.40", features = ["bundled"] }
-serde_yaml = "0.9"
-toml = "1.1"
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
+yaml-rust2 = { version = "0.13", default-features = false }
 thiserror = "2.0"
 regex-lite = "0.1"
 tempfile = "3"
-maxminddb = "0.29"
-quick-xml = { version = "0.41", features = ["serialize"] }
+dunce = "1"
+maxminddb = "0.32"
+quick-xml = { version = "0.42", features = ["serialize"] }
 
 # VPN support
 boringtun = "0.7"
-smoltcp = { version = "0.13", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-dns"] }
+smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-dns"] }
 
 # Tray icon decoding (main-process system tray)
 image = "0.25"
-dirs = "6"
+dirs = "7"
 crossbeam-channel = "0.5"
 sys-locale = "0.3"
+jsonc-parser = { version = "0.34", features = ["cst", "serde_json"] }
+toml_edit = "0.25"
+rusty-leveldb = "4.0.2"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal", "process"] }
 
 # Reading the desktop's titlebar button layout for the in-app window controls.
 [target.'cfg(target_os = "linux")'.dependencies]
+# Held on the minor that tao, wry and tray-icon use. gtk-sys declares
+# `links = "gtk-3"`, and Cargo refuses two crates with the same `links` value,
+# so this moves only when Tauri moves.
 gtk = "0.18"
 # Reading the source browser's "<Brand> Safe Storage" secret during profile
 # import, so its cookies and passwords can be re-encrypted for Wayfern.
@@ -128,8 +152,9 @@ core-foundation = "0.10"
 # Reading the source browser's "<Brand> Safe Storage" Keychain item during
 # profile import, so its cookies and passwords can be re-encrypted for Wayfern.
 security-framework = "3"
-objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", features = ["NSWindow", "NSApplication", "NSRunningApplication"] }
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", features = ["NSWindow", "NSApplication", "NSRunningApplication", "NSView", "NSResponder", "NSButton", "NSControl", "NSGraphics"] }
+objc2-foundation = { version = "0.3.2", features = ["NSGeometry"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.56"
@@ -143,22 +168,45 @@ windows = { version = "0.62", features = [
   "Win32_Security",
   "Win32_Storage_FileSystem",
   "Win32_System_Registry",
+  # CoInitializeEx, so the `ms-settings:` hand-off in default_browser.rs has a
+  # COM apartment. ShellExecuteW activates the URI through a shell extension,
+  # and it runs on a `spawn_blocking` thread that has no apartment of its own.
+  "Win32_System_Com",
   "Win32_UI_Shell",
+  # SendMessageTimeoutW, for the association-change broadcast in
+  # default_browser.rs. Going through the crate rather than a hand-written
+  # `extern "system"` block is what keeps `lpdwResult` typed as DWORD_PTR.
+  "Win32_UI_WindowsAndMessaging",
   # CryptUnprotectData, for unwrapping the source browser's os_crypt key from
   # `Local State` during profile import.
   "Win32_Security_Cryptography",
+  # The RAM volume (src/ramfs): its root security descriptor, and loading the
+  # installed WinFsp DLL by full path.
+  "Win32_Security_Authorization",
+  "Win32_System_LibraryLoader",
 ] }
+# aws-lc (through shadowsocks) assembles its Windows code with NASM. The objects
+# AWS ships in the crate spare every build machine that tool.
+aws-lc-sys = { version = "0.47", features = ["prebuilt-nasm"] }
+# WinFsp, for the RAM volume of ephemeral profiles. Donut does not ship the
+# driver; the DLL is delay-loaded and used only when it is installed.
+winfsp = { version = "0.13", default-features = false }
+winfsp-sys = "0.12"
+
+[target.'cfg(windows)'.build-dependencies]
+winfsp = { version = "0.13", default-features = false, features = ["delayload"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
 wiremock = "0.6"
-hyper = { version = "1.10", features = ["full"] }
+hyper = { version = "1.12", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 tower = "0.5"
 tower-http = { version = "0.7", features = ["fs", "trace"] }
 futures-util = "0.3"
-serial_test = "3"
+serial_test = "4"
+lzma-rust2 = { version = "0.25", features = ["encoder"] }
 
 # Integration test configuration
 [[test]]

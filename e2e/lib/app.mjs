@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import en from "../../src/i18n/locales/en.json" with { type: "json" };
 import { WebDriverClient } from "./webdriver.mjs";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -71,6 +72,7 @@ export class AppSession {
     seedDownloadedBrowser = false,
     onboardingCompleted = true,
     wayfernTermsAccepted = true,
+    settings = {},
   }) {
     this.name = name;
     this.root = root;
@@ -84,6 +86,8 @@ export class AppSession {
     this.seedDownloadedBrowser = seedDownloadedBrowser;
     this.onboardingCompleted = onboardingCompleted;
     this.wayfernTermsAccepted = wayfernTermsAccepted;
+    // Extra keys for the seeded app_settings.json, on top of the defaults.
+    this.settings = settings;
     this.session = null;
   }
 
@@ -91,11 +95,46 @@ export class AppSession {
     return path.join(this.root, "donut");
   }
 
+  /** Where this session's app looks for the Wayfern terms marker. */
+  get wayfernTermsFile() {
+    if (process.platform === "darwin") {
+      return path.join(
+        this.root,
+        "home",
+        "Library",
+        "Application Support",
+        "Wayfern",
+        "license-accepted",
+      );
+    }
+    if (process.platform === "win32") {
+      return path.join(
+        this.root,
+        "windows",
+        "roaming",
+        "Wayfern",
+        "license-accepted",
+      );
+    }
+    return path.join(this.root, "xdg", "config", "Wayfern", "license-accepted");
+  }
+
   async start() {
     await Promise.all([
       mkdir(path.join(this.root, "home"), { recursive: true }),
       mkdir(path.join(this.root, "tmp"), { recursive: true }),
       mkdir(path.join(this.root, "artifacts"), { recursive: true }),
+      // Windows expands the known folders from %USERPROFILE%, which points at
+      // the isolated home. A missing AppData\Roaming makes
+      // SHGetKnownFolderPath fail, and the app cannot resolve its base
+      // directories at startup.
+      ...(process.platform === "win32"
+        ? ["Roaming", "Local"].map((folder) =>
+            mkdir(path.join(this.root, "home", "AppData", folder), {
+              recursive: true,
+            }),
+          )
+        : []),
     ]);
     if (this.onboardingCompleted) {
       const settingsFile = path.join(
@@ -114,6 +153,13 @@ export class AppSession {
             commercial_trial_acknowledged: true,
             window_resize_warning_dismissed: true,
             disable_auto_updates: true,
+            // A tip opening by itself mid-test is a modal nobody asked for;
+            // the tips suite turns it back on for the one session that wants it.
+            tips_auto_show: false,
+            // Hundreds of scripted clicks must not play through the speakers
+            // of the machine running the suite.
+            ui_sounds: false,
+            ...this.settings,
           },
           null,
           2,
@@ -126,31 +172,7 @@ export class AppSession {
       });
     }
     if (this.wayfernTermsAccepted) {
-      const termsFile =
-        process.platform === "darwin"
-          ? path.join(
-              this.root,
-              "home",
-              "Library",
-              "Application Support",
-              "Wayfern",
-              "license-accepted",
-            )
-          : process.platform === "win32"
-            ? path.join(
-                this.root,
-                "windows",
-                "roaming",
-                "Wayfern",
-                "license-accepted",
-              )
-            : path.join(
-                this.root,
-                "xdg",
-                "config",
-                "Wayfern",
-                "license-accepted",
-              );
+      const termsFile = this.wayfernTermsFile;
       await mkdir(path.dirname(termsFile), { recursive: true });
       await writeFile(termsFile, `${Math.floor(Date.now() / 1000)}\n`, {
         flag: "wx",
@@ -244,6 +266,14 @@ export class AppSession {
                   DONUT_E2E_GEOIP_DOWNLOAD_URL: `${process.env.DONUT_E2E_FIXTURE_URL}/geoip.mmdb`,
                 }
               : {}),
+            // The city database has no organisation for an address; the ASN
+            // one does, and it is what a proxy check reports as the exit's
+            // ISP. Seeded separately so the suite can assert a real value.
+            ...(process.env.DONUT_E2E_GEOIP_ASN_FIXTURE_READY === "1"
+              ? {
+                  DONUT_E2E_GEOIP_ASN_DOWNLOAD_URL: `${process.env.DONUT_E2E_FIXTURE_URL}/geoip-asn.mmdb`,
+                }
+              : {}),
           }
         : {}),
       ...(this.token ? { WAYFERN_TEST_TOKEN: this.token } : {}),
@@ -255,6 +285,12 @@ export class AppSession {
       env,
       cwd: this.cwd,
       startupTimeout: 120_000,
+      // Set by run.mjs on macOS and Windows. The driver keeps the Donut window
+      // off the user's screen (on macOS transparent, click-through and never
+      // key, with the app as an accessory; hidden on Windows), so a suite
+      // never pops a window or steals focus. Linux runs show the window on a
+      // private display instead, because a hidden GTK window has no size.
+      headless: process.env.DONUT_E2E_HEADLESS === "1",
     });
     await this.session.setTimeouts();
     await this.waitFor(
@@ -269,7 +305,51 @@ export class AppSession {
         timeoutMs: 60_000,
       },
     );
+    await this.dismissStartupPermissions();
     return this;
+  }
+
+  async dismissStartupPermissions() {
+    if (
+      process.platform !== "darwin" ||
+      !(await this.invoke("get_onboarding_completed"))
+    ) {
+      return;
+    }
+    const [microphone, camera] = await Promise.all([
+      this.invoke("plugin:macos-permissions|check_microphone_permission"),
+      this.invoke("plugin:macos-permissions|check_camera_permission"),
+    ]);
+    if (microphone && camera) return;
+
+    const title = microphone
+      ? en.permissionDialog.titleCamera
+      : en.permissionDialog.titleMicrophone;
+    await this.clickElement(
+      () =>
+        this.execute(
+          `
+            const dialog = [...document.querySelectorAll("[role='dialog']")].find(
+              (node) => node.querySelector("h2")?.textContent === arguments[0]
+            );
+            return [...(dialog?.querySelectorAll("button") ?? [])].find(
+              (button) => button.textContent.trim() === arguments[1]
+            ) ?? null;
+          `,
+          [title, en.permissionDialog.cancelButton],
+        ),
+      "startup permission dialog Cancel button",
+    );
+    await this.waitFor(
+      () =>
+        this.execute(
+          `return ![...document.querySelectorAll("[role='dialog']")].some(
+            (node) => node.querySelector("h2")?.textContent === arguments[0]
+          );`,
+          [title],
+        ),
+      { description: "startup permission dialog to close" },
+    );
   }
 
   async restart() {
@@ -369,22 +449,41 @@ export class AppSession {
     });
   }
 
-  async clickElement(element, description = "element") {
+  async clickElement(target, description = "element") {
+    let element;
     await this.waitFor(
-      () =>
-        this.execute(
+      async () => {
+        // Event-backed tables may replace a cell while its data is loading.
+        // Resolve the current control on each attempt, as a browser locator does.
+        element = typeof target === "function" ? await target() : target;
+        if (!element) return false;
+        const verdict = await this.execute(
           `
             const node = arguments[0];
             if (!(node instanceof Element) || !node.isConnected) return false;
+            if (node.matches(":disabled") || node.getAttribute("aria-disabled") === "true") return false;
             node.scrollIntoView({ block: "center", inline: "center" });
             const rect = node.getBoundingClientRect();
             const x = Math.floor(rect.left + rect.width / 2);
             const y = Math.floor(rect.top + rect.height / 2);
             const hit = document.elementFromPoint(x, y);
-            return Boolean(hit && (hit === node || node.contains(hit)));
+            if (hit && (hit === node || node.contains(hit))) return true;
+            const name = (el) => el
+              ? el.tagName.toLowerCase() +
+                (el.dataset?.slot ? '[data-slot="' + el.dataset.slot + '"]' : "") +
+                (el.className && typeof el.className === "string" ? '.' + el.className.trim().split(/\\s+/).slice(0, 6).join(".") : "")
+              : "nothing";
+            return "its center (" + x + "," + y + ") hits " + name(hit) +
+              (hit?.contains(node) ? " (an ancestor)" : "") +
+              ", viewport " + innerWidth + "x" + innerHeight +
+              ", opacity " + getComputedStyle(node).opacity;
           `,
           [element],
-        ),
+        );
+        // The last miss names what covers the control, for the timeout message.
+        if (typeof verdict === "string") throw new Error(verdict);
+        return verdict;
+      },
       { description: `pointer-interactable ${description}` },
     );
     await this.session.click(element);
@@ -394,8 +493,9 @@ export class AppSession {
     text,
     { exact = true, roles = ["button", "tab", "menuitem", "link"] } = {},
   ) {
-    const element = await this.execute(
-      `
+    const findElement = () =>
+      this.execute(
+        `
         const wanted = arguments[0];
         const exact = arguments[1];
         const roles = new Set(arguments[2]);
@@ -412,13 +512,9 @@ export class AppSession {
           return roles.has(role) && visible(node) && (exact ? label === wanted : label.includes(wanted));
         }) ?? null;
       `,
-      [text, exact, roles],
-    );
-    assert.ok(
-      element,
-      `No visible interactive element matched ${JSON.stringify(text)}`,
-    );
-    await this.clickElement(element, JSON.stringify(text));
+        [text, exact, roles],
+      );
+    await this.clickElement(findElement, JSON.stringify(text));
   }
 
   async clickTextIn(
@@ -426,8 +522,9 @@ export class AppSession {
     text,
     { exact = true, roles = ["button", "tab", "menuitem", "link"] } = {},
   ) {
-    const element = await this.execute(
-      `
+    const findElement = () =>
+      this.execute(
+        `
         const containers = [...document.querySelectorAll(arguments[0])];
         const wanted = arguments[1];
         const exact = arguments[2];
@@ -450,20 +547,16 @@ export class AppSession {
         }
         return null;
       `,
-      [containerSelector, text, exact, roles],
-    );
-    assert.ok(
-      element,
-      `No visible interactive element inside ${containerSelector} matched ${JSON.stringify(text)}`,
-    );
+        [containerSelector, text, exact, roles],
+      );
     await this.clickElement(
-      element,
+      findElement,
       `${JSON.stringify(text)} inside ${containerSelector}`,
     );
   }
 
   async clickSelector(selector) {
-    const element = await this.waitFor(
+    await this.clickElement(
       () =>
         this.execute(
           `
@@ -476,9 +569,8 @@ export class AppSession {
           `,
           [selector],
         ),
-      { description: `visible selector ${selector}` },
+      selector,
     );
-    await this.clickElement(element, selector);
   }
 
   async fillSelector(selector, value) {
@@ -578,6 +670,7 @@ export function appFromEnvironment(name, options = {}) {
     seedDownloadedBrowser: options.seedDownloadedBrowser,
     onboardingCompleted: options.onboardingCompleted,
     wayfernTermsAccepted: options.wayfernTermsAccepted,
+    settings: options.settings,
   });
 }
 

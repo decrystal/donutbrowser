@@ -8,7 +8,7 @@
 //!   The plaintext relpath is encoded inside the ciphertext so a launch can
 //!   reconstruct the directory tree without a separate manifest.
 //!
-//! Wrong password fails the AES-GCM auth tag on the first decrypt, which
+//! Wrong password fails the AES-GCM auth tag on the verifier file, which
 //! doubles as password verification.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -30,11 +30,148 @@ const HMAC_FILENAME_LEN: usize = 32;
 const VERIFY_FILE_NAME: &str = ".donut-pw-verify";
 const VERIFY_FILE_PATH: &str = "__donut_pw_verify__";
 
-lazy_static::lazy_static! {
-  /// In-memory cache of derived per-profile encryption keys, keyed by profile UUID.
-  /// Only populated while a profile is unlocked / running. Never persisted.
-  static ref KEY_CACHE: Mutex<HashMap<uuid::Uuid, [u8; 32]>> = Mutex::new(HashMap::new());
+/// Extension of a file `atomic_write` has not renamed into place yet. One left
+/// by a crash is never a sealed file.
+const TMP_EXTENSION: &str = "donut-tmp";
+
+/// What a sealed copy leaves out: caches the browser rebuilds, lock and temp
+/// files, crash and metrics dumps, and the files Donut writes again before
+/// every launch. Service worker scripts and Cache Storage are site data and
+/// are sealed: without the script, Chromium drops the registration. Everything else is kept, the SQLite journals and write-ahead
+/// logs included: without them a database the browser did not close cleanly
+/// opens torn instead of rolled back.
+pub const SEALED_EXCLUDE_PATTERNS: &[&str] = &[
+  "**/Cache/**",
+  "**/Code Cache/**",
+  "**/GPUCache/**",
+  "**/GrShaderCache/**",
+  "**/ShaderCache/**",
+  "**/DawnCache/**",
+  "**/DawnGraphiteCache/**",
+  "**/DawnWebGPUCache/**",
+  "**/GraphiteDawnCache/**",
+  "**/blob_storage/**",
+  "**/Crashpad/**",
+  "**/Crash Reports/**",
+  "**/BrowserMetrics*",
+  "**/BrowserMetrics/**",
+  "**/optimization_guide_model_store/**",
+  "**/Safe Browsing/**",
+  "**/component_crx_cache/**",
+  "**/cache2/**",
+  "**/startupCache/**",
+  "**/safebrowsing/**",
+  "**/storage/temporary/**",
+  "**/storage/default/*/cache/**",
+  "**/datareporting/**",
+  "**/saved-telemetry-pings/**",
+  "**/crashes/**",
+  "**/minidumps/**",
+  "**/*-shm",
+  "**/LOCK",
+  "**/LOG",
+  "**/LOG.old",
+  "**/SingletonLock",
+  "**/SingletonSocket",
+  "**/SingletonCookie",
+  "**/.DS_Store",
+  "*.tmp",
+  "**/*.donut-tmp",
+  "**/wayfern-identity.json",
+  "**/wayfern-identity-result.json",
+  "**/wayfern-persona.json",
+  BASELINE_FILE_NAME,
+];
+
+/// The file in a decrypted copy that records what the sealed copy holds. It is
+/// written only once the copy is complete and removed before the copy is
+/// erased, so a directory without it is never mistaken for a profile.
+pub const BASELINE_FILE_NAME: &str = ".donut-baseline.json";
+
+/// The files that hold the key every encrypted cookie and password in the
+/// profile is sealed with. A healthy profile never loses them or holds them
+/// blank, so a decrypted copy that lacks one, or holds one empty or
+/// zero-filled, was damaged from outside (a temp-folder cleaner, an erase that
+/// zero-fills before it unlinks). Sealing that state would lose the key and,
+/// with it, every encrypted value, so a seal keeps the sealed file instead.
+const KEY_MATERIAL_PATHS: &[&str] = &["os_crypt_key", "Local State"];
+
+fn is_blank(bytes: &[u8]) -> bool {
+  bytes.iter().all(|byte| *byte == 0)
 }
+
+/// A file's size and modification time, enough to tell that it changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileStamp {
+  secs: u64,
+  nanos: u32,
+  len: u64,
+}
+
+impl FileStamp {
+  fn of(metadata: &std::fs::Metadata) -> Option<Self> {
+    let modified = metadata
+      .modified()
+      .ok()?
+      .duration_since(SystemTime::UNIX_EPOCH)
+      .ok()?;
+    Some(Self {
+      secs: modified.as_secs(),
+      nanos: modified.subsec_nanos(),
+      len: metadata.len(),
+    })
+  }
+}
+
+/// The stamp of every file of a decrypted copy, by plaintext relpath, as of the
+/// moment the sealed copy last held the same bytes.
+pub type Baseline = HashMap<String, FileStamp>;
+
+/// The result of decrypting a sealed copy.
+pub struct Decrypted {
+  pub baseline: Baseline,
+  /// Sealed files that did not open with the right key: damaged, and skipped.
+  pub unreadable: usize,
+}
+
+/// The stamp of the sealed copy as a whole. Every seal and every password
+/// change rewrites the verifier, and a sync download replaces it, so a new
+/// stamp means the sealed copy changed.
+pub fn sealed_stamp(encrypted_dir: &Path) -> Option<FileStamp> {
+  FileStamp::of(&std::fs::metadata(encrypted_dir.join(VERIFY_FILE_NAME)).ok()?)
+}
+
+/// Whether `plaintext_dir` differs from `baseline`: a file added, changed or
+/// removed.
+pub fn has_changes(
+  plaintext_dir: &Path,
+  exclude_patterns: &[&str],
+  baseline: &Baseline,
+) -> PasswordResult<bool> {
+  let excludes = build_excludes(exclude_patterns);
+  let mut files = Vec::new();
+  walk_files(plaintext_dir, plaintext_dir, &excludes, &mut files)?;
+  if files.len() != baseline.len() {
+    return Ok(true);
+  }
+  for (relpath, abs) in files {
+    if FileStamp::of(&std::fs::metadata(&abs)?).as_ref() != baseline.get(&relpath) {
+      return Ok(true);
+    }
+  }
+  Ok(false)
+}
+
+fn is_tmp_name(name: &str) -> bool {
+  Path::new(name)
+    .extension()
+    .is_some_and(|ext| ext == TMP_EXTENSION)
+}
+
+/// In-memory cache of derived per-profile encryption keys, keyed by profile UUID.
+/// Only populated while a profile is unlocked / running. Never persisted.
+static KEY_CACHE: std::sync::LazyLock<Mutex<HashMap<uuid::Uuid, [u8; 32]>>> =
+  std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, thiserror::Error)]
 pub enum PasswordError {
@@ -129,10 +266,9 @@ fn walk_files(
       continue;
     }
 
-    let metadata = match entry.metadata() {
-      Ok(m) => m,
-      Err(_) => continue,
-    };
+    // An error, never a skip: a file left out here is a file the sealed copy
+    // deletes.
+    let metadata = entry.metadata()?;
 
     if metadata.is_dir() {
       walk_files(base, &path, excludes, out)?;
@@ -143,11 +279,11 @@ fn walk_files(
   Ok(())
 }
 
-fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
+pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
   if let Some(parent) = path.parent() {
     std::fs::create_dir_all(parent)?;
   }
-  let tmp = path.with_extension("donut-tmp");
+  let tmp = path.with_extension(TMP_EXTENSION);
   std::fs::write(&tmp, data)?;
   std::fs::rename(&tmp, path)
 }
@@ -206,23 +342,25 @@ pub fn encrypt_profile_dir(
 }
 
 /// Decrypt every file in `encrypted_dir` back into `plaintext_dir` (which is
-/// created if missing). Returns the per-file mtimes captured after writing,
-/// keyed by plaintext relpath. Caller can use them as the "before-launch"
-/// snapshot to skip unchanged files on re-encrypt.
+/// created if missing), and return the baseline of what it wrote.
+///
+/// The key is checked against the verifier first, so a file that does not
+/// open after that is damaged, not a wrong password: it is skipped and counted
+/// rather than failing the whole profile.
 pub fn decrypt_profile_dir(
   key: &[u8; 32],
   encrypted_dir: &Path,
   plaintext_dir: &Path,
-) -> PasswordResult<HashMap<String, SystemTime>> {
+) -> PasswordResult<Decrypted> {
+  verify_key_against_dir(key, encrypted_dir)?;
   std::fs::create_dir_all(plaintext_dir)?;
-  let mut mtimes = HashMap::new();
+  let mut decrypted = Decrypted {
+    baseline: Baseline::new(),
+    unreadable: 0,
+  };
 
-  let entries: Vec<_> = std::fs::read_dir(encrypted_dir)?
-    .filter_map(|r| r.ok())
-    .collect();
-
-  for entry in entries {
-    let path = entry.path();
+  for entry in std::fs::read_dir(encrypted_dir)? {
+    let path = entry?.path();
     if !path.is_file() {
       continue;
     }
@@ -230,37 +368,40 @@ pub fn decrypt_profile_dir(
       Some(n) => n,
       None => continue,
     };
-    if name == VERIFY_FILE_NAME {
+    if name == VERIFY_FILE_NAME || is_tmp_name(name) {
       continue;
     }
     let bytes = std::fs::read(&path)?;
-    let (relpath, content) = decrypt_profile_file(key, &bytes)?;
+    let Ok((relpath, content)) = decrypt_profile_file(key, &bytes) else {
+      decrypted.unreadable += 1;
+      continue;
+    };
     let dest = plaintext_dir.join(&relpath);
     if let Some(parent) = dest.parent() {
       std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&dest, &content)?;
-    if let Ok(m) = dest.metadata().and_then(|m| m.modified()) {
-      mtimes.insert(relpath, m);
+    if let Some(stamp) = FileStamp::of(&std::fs::metadata(&dest)?) {
+      decrypted.baseline.insert(relpath, stamp);
     }
   }
 
-  Ok(mtimes)
+  Ok(decrypted)
 }
 
 /// Re-encrypt the contents of `plaintext_dir` back into `encrypted_dir`,
 /// preserving on-disk filenames for files whose plaintext content didn't
-/// change. Returns the number of files re-encrypted.
+/// change. Returns the number of files re-encrypted and the new baseline.
 ///
-/// `before_launch_mtimes` is the snapshot captured by `decrypt_profile_dir`.
-/// Files whose mtime hasn't moved are left untouched on disk.
+/// A file whose stamp matches `baseline` is already sealed and is left alone.
+/// A sealed file whose plaintext is gone is deleted.
 pub fn reencrypt_changed_files(
   key: &[u8; 32],
   plaintext_dir: &Path,
   encrypted_dir: &Path,
   exclude_patterns: &[&str],
-  before_launch_mtimes: &HashMap<String, SystemTime>,
-) -> PasswordResult<usize> {
+  baseline: &Baseline,
+) -> PasswordResult<(usize, Baseline)> {
   std::fs::create_dir_all(encrypted_dir)?;
   let excludes = build_excludes(exclude_patterns);
 
@@ -270,29 +411,41 @@ pub fn reencrypt_changed_files(
   }
 
   let mut current_paths: HashSet<String> = HashSet::new();
+  let mut sealed = Baseline::new();
   let mut rewrote = 0usize;
   for (relpath, abs) in current_files {
     current_paths.insert(relpath.clone());
 
-    let cur_mtime = abs.metadata().and_then(|m| m.modified()).ok();
-    let unchanged = match (cur_mtime, before_launch_mtimes.get(&relpath)) {
-      (Some(now), Some(before)) => now == *before,
-      _ => false,
-    };
-    if unchanged {
-      continue;
+    // Taken before the read, so a write that lands during it shows up as a
+    // change next time rather than being missed. A file with no usable time
+    // gets no entry and is sealed again every time.
+    let stamp = FileStamp::of(&std::fs::metadata(&abs)?);
+    if let Some(stamp) = stamp {
+      sealed.insert(relpath.clone(), stamp);
+      if baseline.get(&relpath) == Some(&stamp) {
+        continue;
+      }
     }
 
     let bytes = std::fs::read(&abs)?;
+    if KEY_MATERIAL_PATHS.contains(&relpath.as_str()) && is_blank(&bytes) {
+      // Left out of the baseline, so the next seal looks at it again.
+      sealed.remove(&relpath);
+      log::error!("Blank key file not sealed, the sealed one is kept path={relpath}");
+      continue;
+    }
     let encrypted = encrypt_profile_file(key, &relpath, &bytes)?;
     let on_disk = encrypted_dir.join(hmac_filename(key, &relpath));
     atomic_write(&on_disk, &encrypted)?;
     rewrote += 1;
   }
 
-  // Delete on-disk files for plaintext paths that no longer exist
+  // Delete on-disk files for plaintext paths that no longer exist. A key file
+  // is never deleted this way: its absence from the copy is damage.
   let valid_names: HashSet<String> = current_paths
     .iter()
+    .map(String::as_str)
+    .chain(KEY_MATERIAL_PATHS.iter().copied())
     .map(|p| hmac_filename(key, p))
     .collect();
 
@@ -314,21 +467,50 @@ pub fn reencrypt_changed_files(
   }
 
   write_verifier(key, encrypted_dir)?;
-  Ok(rewrote)
+  Ok((rewrote, sealed))
+}
+
+/// Put back, from the sealed copy, each key file the decrypted copy lacks or
+/// holds blank. Returns how many were put back.
+pub fn restore_key_material(
+  key: &[u8; 32],
+  encrypted_dir: &Path,
+  plaintext_dir: &Path,
+) -> PasswordResult<usize> {
+  let mut restored = 0usize;
+  for relpath in KEY_MATERIAL_PATHS {
+    let dest = plaintext_dir.join(relpath);
+    if std::fs::read(&dest).is_ok_and(|bytes| !is_blank(&bytes)) {
+      continue;
+    }
+    let Ok(bytes) = std::fs::read(encrypted_dir.join(hmac_filename(key, relpath))) else {
+      continue;
+    };
+    let (path, content) = decrypt_profile_file(key, &bytes)?;
+    if path != *relpath || is_blank(&content) {
+      continue;
+    }
+    atomic_write(&dest, &content)?;
+    restored += 1;
+  }
+  Ok(restored)
 }
 
 /// Re-encrypt every file under `encrypted_dir` from `old_key` to `new_key` in
 /// place. Used when changing a profile password without launching it.
+/// Returns how many damaged files were dropped: they open with neither key.
 pub fn rekey_profile_dir(
   old_key: &[u8; 32],
   new_key: &[u8; 32],
   encrypted_dir: &Path,
-) -> PasswordResult<()> {
+) -> PasswordResult<usize> {
+  verify_key_against_dir(old_key, encrypted_dir)?;
   let entries: Vec<_> = std::fs::read_dir(encrypted_dir)?
     .filter_map(|r| r.ok())
     .collect();
 
   let mut decrypted: Vec<(String, Vec<u8>)> = Vec::new();
+  let mut unreadable = 0usize;
   for entry in &entries {
     let path = entry.path();
     if !path.is_file() {
@@ -338,15 +520,17 @@ pub fn rekey_profile_dir(
       Some(n) => n,
       None => continue,
     };
-    if name == VERIFY_FILE_NAME {
+    if name == VERIFY_FILE_NAME || is_tmp_name(name) {
       continue;
     }
     let bytes = std::fs::read(&path)?;
-    let (relpath, content) = decrypt_profile_file(old_key, &bytes)?;
-    decrypted.push((relpath, content));
+    match decrypt_profile_file(old_key, &bytes) {
+      Ok(file) => decrypted.push(file),
+      Err(_) => unreadable += 1,
+    }
   }
 
-  // Decryption succeeded for every file; safe to rewrite the directory.
+  // Every readable file is in memory; safe to rewrite the directory.
   for entry in entries {
     let path = entry.path();
     if path.is_file() {
@@ -361,7 +545,7 @@ pub fn rekey_profile_dir(
   }
 
   write_verifier(new_key, encrypted_dir)?;
-  Ok(())
+  Ok(unreadable)
 }
 
 // ---------- key cache ----------
@@ -407,296 +591,5 @@ pub fn fresh_salt() -> String {
 }
 
 #[cfg(test)]
-mod tests {
-  use super::*;
-  use tempfile::TempDir;
-
-  fn make_key() -> [u8; 32] {
-    derive_profile_key("hunter2", &generate_salt()).unwrap()
-  }
-
-  #[test]
-  fn test_hmac_filename_deterministic() {
-    let key = [7u8; 32];
-    let a = hmac_filename(&key, "Default/Cookies");
-    let b = hmac_filename(&key, "Default/Cookies");
-    assert_eq!(a, b);
-    assert_eq!(a.len(), HMAC_FILENAME_LEN);
-  }
-
-  #[test]
-  fn test_hmac_filename_different_keys() {
-    let a = hmac_filename(&[1u8; 32], "Default/Cookies");
-    let b = hmac_filename(&[2u8; 32], "Default/Cookies");
-    assert_ne!(a, b);
-  }
-
-  #[test]
-  fn test_hmac_filename_different_paths() {
-    let key = [1u8; 32];
-    let a = hmac_filename(&key, "Default/Cookies");
-    let b = hmac_filename(&key, "Default/Login Data");
-    assert_ne!(a, b);
-  }
-
-  #[test]
-  fn test_file_roundtrip() {
-    let key = make_key();
-    let original = b"hello world".to_vec();
-    let encrypted = encrypt_profile_file(&key, "Default/Cookies", &original).unwrap();
-    let (path, content) = decrypt_profile_file(&key, &encrypted).unwrap();
-    assert_eq!(path, "Default/Cookies");
-    assert_eq!(content, original);
-  }
-
-  #[test]
-  fn test_file_wrong_key_fails() {
-    let key1 = make_key();
-    let key2 = make_key();
-    let encrypted = encrypt_profile_file(&key1, "Cookies", b"data").unwrap();
-    assert!(matches!(
-      decrypt_profile_file(&key2, &encrypted),
-      Err(PasswordError::WrongPassword)
-    ));
-  }
-
-  #[test]
-  fn test_file_truncated_ciphertext() {
-    let key = make_key();
-    let encrypted = encrypt_profile_file(&key, "x", b"y").unwrap();
-    // Drop the auth tag
-    let truncated = &encrypted[..encrypted.len() - 1];
-    assert!(decrypt_profile_file(&key, truncated).is_err());
-  }
-
-  #[test]
-  fn test_dir_roundtrip() {
-    let key = make_key();
-    let work = TempDir::new().unwrap();
-    let plain = work.path().join("plain");
-    let enc = work.path().join("enc");
-    std::fs::create_dir_all(plain.join("Default")).unwrap();
-    std::fs::write(plain.join("Default/Cookies"), b"sqlite-data").unwrap();
-    std::fs::write(plain.join("Default/Bookmarks"), b"{\"x\":1}").unwrap();
-    std::fs::write(plain.join("Local State"), b"state").unwrap();
-
-    encrypt_profile_dir(&key, &plain, &enc, &[]).unwrap();
-
-    // No plaintext filenames on disk
-    let names: Vec<String> = std::fs::read_dir(&enc)
-      .unwrap()
-      .filter_map(|e| e.ok())
-      .map(|e| e.file_name().to_string_lossy().into_owned())
-      .collect();
-    for n in &names {
-      assert!(!n.contains("Cookies"), "plaintext leaked: {n}");
-      assert!(!n.contains("Bookmarks"));
-      assert!(!n.contains("Local State"));
-    }
-
-    // Verify file present
-    assert!(enc.join(VERIFY_FILE_NAME).exists());
-
-    let restored = work.path().join("restored");
-    let mtimes = decrypt_profile_dir(&key, &enc, &restored).unwrap();
-    assert_eq!(mtimes.len(), 3);
-
-    assert_eq!(
-      std::fs::read(restored.join("Default/Cookies")).unwrap(),
-      b"sqlite-data"
-    );
-    assert_eq!(
-      std::fs::read(restored.join("Default/Bookmarks")).unwrap(),
-      b"{\"x\":1}"
-    );
-    assert_eq!(
-      std::fs::read(restored.join("Local State")).unwrap(),
-      b"state"
-    );
-  }
-
-  #[test]
-  fn test_dir_excludes() {
-    let key = make_key();
-    let work = TempDir::new().unwrap();
-    let plain = work.path().join("plain");
-    let enc = work.path().join("enc");
-    std::fs::create_dir_all(plain.join("Default/Cache")).unwrap();
-    std::fs::write(plain.join("Default/Cookies"), b"keep").unwrap();
-    std::fs::write(plain.join("Default/Cache/data"), b"drop").unwrap();
-
-    encrypt_profile_dir(&key, &plain, &enc, &["**/Cache/**"]).unwrap();
-
-    let restored = work.path().join("restored");
-    let mtimes = decrypt_profile_dir(&key, &enc, &restored).unwrap();
-
-    // Only Cookies (1 file) should be present, not Cache contents
-    assert_eq!(mtimes.len(), 1);
-    assert!(mtimes.contains_key("Default/Cookies"));
-    assert!(restored.join("Default/Cookies").exists());
-    assert!(!restored.join("Default/Cache/data").exists());
-  }
-
-  #[test]
-  fn test_verify_against_wrong_key() {
-    let key1 = make_key();
-    let key2 = make_key();
-    let work = TempDir::new().unwrap();
-    let plain = work.path().join("plain");
-    let enc = work.path().join("enc");
-    std::fs::create_dir_all(&plain).unwrap();
-    std::fs::write(plain.join("file"), b"data").unwrap();
-    encrypt_profile_dir(&key1, &plain, &enc, &[]).unwrap();
-    assert!(verify_key_against_dir(&key1, &enc).is_ok());
-    assert!(matches!(
-      verify_key_against_dir(&key2, &enc),
-      Err(PasswordError::WrongPassword)
-    ));
-  }
-
-  #[test]
-  fn test_reencrypt_skips_unchanged() {
-    let key = make_key();
-    let work = TempDir::new().unwrap();
-    let plain = work.path().join("plain");
-    let enc = work.path().join("enc");
-    std::fs::create_dir_all(&plain).unwrap();
-    std::fs::write(plain.join("a"), b"AAA").unwrap();
-    std::fs::write(plain.join("b"), b"BBB").unwrap();
-    encrypt_profile_dir(&key, &plain, &enc, &[]).unwrap();
-
-    let restored = work.path().join("restored");
-    let snapshot = decrypt_profile_dir(&key, &enc, &restored).unwrap();
-
-    // Capture pre-rewrite ciphertext bytes
-    let name_a = hmac_filename(&key, "a");
-    let name_b = hmac_filename(&key, "b");
-    let cipher_a_before = std::fs::read(enc.join(&name_a)).unwrap();
-    let cipher_b_before = std::fs::read(enc.join(&name_b)).unwrap();
-
-    // Modify only "a" in the restored tree
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-    std::fs::write(restored.join("a"), b"AAA-CHANGED").unwrap();
-
-    let rewrote = reencrypt_changed_files(&key, &restored, &enc, &[], &snapshot).unwrap();
-    assert_eq!(rewrote, 1);
-
-    let cipher_a_after = std::fs::read(enc.join(&name_a)).unwrap();
-    let cipher_b_after = std::fs::read(enc.join(&name_b)).unwrap();
-    assert_ne!(
-      cipher_a_before, cipher_a_after,
-      "changed file should have new ciphertext"
-    );
-    assert_eq!(
-      cipher_b_before, cipher_b_after,
-      "unchanged file should have stable ciphertext"
-    );
-  }
-
-  #[test]
-  fn test_reencrypt_handles_added_and_removed() {
-    let key = make_key();
-    let work = TempDir::new().unwrap();
-    let plain = work.path().join("plain");
-    let enc = work.path().join("enc");
-    std::fs::create_dir_all(&plain).unwrap();
-    std::fs::write(plain.join("keep"), b"k").unwrap();
-    std::fs::write(plain.join("delete"), b"d").unwrap();
-    encrypt_profile_dir(&key, &plain, &enc, &[]).unwrap();
-
-    let restored = work.path().join("restored");
-    let snapshot = decrypt_profile_dir(&key, &enc, &restored).unwrap();
-
-    std::fs::remove_file(restored.join("delete")).unwrap();
-    std::fs::write(restored.join("new"), b"n").unwrap();
-
-    reencrypt_changed_files(&key, &restored, &enc, &[], &snapshot).unwrap();
-
-    let names: HashSet<String> = std::fs::read_dir(&enc)
-      .unwrap()
-      .filter_map(|e| e.ok())
-      .map(|e| e.file_name().to_string_lossy().into_owned())
-      .collect();
-
-    assert!(names.contains(&hmac_filename(&key, "keep")));
-    assert!(names.contains(&hmac_filename(&key, "new")));
-    assert!(!names.contains(&hmac_filename(&key, "delete")));
-    assert!(names.contains(VERIFY_FILE_NAME));
-  }
-
-  #[test]
-  fn test_rekey_changes_filenames_and_content() {
-    let old = make_key();
-    let new = make_key();
-    let work = TempDir::new().unwrap();
-    let plain = work.path().join("plain");
-    let enc = work.path().join("enc");
-    std::fs::create_dir_all(&plain).unwrap();
-    std::fs::write(plain.join("x"), b"data").unwrap();
-    encrypt_profile_dir(&old, &plain, &enc, &[]).unwrap();
-
-    let old_name = hmac_filename(&old, "x");
-    let new_name = hmac_filename(&new, "x");
-    assert_ne!(old_name, new_name);
-
-    rekey_profile_dir(&old, &new, &enc).unwrap();
-
-    assert!(!enc.join(&old_name).exists());
-    assert!(enc.join(&new_name).exists());
-    verify_key_against_dir(&new, &enc).unwrap();
-    assert!(matches!(
-      verify_key_against_dir(&old, &enc),
-      Err(PasswordError::WrongPassword)
-    ));
-
-    let restored = work.path().join("restored");
-    decrypt_profile_dir(&new, &enc, &restored).unwrap();
-    assert_eq!(std::fs::read(restored.join("x")).unwrap(), b"data");
-  }
-
-  #[test]
-  fn test_atomic_write_leaves_original_intact_if_tmp_lingers() {
-    let work = TempDir::new().unwrap();
-    let target = work.path().join("file");
-    std::fs::write(&target, b"original").unwrap();
-
-    // Simulate a stale tmp from a crashed write
-    std::fs::write(target.with_extension("donut-tmp"), b"partial").unwrap();
-
-    // A successful write should overwrite the original even when stale tmp exists
-    atomic_write(&target, b"new").unwrap();
-    assert_eq!(std::fs::read(&target).unwrap(), b"new");
-  }
-
-  #[test]
-  fn test_key_cache_lifecycle() {
-    let id = uuid::Uuid::new_v4();
-    assert!(!has_cached_key(&id));
-    cache_key(id, [9u8; 32]);
-    assert!(has_cached_key(&id));
-    assert_eq!(get_cached_key(&id), Some([9u8; 32]));
-    drop_cached_key(&id);
-    assert!(!has_cached_key(&id));
-  }
-
-  #[test]
-  fn test_unlock_helper() {
-    let work = TempDir::new().unwrap();
-    let plain = work.path().join("plain");
-    let enc = work.path().join("enc");
-    std::fs::create_dir_all(&plain).unwrap();
-    std::fs::write(plain.join("x"), b"data").unwrap();
-
-    let salt = generate_salt();
-    let key = derive_profile_key("correct horse", &salt).unwrap();
-    encrypt_profile_dir(&key, &plain, &enc, &[]).unwrap();
-
-    let id = uuid::Uuid::new_v4();
-    drop_cached_key(&id);
-    assert!(unlock(id, "wrong", &salt, &enc).is_err());
-    assert!(!has_cached_key(&id));
-    assert!(unlock(id, "correct horse", &salt, &enc).is_ok());
-    assert!(has_cached_key(&id));
-    drop_cached_key(&id);
-  }
-}
+#[path = "encryption_tests.rs"]
+mod tests;

@@ -1,8 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { Event as TauriEvent } from "@tauri-apps/api/event";
 import { listen } from "@tauri-apps/api/event";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import i18n from "@/i18n";
+import { translateBackendError } from "@/lib/backend-errors";
 import { getBrowserDisplayName } from "@/lib/browser-utils";
 import { isOnboardingActive } from "@/lib/onboarding-signal";
 import {
@@ -38,6 +39,7 @@ interface DownloadProgress {
   speed_bytes_per_sec: number;
   eta_seconds?: number;
   stage: string;
+  error?: string;
 }
 
 interface BrowserVersionsResult {
@@ -58,6 +60,11 @@ export function useBrowserDownload() {
   );
   const [downloadProgress, setDownloadProgress] =
     useState<DownloadProgress | null>(null);
+  // Last non-terminal stage seen per browser-version. The backend's terminal
+  // "error" event does not say which phase failed, and only a failed
+  // extraction deletes the archive, so the phase it interrupted is what
+  // decides which message the user gets.
+  const lastDownloadStageRef = useRef(new Map<string, string>());
 
   const formatTime = useCallback((seconds: number): string => {
     if (seconds < 60) {
@@ -247,12 +254,15 @@ export function useBrowserDownload() {
 
           // Ensure the long-running download toast is dismissed, and show a finite error toast
           dismissToast(`download-${browserStr}-${version}`);
+          // Same id as the progress listener's error toast, so the concrete
+          // backend message replaces the generic one instead of stacking on it.
           showErrorToast(
             i18n.t("browserDownload.toast.downloadFailed", {
               browser: browserName,
               version,
             }),
             {
+              id: `download-error-${browserStr}-${version}`,
               description: errorMessage,
               duration: 8000,
             },
@@ -304,15 +314,22 @@ export function useBrowserDownload() {
             const progress = event.payload;
             setDownloadProgress(progress);
 
+            const downloadKey = `${progress.browser}-${progress.version}`;
+            const interruptedStage =
+              lastDownloadStageRef.current.get(downloadKey);
+
             if (
               progress.stage === "downloading" ||
               progress.stage === "extracting" ||
               progress.stage === "verifying"
             ) {
+              lastDownloadStageRef.current.set(downloadKey, progress.stage);
               setDownloadingBrowsers((prev) => {
                 if (prev.has(progress.browser)) return prev;
                 return new Set(prev).add(progress.browser);
               });
+            } else {
+              lastDownloadStageRef.current.delete(downloadKey);
             }
 
             const browserName = getBrowserDisplayName(progress.browser);
@@ -390,15 +407,26 @@ export function useBrowserDownload() {
               // During first-run onboarding the welcome dialog surfaces a
               // concrete setup error itself, so suppress the global toast.
               if (!isOnboardingActive()) {
+                const wasExtracting = interruptedStage === "extracting";
                 showErrorToast(
-                  i18n.t("browserDownload.toast.extractionFailed", {
-                    browser: browserName,
-                    version: progress.version,
-                  }),
+                  i18n.t(
+                    wasExtracting
+                      ? "browserDownload.toast.extractionFailed"
+                      : "browserDownload.toast.downloadFailed",
+                    {
+                      browser: browserName,
+                      version: progress.version,
+                    },
+                  ),
                   {
-                    description: i18n.t(
-                      "browserDownload.toast.extractionFailedDescription",
-                    ),
+                    id: `download-error-${progress.browser}-${progress.version}`,
+                    description: progress.error
+                      ? translateBackendError(i18n.t, progress.error)
+                      : i18n.t(
+                          wasExtracting
+                            ? "browserDownload.toast.extractionFailedDescription"
+                            : "browserDownload.toast.downloadFailedDescription",
+                        ),
                   },
                 );
               }

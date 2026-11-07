@@ -9,6 +9,8 @@ pub struct ProxySettings {
   pub port: u16,
   pub username: Option<String>,
   pub password: Option<String>,
+  /// The share link of a `vless`, `vmess`, `trojan` or `hysteria2` proxy. It
+  /// holds the whole server configuration; the name predates the other three.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub vless_uri: Option<String>,
 }
@@ -24,6 +26,15 @@ impl BrowserType {
     match self {
       BrowserType::FingerprintChromium => crate::fingerprint_chromium::BROWSER_ID,
       BrowserType::Wayfern => "wayfern",
+    }
+  }
+
+  /// Brand name for user-facing strings. `as_str` is the internal id and is
+  /// the wrong thing to put in a message the user reads.
+  pub fn display_name(&self) -> &'static str {
+    match self {
+      BrowserType::FingerprintChromium => "Fingerprint Chromium",
+      BrowserType::Wayfern => "Wayfern",
     }
   }
 
@@ -224,7 +235,6 @@ mod linux {
   #[allow(dead_code)]
   pub fn prepare_executable(executable_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // On Linux, ensure the executable has proper permissions
-    log::info!("Setting execute permissions for: {:?}", executable_path);
 
     let metadata = std::fs::metadata(executable_path)?;
     let mut permissions = metadata.permissions();
@@ -235,10 +245,7 @@ mod linux {
 
     std::fs::set_permissions(executable_path, permissions)?;
 
-    log::info!(
-      "Execute permissions set successfully for: {:?}",
-      executable_path
-    );
+    log::debug!("Execute permission set path={}", executable_path.display());
     Ok(())
   }
 }
@@ -422,7 +429,6 @@ impl Browser for WayfernBrowser {
       "--no-default-browser-check".to_string(),
       "--disable-background-mode".to_string(),
       "--disable-component-update".to_string(),
-      "--disable-background-timer-throttling".to_string(),
       "--crash-server-url=".to_string(),
       "--disable-updater".to_string(),
       "--disable-session-crashed-bubble".to_string(),
@@ -614,6 +620,10 @@ pub struct GithubAsset {
   #[serde(default)]
   pub updated_at: Option<String>,
 }
+
+// Global singleton instance
+static BROWSER_FACTORY: std::sync::LazyLock<BrowserFactory> =
+  std::sync::LazyLock::new(BrowserFactory::new);
 
 #[cfg(test)]
 mod tests {
@@ -849,11 +859,15 @@ mod tests {
       last_sync: None,
       host_os: None,
       ephemeral: false,
+      temporary: false,
       extension_group_id: None,
       proxy_bypass_rules: Vec::new(),
       created_by_id: None,
       created_by_email: None,
       dns_blocklist: None,
+      dns_server: None,
+      status_id: None,
+      start_urls: Vec::new(),
       password_protected: false,
       clear_on_close: false,
       created_at: None,
@@ -868,9 +882,4 @@ mod tests {
         .join("profile")
     );
   }
-}
-
-// Global singleton instance
-lazy_static::lazy_static! {
-  static ref BROWSER_FACTORY: BrowserFactory = BrowserFactory::new();
 }

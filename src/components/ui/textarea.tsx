@@ -1,15 +1,37 @@
+"use client";
+
+import { cva, type VariantProps } from "class-variance-authority";
 import * as React from "react";
 
+import { useFieldVariant } from "@/components/ui/field-variant";
+import { FOCUS_RING } from "@/components/ui/focus-ring";
 import { cn } from "@/lib/utils";
 
-export type TextareaProps = React.TextareaHTMLAttributes<HTMLTextAreaElement>;
+const textareaVariants = cva(
+  "flex min-h-[80px] w-full px-3 py-2 text-sm transition-[color,background-color,border-color,box-shadow] placeholder:text-muted-foreground disabled:cursor-not-allowed disabled:opacity-50",
+  {
+    variants: {
+      variant: {
+        default: `rounded-md border border-input bg-background ${FOCUS_RING} aria-invalid:border-destructive aria-invalid:focus-visible:ring-destructive`,
+        soft: `rounded-lg bg-foreground/5 hover:bg-foreground/7 focus-visible:bg-foreground/7 ${FOCUS_RING} aria-invalid:bg-destructive/10 aria-invalid:ring-2 aria-invalid:ring-destructive/40 aria-invalid:focus-visible:ring-destructive`,
+      },
+    },
+    defaultVariants: {
+      variant: "default",
+    },
+  },
+);
+
+export type TextareaProps = React.TextareaHTMLAttributes<HTMLTextAreaElement> &
+  VariantProps<typeof textareaVariants>;
 
 const Textarea = React.forwardRef<HTMLTextAreaElement, TextareaProps>(
-  ({ className, ...props }, ref) => {
+  ({ className, variant, ...props }, ref) => {
+    const inherited = useFieldVariant();
     return (
       <textarea
         className={cn(
-          "flex min-h-[80px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50",
+          textareaVariants({ variant: variant ?? inherited }),
           className,
         )}
         ref={ref}

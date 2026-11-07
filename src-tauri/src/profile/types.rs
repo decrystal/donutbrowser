@@ -61,6 +61,13 @@ pub struct BrowserProfile {
   pub host_os: Option<String>, // OS where profile was created ("macos", "windows", "linux")
   #[serde(default)]
   pub ephemeral: bool,
+  /// A profile that exists for one automation run. REST and MCP create it,
+  /// the browser stopping destroys it, and a startup sweep destroys any that
+  /// outlived a crash. Always ephemeral as well, so nothing it browses ever
+  /// reaches real disk. Never trashed: a disposable profile has nothing to
+  /// restore, and keeping one would defeat the point of asking for it.
+  #[serde(default)]
+  pub temporary: bool,
   #[serde(default)]
   pub extension_group_id: Option<String>,
   #[serde(default)]
@@ -71,6 +78,16 @@ pub struct BrowserProfile {
   pub created_by_email: Option<String>,
   #[serde(default)]
   pub dns_blocklist: Option<String>,
+  /// The DNS server this profile resolves names with, through its own proxy
+  /// or VPN (see `profile_dns`). `None` lets the proxy resolve them.
+  #[serde(default)]
+  pub dns_server: Option<String>,
+  /// The profile's status (see `profile_statuses`), by id.
+  #[serde(default)]
+  pub status_id: Option<String>,
+  /// Pages a launch opens, in order. An explicit launch URL replaces them.
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub start_urls: Vec<String>,
   /// True when the on-disk profile dir is encrypted with a per-profile password.
   /// Decryption goes to a RAM-backed ephemeral dir, never to disk.
   #[serde(default)]
@@ -110,8 +127,8 @@ pub fn get_host_os() -> String {
 ///
 /// A fingerprint OS is a wider set than a host OS: `"android"` and `"ios"` are
 /// valid fingerprints but no machine ever reports them as its host. Storing one
-/// in `host_os` makes `is_cross_os` permanently true, which bars the profile
-/// from every local launch path on the very machine that created it.
+/// in `host_os` records a creating machine that cannot exist, which every
+/// reader of `host_os` then treats as foreign.
 pub fn is_host_os(value: &str) -> bool {
   matches!(value, "macos" | "windows" | "linux")
 }
@@ -138,13 +155,55 @@ impl BrowserProfile {
       .or_else(|| self.wayfern_config.as_ref().and_then(|c| c.os.as_deref()))
   }
 
-  /// Returns true when the profile was created on a different OS than the current host.
-  /// Checks `host_os` first, then falls back to the browser config's `os` field.
+  /// Whether this profile's directory runs on every supported OS, whichever OS
+  /// wrote it. True for Wayfern; other browsers stay on the OS that created
+  /// their profile.
+  pub fn runs_on_any_os(&self) -> bool {
+    self.browser == "wayfern"
+  }
+
+  /// The host OS a remote session or a cookie-bot run is scheduled on, or
+  /// `None` when the profile cannot be scheduled.
+  ///
+  /// A profile that runs on every OS goes to a Linux host, which presents the
+  /// fingerprint's `os`, else the OS of the machine that created the profile.
+  /// Unlike `native_os` there is no fallback to this machine, which is not the
+  /// host, and a `host_os` that is not a real machine counts as unknown: with
+  /// neither OS the profile has none to present and no host. Any other profile
+  /// goes to the OS that created it.
+  pub fn remote_platform(&self) -> Option<&str> {
+    if self.runs_on_any_os() {
+      let fingerprint_os = self.wayfern_config.as_ref().and_then(|c| c.os.as_deref());
+      let creating_os = self.host_os.as_deref().filter(|os| is_host_os(os));
+      return fingerprint_os.or(creating_os).map(|_| "linux");
+    }
+    self.resolved_os()
+  }
+
+  /// Returns true when the profile cannot run here because a browser bound to
+  /// its OS created it on a different OS. A Wayfern profile is never cross-OS:
+  /// it syncs its data and launches on every OS.
   pub fn is_cross_os(&self) -> bool {
+    if self.runs_on_any_os() {
+      return false;
+    }
     match self.resolved_os() {
       Some(os) => os != get_host_os(),
       None => false,
     }
+  }
+
+  /// The OS a fingerprint without an explicit `os` describes: the machine that
+  /// created the profile, or this machine when that is not recorded. Such a
+  /// fingerprint was generated for its creating machine, so it keeps that OS
+  /// when the profile moves to another one.
+  pub fn native_os(&self) -> String {
+    self
+      .host_os
+      .as_deref()
+      .filter(|os| is_host_os(os))
+      .map(str::to_string)
+      .unwrap_or_else(get_host_os)
   }
 
   /// Returns true if sync is enabled (either Regular or Encrypted mode).
@@ -180,5 +239,93 @@ mod tests {
     for os in ["android", "ios", "", "Windows", "chromeos"] {
       assert!(!is_host_os(os), "{os} must not be stored as a host OS");
     }
+  }
+
+  fn other_host_os() -> &'static str {
+    if get_host_os() == "windows" {
+      "macos"
+    } else {
+      "windows"
+    }
+  }
+
+  fn profile_from(browser: &str, host_os: Option<&str>) -> BrowserProfile {
+    BrowserProfile {
+      browser: browser.to_string(),
+      host_os: host_os.map(str::to_string),
+      ..BrowserProfile::default()
+    }
+  }
+
+  #[test]
+  fn a_wayfern_profile_from_another_os_is_not_cross_os() {
+    for os in ["macos", "windows", "linux"] {
+      let profile = profile_from("wayfern", Some(os));
+      assert!(profile.runs_on_any_os());
+      assert!(
+        !profile.is_cross_os(),
+        "a Wayfern profile created on {os} must run here"
+      );
+    }
+    // A claimed OS with no recorded creating machine is not a reason either.
+    let mut claimed = profile_from("wayfern", None);
+    claimed.wayfern_config = Some(WayfernConfig {
+      os: Some(other_host_os().to_string()),
+      ..WayfernConfig::default()
+    });
+    assert!(!claimed.is_cross_os());
+  }
+
+  #[test]
+  fn a_profile_of_another_browser_stays_on_its_own_os() {
+    let foreign = profile_from("camoufox", Some(other_host_os()));
+    assert!(!foreign.runs_on_any_os());
+    assert!(foreign.is_cross_os());
+    assert!(!profile_from("camoufox", Some(&get_host_os())).is_cross_os());
+    assert!(!profile_from("camoufox", None).is_cross_os());
+  }
+
+  #[test]
+  fn a_profile_that_runs_on_any_os_is_scheduled_on_linux_only_with_an_os_to_present() {
+    for os in ["macos", "windows", "linux"] {
+      assert_eq!(
+        profile_from("wayfern", Some(os)).remote_platform(),
+        Some("linux"),
+        "a Wayfern profile created on {os} runs on a Linux host"
+      );
+    }
+    let mut mobile = profile_from("wayfern", None);
+    mobile.wayfern_config = Some(WayfernConfig {
+      os: Some("android".to_string()),
+      ..WayfernConfig::default()
+    });
+    assert_eq!(mobile.remote_platform(), Some("linux"));
+
+    // Nothing says which OS the profile is, so no host can run it.
+    assert_eq!(profile_from("wayfern", None).remote_platform(), None);
+    // A fingerprint OS stored as the creating machine is not a machine.
+    assert_eq!(
+      profile_from("wayfern", Some("android")).remote_platform(),
+      None
+    );
+
+    // A profile bound to its OS still goes to the OS that created it.
+    assert_eq!(
+      profile_from("camoufox", Some("macos")).remote_platform(),
+      Some("macos")
+    );
+    assert_eq!(profile_from("camoufox", None).remote_platform(), None);
+  }
+
+  #[test]
+  fn native_os_is_the_creating_machine_not_this_one() {
+    let other = other_host_os();
+    assert_eq!(profile_from("wayfern", Some(other)).native_os(), other);
+    assert_eq!(profile_from("wayfern", None).native_os(), get_host_os());
+    // A fingerprint OS stored by mistake is not a machine.
+    assert_eq!(
+      profile_from("wayfern", Some("android")).native_os(),
+      get_host_os()
+    );
   }
 }

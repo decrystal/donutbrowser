@@ -32,6 +32,79 @@ pub struct BrowserVersionManager {
   api_client: &'static ApiClient,
 }
 
+/// The OS and CPU of this machine, as the Wayfern catalogue names them
+/// (`linux-arm64`, `windows-x64`, ...).
+///
+/// The CPU is the machine's own, not the one Donut was compiled for: Windows
+/// on ARM runs the x64 build of Donut under emulation, and it must still get
+/// the arm64 browser.
+/// The local file name of a Wayfern archive for one downloads key, or None for an unknown key.
+pub(crate) fn wayfern_archive_name(version: &str, slot: &str) -> Option<String> {
+  let extension = match slot {
+    "macos-arm64" | "macos-x64" => "dmg",
+    "linux-x64" | "linux-arm64" => "tar.xz",
+    "windows-x64" | "windows-arm64" => "zip",
+    _ => return None,
+  };
+  Some(format!("wayfern-{version}-{slot}.{extension}"))
+}
+
+/// The downloads key that `wayfern_archive_name` built `filename` from.
+pub(crate) fn wayfern_slot_of_archive<'a>(filename: &'a str, version: &str) -> Option<&'a str> {
+  let rest = filename
+    .strip_prefix("wayfern-")?
+    .strip_prefix(version)?
+    .strip_prefix('-')?;
+  [".dmg", ".tar.xz", ".zip"]
+    .iter()
+    .find_map(|extension| rest.strip_suffix(extension))
+}
+
+pub(crate) fn host_platform() -> (String, String) {
+  let os = if cfg!(target_os = "windows") {
+    "windows"
+  } else if cfg!(target_os = "linux") {
+    "linux"
+  } else if cfg!(target_os = "macos") {
+    "macos"
+  } else {
+    "unknown"
+  };
+
+  #[cfg(target_os = "windows")]
+  if let Some(arch) = windows_native_arch() {
+    return (os.to_string(), arch.to_string());
+  }
+
+  let arch = if cfg!(target_arch = "x86_64") {
+    "x64"
+  } else if cfg!(target_arch = "aarch64") {
+    "arm64"
+  } else {
+    "unknown"
+  };
+
+  (os.to_string(), arch.to_string())
+}
+
+/// The native CPU of a Windows machine, also when this process is emulated.
+#[cfg(target_os = "windows")]
+fn windows_native_arch() -> Option<&'static str> {
+  use windows::Win32::System::SystemInformation::{
+    IMAGE_FILE_MACHINE, IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64,
+  };
+  use windows::Win32::System::Threading::{GetCurrentProcess, IsWow64Process2};
+
+  let mut process = IMAGE_FILE_MACHINE::default();
+  let mut native = IMAGE_FILE_MACHINE::default();
+  unsafe { IsWow64Process2(GetCurrentProcess(), &mut process, Some(&mut native)) }.ok()?;
+  match native {
+    IMAGE_FILE_MACHINE_ARM64 => Some("arm64"),
+    IMAGE_FILE_MACHINE_AMD64 => Some("x64"),
+    _ => None,
+  }
+}
+
 impl BrowserVersionManager {
   fn new() -> Self {
     Self {
@@ -48,7 +121,7 @@ impl BrowserVersionManager {
     &self,
     browser: &str,
   ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let (os, arch) = Self::get_platform_info();
+    let (os, arch) = host_platform();
 
     match browser {
       crate::fingerprint_chromium::BROWSER_ID => Ok(matches!(
@@ -227,7 +300,7 @@ impl BrowserVersionManager {
         .api_client
         .save_cached_versions(browser, &merged_releases)
       {
-        log::error!("Failed to save merged cache for {browser}: {e}");
+        log::warn!("Browser version cache save failed browser={browser} err=\"{e}\"");
       }
     }
 
@@ -309,7 +382,7 @@ impl BrowserVersionManager {
       })
       .collect();
     if let Err(e) = self.api_client.save_cached_versions(browser, &releases) {
-      log::error!("Failed to save updated cache for {browser}: {e}");
+      log::warn!("Browser version cache save failed browser={browser} err=\"{e}\"");
     }
 
     Ok(new_versions_count)
@@ -321,7 +394,7 @@ impl BrowserVersionManager {
     browser: &str,
     version: &str,
   ) -> Result<DownloadInfo, Box<dyn std::error::Error + Send + Sync>> {
-    let (os, arch) = Self::get_platform_info();
+    let (os, arch) = host_platform();
 
     match browser {
       crate::fingerprint_chromium::BROWSER_ID => {
@@ -377,19 +450,16 @@ impl BrowserVersionManager {
         // Wayfern downloads from https://download.wayfern.com/
         // File naming: wayfern-{chromium_version}-{platform}-{arch}.{ext}
         // Platform/arch format: linux-x64, macos-arm64, etc.
-        let platform_key = format!("{os}-{arch}");
-        let (filename, is_archive) = match platform_key.as_str() {
-          "macos-arm64" | "macos-x64" => (format!("wayfern-{version}-{platform_key}.dmg"), true),
-          "linux-x64" | "linux-arm64" => (format!("wayfern-{version}-{platform_key}.tar.xz"), true),
-          "windows-x64" | "windows-arm64" => {
-            (format!("wayfern-{version}-{platform_key}.zip"), true)
-          }
-          _ => {
-            return Err(
-              format!("Unsupported platform/architecture for Wayfern: {os}/{arch}").into(),
-            )
-          }
+        // The local name follows the build this host actually takes, so a file named for one CPU
+        // never holds another CPU's build. Without a cached manifest it names the host's own slot.
+        let platform_key = self
+          .api_client
+          .cached_wayfern_slot()
+          .unwrap_or_else(|| format!("{os}-{arch}"));
+        let Some(filename) = wayfern_archive_name(version, &platform_key) else {
+          return Err(format!("Unsupported platform/architecture for Wayfern: {os}/{arch}").into());
         };
+        let is_archive = true;
 
         // Note: The actual URL will be resolved dynamically from version.json in downloader.rs
         Ok(DownloadInfo {
@@ -401,29 +471,6 @@ impl BrowserVersionManager {
       }
       _ => Err(format!("Unsupported browser: {browser}").into()),
     }
-  }
-
-  /// Get platform and architecture information
-  fn get_platform_info() -> (String, String) {
-    let os = if cfg!(target_os = "windows") {
-      "windows"
-    } else if cfg!(target_os = "linux") {
-      "linux"
-    } else if cfg!(target_os = "macos") {
-      "macos"
-    } else {
-      "unknown"
-    };
-
-    let arch = if cfg!(target_arch = "x86_64") {
-      "x64"
-    } else if cfg!(target_arch = "aarch64") {
-      "arm64"
-    } else {
-      "unknown"
-    };
-
-    (os.to_string(), arch.to_string())
   }
 
   async fn fetch_wayfern_versions(
@@ -462,6 +509,46 @@ pub async fn get_browser_release_types(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn wayfern_archive_name_follows_the_slot_taken_and_round_trips() {
+    let version = "155.0.8059.79";
+    assert_eq!(
+      wayfern_archive_name(version, "windows-arm64").as_deref(),
+      Some("wayfern-155.0.8059.79-windows-arm64.zip")
+    );
+    // Windows on Arm that falls back to the x64 build stores it under the x64 name.
+    assert_eq!(
+      wayfern_archive_name(version, "windows-x64").as_deref(),
+      Some("wayfern-155.0.8059.79-windows-x64.zip")
+    );
+    assert_eq!(
+      wayfern_archive_name(version, "linux-arm64").as_deref(),
+      Some("wayfern-155.0.8059.79-linux-arm64.tar.xz")
+    );
+    assert_eq!(wayfern_archive_name(version, "plan9-x64"), None);
+    for slot in [
+      "macos-arm64",
+      "linux-x64",
+      "linux-arm64",
+      "windows-x64",
+      "windows-arm64",
+    ] {
+      let name = wayfern_archive_name(version, slot).unwrap();
+      assert_eq!(wayfern_slot_of_archive(&name, version), Some(slot));
+    }
+    assert_eq!(
+      wayfern_slot_of_archive("wayfern-155.0.8059.79-windows-x64.zip", "154.0.8037.57"),
+      None
+    );
+    // A rebuild's version carries its revision, and the name still round-trips.
+    let rebuilt = wayfern_archive_name("155.0.8059.79-2", "windows-x64").unwrap();
+    assert_eq!(rebuilt, "wayfern-155.0.8059.79-2-windows-x64.zip");
+    assert_eq!(
+      wayfern_slot_of_archive(&rebuilt, "155.0.8059.79-2"),
+      Some("windows-x64")
+    );
+  }
 
   #[tokio::test]
   async fn test_browser_version_manager_creation() {
@@ -516,15 +603,13 @@ mod tests {
       assert!(wayfern_info.is_archive);
     }
 
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[cfg(target_os = "windows")]
     {
-      assert_eq!(wayfern_info.filename, "wayfern-1.0.0-windows-x64.zip");
-      assert!(wayfern_info.is_archive);
-    }
-
-    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
-    {
-      assert_eq!(wayfern_info.filename, "wayfern-1.0.0-windows-arm64.zip");
+      let (_, arch) = host_platform();
+      assert_eq!(
+        wayfern_info.filename,
+        format!("wayfern-1.0.0-windows-{arch}.zip")
+      );
       assert!(wayfern_info.is_archive);
     }
 
@@ -606,11 +691,15 @@ pub async fn fetch_browser_versions_cached_first(
       let service_clone = BrowserVersionManager::instance();
       let browser_str_clone = browser_str.clone();
       tokio::spawn(async move {
-        if let Err(e) = service_clone
+        match service_clone
           .fetch_browser_versions_detailed(&browser_str_clone, false)
           .await
         {
-          log::error!("Background version update failed for {browser_str_clone}: {e}");
+          Ok(_) => BACKGROUND_UPDATE.succeeded(),
+          Err(e) => BACKGROUND_UPDATE.failed(format_args!(
+            "browser={browser_str_clone} {}",
+            crate::log_redaction::text(&e.to_string())
+          )),
         }
       });
     }
@@ -638,11 +727,15 @@ pub async fn fetch_browser_versions_with_count_cached_first(
       let service_clone = BrowserVersionManager::instance();
       let browser_str_clone = browser_str.clone();
       tokio::spawn(async move {
-        if let Err(e) = service_clone
+        match service_clone
           .fetch_browser_versions_with_count(&browser_str_clone, false)
           .await
         {
-          log::error!("Background version update failed for {browser_str_clone}: {e}");
+          Ok(_) => BACKGROUND_UPDATE.succeeded(),
+          Err(e) => BACKGROUND_UPDATE.failed(format_args!(
+            "browser={browser_str_clone} {}",
+            crate::log_redaction::text(&e.to_string())
+          )),
         }
       });
     }
@@ -674,6 +767,8 @@ pub async fn fetch_browser_versions_with_count(
 }
 
 // Global singleton instance
-lazy_static::lazy_static! {
-  static ref BROWSER_VERSION_SERVICE: BrowserVersionManager = BrowserVersionManager::new();
-}
+static BACKGROUND_UPDATE: crate::log_streak::Streak =
+  crate::log_streak::Streak::new(module_path!(), "Background browser version update");
+
+static BROWSER_VERSION_SERVICE: std::sync::LazyLock<BrowserVersionManager> =
+  std::sync::LazyLock::new(BrowserVersionManager::new);

@@ -12,6 +12,13 @@ use super::types::{SyncError, SyncResult};
 /// Default exclude patterns for volatile browser profile files.
 /// Patterns use `**/` prefix to match at any directory depth, since the sync
 /// engine scans from `profiles/{uuid}/` which contains `profile/Default/...`.
+///
+/// `Service Worker/ScriptCache` and `Service Worker/CacheStorage` are site
+/// data, not caches: Chromium drops a service worker registration whose script
+/// is missing, which loses the site's push subscription and offline data, and
+/// an extension's background worker fails its first start. `Secure
+/// Preferences` holds the extension, homepage and startup settings of profiles
+/// written by browsers that kept tracked preferences there.
 pub const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &[
   "**/Cache/**",
   "**/Code Cache/**",
@@ -20,8 +27,6 @@ pub const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &[
   "**/ShaderCache/**",
   "**/DawnCache/**",
   "**/DawnGraphiteCache/**",
-  "**/Service Worker/CacheStorage/**",
-  "**/Service Worker/ScriptCache/**",
   "**/Session Storage/**",
   "**/blob_storage/**",
   "**/Crashpad/**",
@@ -52,14 +57,24 @@ pub const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &[
   "**/LOCK",
   "**/*-journal",
   "**/*-wal",
+  "**/*-shm",
   "**/SingletonLock",
+  // Rewritten by donut before every launch from the profile metadata that
+  // already syncs; uploading it would only duplicate that state.
+  "**/wayfern-identity.json",
+  "**/wayfern-identity-result.json",
+  "**/wayfern-persona.json",
   "**/SingletonSocket",
   "**/SingletonCookie",
-  "**/Secure Preferences",
   "**/GraphiteDawnCache/**",
   "**/DawnWebGPUCache/**",
+  "**/GPUPersistentCache/**",
   "**/BrowserMetrics*",
   "**/.DS_Store",
+  // Site storage a repair moved aside (`site_storage.rs`): kept on this
+  // device only, until the person deletes it.
+  "**/*.donut-backup-*",
+  "**/*.donut-backup-*/**",
   // Profile metadata is a separately reconciled LWW config object. Including
   // it in the browser-file manifest creates two competing sync mechanisms and
   // lets a stale in-memory profile overwrite a metadata download.
@@ -269,10 +284,7 @@ pub fn generate_manifest(
   let mut max_mtime: i64 = 0;
 
   if !profile_dir.exists() {
-    log::debug!(
-      "Profile directory doesn't exist: {}, creating empty manifest",
-      profile_dir.display()
-    );
+    log::debug!("Profile dir missing, empty manifest profile={profile_id}");
     return Ok(manifest);
   }
 
@@ -385,9 +397,11 @@ pub fn generate_manifest(
   // Sort files for deterministic manifest
   manifest.files.sort_by(|a, b| a.path.cmp(&b.path));
 
-  // Update the updatedAt timestamp to max mtime
-  if max_mtime > 0 {
-    if let Some(dt) = DateTime::from_timestamp(max_mtime, 0) {
+  // Update the updatedAt timestamp to max mtime, or to a local edit no mtime
+  // shows (`mark_local_edit`), whichever is newer.
+  let newest = max_mtime.max(local_edit_secs(profile_dir).unwrap_or(0));
+  if newest > 0 {
+    if let Some(dt) = DateTime::from_timestamp(newest, 0) {
       manifest.updated_at = dt.to_rfc3339();
     }
   }
@@ -423,7 +437,7 @@ pub enum DiffBias {
   /// Remote wins regardless of timestamps.
   ///
   /// Used for exactly one thing: the pull that follows a remote session. A
-  /// leased host has just written the authoritative copy of this profile, and
+  /// remote host has just written the authoritative copy of this profile, and
   /// the local directory is whatever it was before the session started. If the
   /// user launched locally in between, local mtimes are NEWER than the host's
   /// push, so `Auto` would upload the stale copy and put every file the host
@@ -432,6 +446,168 @@ pub enum DiffBias {
   /// the local clock genuinely is later; only the caller knows that the remote
   /// copy is the one that matters.
   PreferRemote,
+  /// Remote wins, for the pull that follows a restore point: the server now
+  /// holds the restored files, and the local copy is the one being replaced.
+  Restore,
+  /// Local wins regardless of timestamps: only this copy changed since the
+  /// last sync, or both did and this one is kept (`SyncedSide`).
+  PreferLocal,
+}
+
+/// Which copies changed since the last sync both sides agreed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Changed {
+  /// No record of the last sync: timestamps decide, as before.
+  Unknown,
+  Neither,
+  Local,
+  Remote,
+  Both,
+}
+
+impl Changed {
+  /// The direction this change calls for; `Auto` when timestamps decide.
+  /// Both changed keeps the local copy: a download would replace files this
+  /// device changed with a copy that does not have those changes.
+  pub fn bias(self) -> DiffBias {
+    match self {
+      Changed::Local | Changed::Both => DiffBias::PreferLocal,
+      Changed::Remote => DiffBias::PreferRemote,
+      Changed::Unknown | Changed::Neither => DiffBias::Auto,
+    }
+  }
+}
+
+/// A digest of a manifest's files by path and content. Times are left out:
+/// a copy with the same content is the same copy.
+pub fn files_digest(manifest: &SyncManifest) -> String {
+  use sha2::Digest;
+  let mut files: Vec<(&str, &str)> = manifest
+    .files
+    .iter()
+    .map(|f| (f.path.as_str(), f.hash.as_str()))
+    .collect();
+  files.sort_unstable();
+  let mut hasher = sha2::Sha256::new();
+  for (path, hash) in files {
+    hasher.update(path.as_bytes());
+    hasher.update([0]);
+    hasher.update(hash.as_bytes());
+    hasher.update(*b"\n");
+  }
+  hasher
+    .finalize()
+    .iter()
+    .map(|b| format!("{b:02x}"))
+    .collect()
+}
+
+fn synced_path(profile_dir: &Path) -> std::path::PathBuf {
+  profile_dir.join(".donut-sync").join("synced")
+}
+
+/// Notes the copy both sides hold after a successful sync.
+pub fn save_synced(profile_dir: &Path, manifest: &SyncManifest) -> std::io::Result<()> {
+  let path = synced_path(profile_dir);
+  if let Some(parent) = path.parent() {
+    fs::create_dir_all(parent)?;
+  }
+  fs::write(path, files_digest(manifest))
+}
+
+pub fn changed_since_sync(
+  profile_dir: &Path,
+  local: &SyncManifest,
+  remote: &SyncManifest,
+) -> Changed {
+  let Some(synced) = fs::read_to_string(synced_path(profile_dir))
+    .ok()
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+  else {
+    return Changed::Unknown;
+  };
+  match (
+    files_digest(local) != synced,
+    files_digest(remote) != synced,
+  ) {
+    (false, false) => Changed::Neither,
+    (true, false) => Changed::Local,
+    (false, true) => Changed::Remote,
+    (true, true) => Changed::Both,
+  }
+}
+
+/// `Cookies,Local State`: the key files whose content differs between two
+/// copies, or `-`.
+pub fn differing_key_files(a: &SyncManifest, b: &SyncManifest) -> String {
+  let hash_of = |m: &SyncManifest, path: &str| {
+    m.files
+      .iter()
+      .find(|f| f.path == path)
+      .map(|f| f.hash.clone())
+  };
+  let mut names: Vec<&str> = KEY_FILES
+    .iter()
+    .filter(|(path, _)| hash_of(a, path) != hash_of(b, path))
+    .map(|(_, name)| *name)
+    .collect();
+  names.dedup();
+  if names.is_empty() {
+    "-".to_string()
+  } else {
+    names.join(",")
+  }
+}
+
+/// The files that hold a Wayfern profile's cookies and the key that opens
+/// them, by manifest path. A sync that moves one without the other logs the
+/// person out of every site, so the result line names what happened to each.
+const KEY_FILES: &[(&str, &str)] = &[
+  ("profile/os_crypt_key", "os_crypt_key"),
+  ("profile/Local State", "Local State"),
+  ("profile/Default/Network/Cookies", "Cookies"),
+  ("profile/Default/Cookies", "Cookies"),
+];
+
+/// Key material a sync never deletes locally: without it every encrypted
+/// cookie and password in the profile is lost, and a remote copy that lacks it
+/// cannot replace it.
+pub fn is_key_material(path: &str) -> bool {
+  matches!(path, "profile/os_crypt_key" | "profile/Local State")
+}
+
+/// `os_crypt_key:downloaded,Cookies:replaced`: what `diff` does to the
+/// profile's key files on this device, or `-` when it touches none. A download
+/// over a file `local` has is `replaced`; key material the sync keeps instead
+/// of deleting (`keeps_keys`) is `kept`.
+pub fn key_file_changes(diff: &ManifestDiff, local: &SyncManifest, keeps_keys: bool) -> String {
+  let changes: Vec<String> = KEY_FILES
+    .iter()
+    .filter_map(|(path, name)| {
+      let action = if diff.files_to_download.iter().any(|f| f.path == *path) {
+        if local.files.iter().any(|f| f.path == *path) {
+          "replaced"
+        } else {
+          "downloaded"
+        }
+      } else if diff.files_to_delete_local.iter().any(|p| p == path) {
+        if keeps_keys && is_key_material(path) {
+          "kept"
+        } else {
+          "deleted"
+        }
+      } else {
+        return None;
+      };
+      Some(format!("{name}:{action}"))
+    })
+    .collect();
+  if changes.is_empty() {
+    "-".to_string()
+  } else {
+    changes.join(",")
+  }
 }
 
 pub fn compute_diff(local: &SyncManifest, remote: Option<&SyncManifest>) -> ManifestDiff {
@@ -465,7 +641,7 @@ pub fn compute_diff_with_bias(
   // would appear "newer" and cause all remote files to be deleted.
   if local.files.is_empty() && !remote.files.is_empty() {
     log::info!(
-      "Local manifest is empty but remote has {} files — downloading from remote to recover",
+      "Local manifest empty, recovering from remote files={}",
       remote.files.len()
     );
     diff.files_to_download = remote.files.clone();
@@ -477,7 +653,8 @@ pub fn compute_diff_with_bias(
   let remote_updated = remote.updated_at_datetime();
 
   let local_is_newer = match bias {
-    DiffBias::PreferRemote => false,
+    DiffBias::PreferRemote | DiffBias::Restore => false,
+    DiffBias::PreferLocal => true,
     DiffBias::Auto => match (local_updated, remote_updated) {
       (Some(l), Some(r)) => l > r,
       (Some(_), None) => true,
@@ -527,6 +704,31 @@ pub fn compute_diff_with_bias(
   }
 
   diff
+}
+
+fn local_edit_path(profile_dir: &Path) -> std::path::PathBuf {
+  profile_dir.join(".donut-sync").join("local-edit")
+}
+
+fn local_edit_secs(profile_dir: &Path) -> Option<i64> {
+  fs::read_to_string(local_edit_path(profile_dir))
+    .ok()?
+    .trim()
+    .parse()
+    .ok()
+}
+
+/// Marks a profile's synced files as edited now, for a change no file mtime
+/// shows: moving files out of the synced set (a site-data repair) keeps the
+/// newest mtime, or lowers it, and sync would then take the remote copy back.
+/// The profile's next manifest is at least this new. `profile_dir` is the
+/// folder sync walks (`<profiles dir>/<profile id>`).
+pub fn mark_local_edit(profile_dir: &Path) -> std::io::Result<()> {
+  let path = local_edit_path(profile_dir);
+  if let Some(parent) = path.parent() {
+    fs::create_dir_all(parent)?;
+  }
+  fs::write(path, Utc::now().timestamp().to_string())
 }
 
 /// Get the path to the hash cache file for a profile
@@ -675,6 +877,66 @@ mod tests {
   }
 
   #[test]
+  fn test_generate_manifest_keeps_site_data_and_secure_preferences() {
+    let temp_dir = TempDir::new().unwrap();
+    let profile_dir = temp_dir.path().join("profile_root");
+    let default_dir = profile_dir.join("profile/Default");
+    for relative in [
+      "Service Worker/Database/000001.log",
+      "Service Worker/ScriptCache/index",
+      "Service Worker/CacheStorage/index.txt",
+      "Secure Preferences",
+    ] {
+      let path = default_dir.join(relative);
+      fs::create_dir_all(path.parent().unwrap()).unwrap();
+      fs::write(&path, "keep").unwrap();
+    }
+
+    let mut cache = HashCache::default();
+    let manifest = generate_manifest("test-profile", &profile_dir, &mut cache).unwrap();
+
+    let paths: Vec<&str> = manifest.files.iter().map(|f| f.path.as_str()).collect();
+    for kept in [
+      "profile/Default/Service Worker/Database/000001.log",
+      "profile/Default/Service Worker/ScriptCache/index",
+      "profile/Default/Service Worker/CacheStorage/index.txt",
+      "profile/Default/Secure Preferences",
+    ] {
+      assert!(paths.contains(&kept), "{kept} must sync: {paths:?}");
+    }
+  }
+
+  #[test]
+  fn test_generate_manifest_excludes_sqlite_shm_sidecars() {
+    let temp_dir = TempDir::new().unwrap();
+    let profile_dir = temp_dir.path().join("profile_root");
+    let default_dir = profile_dir.join("profile/Default");
+    fs::create_dir_all(&default_dir).unwrap();
+
+    fs::write(profile_dir.join("Cookies-shm"), "scratch").unwrap();
+    fs::write(default_dir.join("History-shm"), "scratch").unwrap();
+    fs::write(default_dir.join("History-wal"), "scratch").unwrap();
+    fs::write(default_dir.join("History"), "keep").unwrap();
+
+    let mut cache = HashCache::default();
+    let manifest = generate_manifest("test-profile", &profile_dir, &mut cache).unwrap();
+
+    let paths: Vec<&str> = manifest.files.iter().map(|f| f.path.as_str()).collect();
+    assert!(
+      !paths.iter().any(|p| p.ends_with("-shm")),
+      "SQLite -shm sidecars are scratch state and must not sync: {paths:?}"
+    );
+    assert!(
+      !paths.iter().any(|p| p.ends_with("-wal")),
+      "-wal sidecars stay excluded: {paths:?}"
+    );
+    assert!(
+      paths.contains(&"profile/Default/History"),
+      "the database itself must still sync: {paths:?}"
+    );
+  }
+
+  #[test]
   fn test_compute_diff_upload_all_when_no_remote() {
     let local = SyncManifest {
       version: 1,
@@ -726,6 +988,52 @@ mod tests {
         .collect(),
       encrypted: false,
     }
+  }
+
+  #[test]
+  fn key_file_changes_name_what_a_sync_does_to_the_key_and_cookies() {
+    let local = manifest_at(
+      "2026-01-01T00:00:00Z",
+      &[
+        ("profile/os_crypt_key", "k1"),
+        ("profile/Local State", "ls"),
+        ("profile/Default/Network/Cookies", "c1"),
+        ("profile/Default/History", "h1"),
+      ],
+    );
+    let remote = manifest_at(
+      "2026-01-02T00:00:00Z",
+      &[
+        ("profile/Default/Network/Cookies", "c2"),
+        ("profile/Default/History", "h2"),
+      ],
+    );
+    let diff = compute_diff(&local, Some(&remote));
+    assert_eq!(
+      key_file_changes(&diff, &local, true),
+      "os_crypt_key:kept,Local State:kept,Cookies:replaced"
+    );
+    assert_eq!(
+      key_file_changes(&diff, &local, false),
+      "os_crypt_key:deleted,Local State:deleted,Cookies:replaced"
+    );
+
+    let empty = manifest_at("2026-01-01T00:00:00Z", &[("profile/x", "1")]);
+    let fresh = manifest_at(
+      "2026-01-02T00:00:00Z",
+      &[("profile/x", "1"), ("profile/os_crypt_key", "k")],
+    );
+    let diff = compute_diff(&empty, Some(&fresh));
+    assert_eq!(
+      key_file_changes(&diff, &empty, true),
+      "os_crypt_key:downloaded"
+    );
+    assert_eq!(
+      key_file_changes(&compute_diff(&fresh, Some(&fresh)), &fresh, true),
+      "-"
+    );
+    assert!(is_key_material("profile/os_crypt_key"));
+    assert!(!is_key_material("profile/Default/Network/Cookies"));
   }
 
   #[test]
@@ -911,5 +1219,205 @@ mod tests {
     assert!(diff.files_to_upload.is_empty());
     assert!(diff.files_to_delete_remote.is_empty());
     assert!(diff.files_to_delete_local.is_empty());
+  }
+
+  fn file_at(path: &Path, body: &str, secs: u64) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, body).unwrap();
+    File::options()
+      .write(true)
+      .open(path)
+      .unwrap()
+      .set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+      .unwrap();
+  }
+
+  #[test]
+  fn site_storage_moved_aside_never_syncs() {
+    let dir = TempDir::new().unwrap();
+    let data = dir.path().join("profile/Default/IndexedDB");
+    file_at(
+      &data.join("https_kept.example_0/blob"),
+      "kept",
+      1_700_000_000,
+    );
+    let backup = data.join("https_studio.youtube.com_0.donut-backup-20261101-165020");
+    file_at(&backup.join("1.indexeddb.blob/blob"), "big", 1_700_000_000);
+    file_at(&backup.join("LOG.manifest"), "x", 1_700_000_000);
+    let mut cache = HashCache::default();
+    let manifest = generate_manifest("p", dir.path(), &mut cache).unwrap();
+    let paths: Vec<&str> = manifest.files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(
+      paths,
+      ["profile/Default/IndexedDB/https_kept.example_0/blob"]
+    );
+  }
+
+  /// A repair moves the newest files out of the synced set: without the mark
+  /// the manifest gets older than the remote one and sync brings the remote
+  /// folder back; with it, this copy wins and the remote files go.
+  #[test]
+  fn a_marked_local_edit_wins_over_the_remote_copy() {
+    let dir = TempDir::new().unwrap();
+    file_at(
+      &dir.path().join("profile/Default/Preferences"),
+      "p",
+      1_600_000_000,
+    );
+    let mut cache = HashCache::default();
+    let before = generate_manifest("p", dir.path(), &mut cache).unwrap();
+    assert!(
+      before.updated_at.starts_with("2020-09-13"),
+      "{}",
+      before.updated_at
+    );
+
+    let remote = manifest_at(
+      "2024-01-01T00:00:00Z",
+      &[
+        ("profile/Default/Preferences", "other"),
+        (
+          "profile/Default/IndexedDB/https_studio.youtube.com_0/blob",
+          "big",
+        ),
+      ],
+    );
+    let diff = compute_diff(&before, Some(&remote));
+    assert!(
+      !diff.files_to_download.is_empty(),
+      "unmarked, the remote copy wins"
+    );
+
+    mark_local_edit(dir.path()).unwrap();
+    let after = generate_manifest("p", dir.path(), &mut cache).unwrap();
+    let marked = after.updated_at_datetime().unwrap();
+    assert!(
+      (Utc::now() - marked).num_seconds() < 60,
+      "{}",
+      after.updated_at
+    );
+    assert!(after
+      .files
+      .iter()
+      .all(|f| !f.path.starts_with(".donut-sync")));
+    let diff = compute_diff(&after, Some(&remote));
+    assert!(diff.files_to_download.is_empty());
+    assert_eq!(
+      diff.files_to_delete_remote,
+      ["profile/Default/IndexedDB/https_studio.youtube.com_0/blob"]
+    );
+  }
+
+  fn cookie_jar(path: &Path, sid: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let db = rusqlite::Connection::open(path).unwrap();
+    db.execute_batch(
+      "CREATE TABLE IF NOT EXISTS cookies (host_key TEXT, name TEXT, value TEXT, PRIMARY KEY (host_key, name))",
+    )
+    .unwrap();
+    db.execute(
+      "INSERT OR REPLACE INTO cookies VALUES ('.google.com', 'SID', ?1)",
+      [sid],
+    )
+    .unwrap();
+  }
+
+  fn with_hash(manifest: &SyncManifest, path: &str, hash: &str, updated_at: &str) -> SyncManifest {
+    let mut out = manifest.clone();
+    out.updated_at = updated_at.to_string();
+    for file in &mut out.files {
+      if file.path == path {
+        file.hash = hash.to_string();
+      }
+    }
+    out
+  }
+
+  /// Google rotates its session cookie on each device that runs the profile.
+  /// A download must never put an older jar over one this device changed
+  /// since the last sync, whatever the clocks say.
+  #[test]
+  fn a_cookie_jar_changed_on_both_sides_stays_local() {
+    const COOKIES: &str = "profile/Default/Network/Cookies";
+    let dir = TempDir::new().unwrap();
+    let jar = dir.path().join(COOKIES);
+    cookie_jar(&jar, "rotated-1");
+    fs::write(dir.path().join("profile/Local State"), "{}").unwrap();
+    let synced = generate_manifest("p", dir.path(), &mut HashCache::default()).unwrap();
+    save_synced(dir.path(), &synced).unwrap();
+    // Remote clocks run far ahead: by timestamps the remote copy always wins.
+    let remote = with_hash(&synced, COOKIES, "remote-jar", "2099-01-01T00:00:00Z");
+
+    // Only the remote copy changed: it comes down.
+    let unchanged = generate_manifest("p", dir.path(), &mut HashCache::default()).unwrap();
+    assert_eq!(
+      changed_since_sync(dir.path(), &unchanged, &remote),
+      Changed::Remote
+    );
+    let diff = compute_diff_with_bias(&unchanged, Some(&remote), Changed::Remote.bias());
+    assert_eq!(diff.files_to_download.len(), 1);
+
+    // This device rotated the cookie too.
+    cookie_jar(&jar, "rotated-2");
+    let local = generate_manifest("p", dir.path(), &mut HashCache::default()).unwrap();
+    let auto = compute_diff(&local, Some(&remote));
+    assert_eq!(
+      auto.files_to_download[0].path, COOKIES,
+      "timestamps alone would download"
+    );
+
+    let changed = changed_since_sync(dir.path(), &local, &remote);
+    assert_eq!(changed, Changed::Both);
+    let diff = compute_diff_with_bias(&local, Some(&remote), changed.bias());
+    assert!(diff.files_to_download.is_empty());
+    assert!(diff.files_to_delete_local.is_empty());
+    assert_eq!(
+      diff
+        .files_to_upload
+        .iter()
+        .map(|f| f.path.as_str())
+        .collect::<Vec<_>>(),
+      [COOKIES]
+    );
+    assert_eq!(differing_key_files(&local, &remote), "Cookies");
+
+    // Only this device changed: it goes up even against a later remote clock.
+    let untouched = with_hash(
+      &synced,
+      COOKIES,
+      &synced
+        .files
+        .iter()
+        .find(|f| f.path == COOKIES)
+        .unwrap()
+        .hash,
+      "2099-01-01T00:00:00Z",
+    );
+    assert_eq!(
+      changed_since_sync(dir.path(), &local, &untouched),
+      Changed::Local
+    );
+    let diff = compute_diff_with_bias(&local, Some(&untouched), Changed::Local.bias());
+    assert!(diff.files_to_download.is_empty());
+    assert_eq!(diff.files_to_upload.len(), 1);
+
+    // After the sync both hold the local copy: nothing changed.
+    save_synced(dir.path(), &local).unwrap();
+    assert_eq!(
+      changed_since_sync(dir.path(), &local, &local),
+      Changed::Neither
+    );
+  }
+
+  #[test]
+  fn without_a_record_of_the_last_sync_timestamps_decide() {
+    let dir = TempDir::new().unwrap();
+    let local = manifest_at("2024-01-01T00:00:00Z", &[("profile/a", "1")]);
+    let remote = manifest_at("2025-01-01T00:00:00Z", &[("profile/a", "2")]);
+    assert_eq!(
+      changed_since_sync(dir.path(), &local, &remote),
+      Changed::Unknown
+    );
+    assert_eq!(Changed::Unknown.bias(), DiffBias::Auto);
   }
 }

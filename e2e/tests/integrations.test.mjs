@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { withApp } from "../lib/app.mjs";
@@ -63,6 +63,41 @@ async function invokeContract(app, command, args = {}) {
   }
 }
 
+/**
+ * Evidence that a command's BODY ran, not merely that it was invoked.
+ *
+ * `assert.ok(await invokeContract(...))` was the pattern here, and it cannot
+ * fail: `invokeContract` always resolves to an object, and every object is
+ * truthy. It passed whether the command succeeded, refused, or did not exist at
+ * all, so eight commands whose only coverage-map evidence was that line could
+ * have had their entire bodies deleted with every suite still green.
+ *
+ * Each caller now states which of the two outcomes it expects and pins it, so
+ * the assertion fails if the command stops reaching its real logic. The two
+ * outcomes are both legitimate here: these are cloud and update commands, and a
+ * hermetic E2E run has no session, so a refusal FOR THE RIGHT REASON is exactly
+ * as much proof that the body ran as a success is.
+ */
+async function assertContract(app, command, expected, args = {}) {
+  const result = await invokeContract(app, command, args);
+  if (expected.refusedWith) {
+    assert.equal(
+      result.ok,
+      false,
+      `${command} was expected to refuse, but returned ${JSON.stringify(result.value)}`,
+    );
+    assert.match(
+      result.error,
+      expected.refusedWith,
+      `${command} refused for a different reason than the one that proves its body ran`,
+    );
+    return result;
+  }
+  assert.equal(result.ok, true, `${command} failed: ${result.error}`);
+  expected.answers(result.value);
+  return result;
+}
+
 async function assertCommandErrorCode(app, command, code, args = {}) {
   const error = await app.invokeError(command, args);
   assert.match(error, new RegExp(`"code":"${code}"`));
@@ -84,6 +119,26 @@ test("authenticated REST API serves its complete OpenAPI contract and CRUD lifec
     assert.ok(saved.api_token?.length >= 32);
     const port = await app.invoke("start_api_server", { port: 0 });
     assert.equal(await app.invoke("get_api_server_status"), port);
+    const diagnostic = await app.invoke("check_integration_connection", {
+      target: "api",
+    });
+    assert.equal(diagnostic.configured, true);
+    assert.equal(diagnostic.reachable, true);
+    assert.equal(diagnostic.authorized, true);
+    assert.equal(diagnostic.http_status, 200);
+    assert.ok(diagnostic.checked_at > 0);
+    assert.deepEqual(Object.keys(diagnostic).sort(), [
+      "authorized",
+      "checked_at",
+      "configured",
+      "http_status",
+      "reachable",
+    ]);
+    const unconfigured = await app.invoke("check_integration_connection", {
+      target: "remote",
+    });
+    assert.equal(unconfigured.configured, false);
+    assert.equal(unconfigured.authorized, null);
     const base = `http://127.0.0.1:${port}`;
 
     const openapi = await jsonRequest(`${base}/openapi.json`);
@@ -199,7 +254,7 @@ test("authenticated REST API serves its complete OpenAPI contract and CRUD lifec
         body: {
           proxy_settings: {
             ...createdVless.value.proxy_settings,
-            vless_uri: VLESS_URI.replace("security=reality", "security=tls"),
+            vless_uri: VLESS_URI.replace("type=tcp", "type=kcp"),
           },
         },
       },
@@ -719,313 +774,839 @@ test("authenticated REST API serves its complete OpenAPI contract and CRUD lifec
     );
     await app.invoke("stop_api_server");
     assert.equal(await app.invoke("get_api_server_status"), null);
+    const stoppedDiagnostic = await app.invoke("check_integration_connection", {
+      target: "api",
+    });
+    assert.equal(stoppedDiagnostic.configured, true);
+    assert.equal(stoppedDiagnostic.reachable, false);
+    assert.equal(stoppedDiagnostic.authorized, null);
   });
 });
 
-test("MCP Streamable HTTP initialization, auth, discovery, calls, and isolated agent install", async () => {
+test("MCP clients are installed only against the remote endpoint", async () => {
   await withApp("integrations-mcp", async (app) => {
-    await seedTerms(app);
-    await assertCommandErrorCode(
-      app,
-      "stop_mcp_server",
-      "MCP_SERVER_NOT_RUNNING",
-    );
-    const port = await app.invoke("start_mcp_server");
-    await assertCommandErrorCode(
-      app,
-      "start_mcp_server",
-      "MCP_SERVER_ALREADY_RUNNING",
-    );
-    assert.equal(await app.invoke("get_mcp_server_status"), true);
-    const config = await app.invoke("get_mcp_config");
-    assert.equal(config.port, port);
-    assert.ok(config.token.length >= 32);
-    const base = `http://127.0.0.1:${port}`;
-    assert.equal((await fetch(`${base}/health`)).status, 200);
-    assert.equal(
-      (
-        await jsonRequest(`${base}/mcp`, {
-          method: "POST",
-          body: { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
-        })
-      ).response.status,
-      401,
-    );
-
-    const initialized = await jsonRequest(`${base}/mcp/${config.token}`, {
-      method: "POST",
-      body: {
-        jsonrpc: "2.0",
-        id: 1,
-        method: "initialize",
-        params: {
-          protocolVersion: "2025-11-25",
-          capabilities: {},
-          clientInfo: { name: "donut-e2e", version: "1" },
-        },
-      },
-    });
-    assert.equal(initialized.response.status, 200);
-    assert.equal(initialized.value.result.serverInfo.name, "donut-browser");
-    const sessionId = initialized.response.headers.get("mcp-session-id");
-    assert.ok(sessionId);
-    const mcpHeaders = { "mcp-session-id": sessionId };
-    const notification = await jsonRequest(`${base}/mcp/${config.token}`, {
-      method: "POST",
-      headers: mcpHeaders,
-      body: { jsonrpc: "2.0", method: "notifications/initialized" },
-    });
-    assert.equal(notification.response.status, 202);
-    const tools = await jsonRequest(`${base}/mcp/${config.token}`, {
-      method: "POST",
-      headers: mcpHeaders,
-      body: { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
-    });
-    assert.equal(tools.response.status, 200);
-    const names = tools.value.result.tools.map((tool) => tool.name);
-    for (const name of [
-      "list_profiles",
-      "create_profile",
-      "run_profile",
-      "list_proxies",
-      "create_proxy",
-      "update_proxy",
-      "get_page_content",
-      "get_interactive_elements",
-      // The remote loop has to be complete from MCP alone: start a session,
-      // watch it become usable, drive it with the interaction tools above, stop
-      // it. Any one of these missing leaves an agent able to lease a host it
-      // cannot use, or unable to lease one at all.
-      "run_profile_remote",
-      "get_remote_session",
-      "stop_remote_session",
-      // Extension management is only usable from an agent if importing and
-      // grouping are reachable, not just listing and deleting.
-      "add_extension",
-      "update_extension",
-      "add_extension_to_group",
-      "remove_extension_from_group",
-      "update_extension_group",
-    ]) {
-      assert.ok(names.includes(name), `MCP is missing ${name}`);
-    }
-    const listed = await jsonRequest(`${base}/mcp/${config.token}`, {
-      method: "POST",
-      headers: mcpHeaders,
-      body: {
-        jsonrpc: "2.0",
-        id: 3,
-        method: "tools/call",
-        params: { name: "list_profiles", arguments: {} },
-      },
-    });
-    assert.equal(listed.response.status, 200);
-    assert.equal(listed.value.error, undefined);
-    assert.ok(listed.value.result);
-
-    const createdVless = await jsonRequest(`${base}/mcp/${config.token}`, {
-      method: "POST",
-      headers: mcpHeaders,
-      body: {
-        jsonrpc: "2.0",
-        id: 4,
-        method: "tools/call",
-        params: {
-          name: "create_proxy",
-          arguments: {
-            name: "MCP VLESS Reality",
-            proxy_type: "vless",
-            vless_uri: VLESS_URI,
-          },
-        },
-      },
-    });
-    assert.equal(createdVless.response.status, 200);
-    assert.equal(createdVless.value.error, undefined);
-    let vlessProxy = (await app.invoke("get_stored_proxies")).find(
-      (proxy) => proxy.name === "MCP VLESS Reality",
-    );
-    assert.ok(vlessProxy);
-    assert.equal(vlessProxy.proxy_settings.proxy_type, "vless");
-    assert.equal(vlessProxy.proxy_settings.vless_uri, VLESS_URI);
-
-    const updatedVless = await jsonRequest(`${base}/mcp/${config.token}`, {
-      method: "POST",
-      headers: mcpHeaders,
-      body: {
-        jsonrpc: "2.0",
-        id: 5,
-        method: "tools/call",
-        params: {
-          name: "update_proxy",
-          arguments: {
-            proxy_id: vlessProxy.id,
-            name: "MCP VLESS Updated",
-            vless_uri: VLESS_URI,
-          },
-        },
-      },
-    });
-    assert.equal(updatedVless.value.error, undefined);
-    vlessProxy = (await app.invoke("get_stored_proxies")).find(
-      (proxy) => proxy.id === vlessProxy.id,
-    );
-    assert.equal(vlessProxy.name, "MCP VLESS Updated");
-
-    const invalidVless = await jsonRequest(`${base}/mcp/${config.token}`, {
-      method: "POST",
-      headers: mcpHeaders,
-      body: {
-        jsonrpc: "2.0",
-        id: 6,
-        method: "tools/call",
-        params: {
-          name: "update_proxy",
-          arguments: {
-            proxy_id: vlessProxy.id,
-            vless_uri: VLESS_URI.replace("security=reality", "security=tls"),
-          },
-        },
-      },
-    });
-    assert.match(invalidVless.value.error.message, /VLESS_CONFIG_INVALID/);
-    assert.equal(
-      (await app.invoke("get_stored_proxies")).find(
-        (proxy) => proxy.id === vlessProxy.id,
-      ).proxy_settings.vless_uri,
-      VLESS_URI,
-    );
-    await app.invoke("delete_stored_proxy", { proxyId: vlessProxy.id });
-
-    let toolCallId = 7;
-    const callTool = (name, args) =>
-      jsonRequest(`${base}/mcp/${config.token}`, {
-        method: "POST",
-        headers: mcpHeaders,
-        body: {
-          jsonrpc: "2.0",
-          id: toolCallId++,
-          method: "tools/call",
-          params: { name, arguments: args },
-        },
-      });
-
-    const unpackedDir = await writeUnpackedExtension(
-      path.join(app.root, "fixtures", "mcp-unpacked-extension"),
-      { name: "Donut MCP Unpacked", version: "1.0.0" },
-    );
-    const addedExtension = await callTool("add_extension", {
-      path: unpackedDir,
-      name: "MCP Folder Extension",
-    });
-    assert.equal(addedExtension.response.status, 200);
-    const subscriptionGated = /subscription/i.test(
-      addedExtension.value.error?.message ?? "",
-    );
-    // The e2e build overrides the paid-plan gate whenever a Wayfern test token
-    // is present, so with one in the environment a gated answer means the
-    // override stopped working and everything below it silently stopped
-    // running.
-    assert.ok(
-      !subscriptionGated || !process.env.WAYFERN_TEST_TOKEN,
-      `the e2e paid-plan override did not apply: ${addedExtension.value.error?.message}`,
-    );
-    if (subscriptionGated) {
-      // Every extension tool is gated on an active paid plan and this session
-      // is signed out, so the call path is unreachable here. The tool list
-      // above still proves the tools are published.
-      console.warn(
-        "Skipping the MCP extension tool calls: this session has no paid entitlement",
-      );
-    } else {
-      assert.equal(addedExtension.value.error, undefined);
-      const stored = (await app.invoke("list_extensions")).find(
-        (item) => item.name === "Donut MCP Unpacked",
-      );
-      assert.ok(stored, "the MCP import must produce a stored extension");
-      assert.equal(stored.source_kind, "unpacked");
-      assert.equal(stored.linked_path, null);
-
-      const renamedExtension = await callTool("update_extension", {
-        extension_id: stored.id,
-        name: "MCP Renamed Extension",
-      });
-      assert.equal(renamedExtension.value.error, undefined);
-      assert.equal(
-        (await app.invoke("list_extensions")).find(
-          (item) => item.id === stored.id,
-        ).name,
-        "MCP Renamed Extension",
-      );
-
-      const extensionGroup = await app.invoke("create_extension_group", {
-        name: "MCP Extension Group",
-      });
-      const joined = await callTool("add_extension_to_group", {
-        group_id: extensionGroup.id,
-        extension_id: stored.id,
-      });
-      assert.equal(joined.value.error, undefined);
-      const readGroup = async () =>
-        (await app.invoke("list_extension_groups")).find(
-          (item) => item.id === extensionGroup.id,
-        );
-      assert.deepEqual((await readGroup()).extension_ids, [stored.id]);
-
-      const renamedGroup = await callTool("update_extension_group", {
-        group_id: extensionGroup.id,
-        name: "MCP Extension Group Updated",
-      });
-      assert.equal(renamedGroup.value.error, undefined);
-      assert.equal((await readGroup()).name, "MCP Extension Group Updated");
-
-      const removed = await callTool("remove_extension_from_group", {
-        group_id: extensionGroup.id,
-        extension_id: stored.id,
-      });
-      assert.equal(removed.value.error, undefined);
-      assert.deepEqual((await readGroup()).extension_ids, []);
-
-      await app.invoke("delete_extension", { extensionId: stored.id });
-      await app.invoke("delete_extension_group", {
-        groupId: extensionGroup.id,
-      });
-    }
-
+    // The client roster resolves, so the Integrations page can offer the
+    // remote endpoint. A row says whether the client is connected, not where.
     const agents = await app.invoke("list_mcp_agents");
     assert.ok(agents.some((agent) => agent.id === "cursor"));
+    assert.ok(agents.every((agent) => !("endpoint" in agent)));
+    // fx cannot take the bearer from its config file, so the page tells the
+    // user which variable to export; that name travels with the row.
+    assert.equal(
+      agents.find((agent) => agent.id === "fx").token_env,
+      "DONUT_MCP_TOKEN",
+    );
+    assert.equal(agents.find((agent) => agent.id === "cursor").token_env, null);
+    assert.ok(agents.some((agent) => agent.id === "pi"));
+    assert.ok(agents.some((agent) => agent.id === "mastracode"));
+
+    // Toolsets: only known groups, saved in display order; every group is the
+    // same as none (all tools), and core alone is the core tools only.
+    await assertCommandErrorCode(
+      app,
+      "set_mcp_toolsets",
+      "MCP_TOOLSET_UNKNOWN",
+      {
+        toolsets: ["network", "everything"],
+      },
+    );
+    assert.deepEqual(
+      await app.invoke("set_mcp_toolsets", {
+        toolsets: ["cookies", "network"],
+      }),
+      [],
+      "no client is connected, so none can fail",
+    );
+    assert.deepEqual((await app.invoke("get_app_settings")).mcp_toolsets, [
+      "network",
+      "cookies",
+    ]);
+    await app.invoke("set_mcp_toolsets", { toolsets: ["core"] });
+    assert.deepEqual((await app.invoke("get_app_settings")).mcp_toolsets, [
+      "core",
+    ]);
+    await app.invoke("set_mcp_toolsets", { toolsets: [] });
+    assert.deepEqual((await app.invoke("get_app_settings")).mcp_toolsets, []);
+
     await assertCommandErrorCode(app, "add_mcp_to_agent", "MCP_AGENT_UNKNOWN", {
       agentId: "missing-e2e-agent",
     });
-    await app.invoke("add_mcp_to_agent", { agentId: "cursor" });
-    assert.equal(
-      (await app.invoke("list_mcp_agents")).find(
-        (agent) => agent.id === "cursor",
-      ).connected,
-      true,
+    await assertCommandErrorCode(
+      app,
+      "remove_mcp_from_agent",
+      "MCP_AGENT_UNKNOWN",
+      { agentId: "missing-e2e-agent" },
     );
-    await app.invoke("remove_mcp_from_agent", { agentId: "cursor" });
+
+    // Remote MCP with no stored `dmk_` credential is refused with a code the UI
+    // can explain, and writes nothing into the client's config.
+    await assertCommandErrorCode(
+      app,
+      "add_mcp_to_agent",
+      "MCP_REMOTE_KEY_MISSING",
+      { agentId: "cursor" },
+    );
     assert.equal(
       (await app.invoke("list_mcp_agents")).find(
         (agent) => agent.id === "cursor",
       ).connected,
       false,
+      "a refused remote install must not have written an entry",
     );
-    assert.equal(
-      (
-        await jsonRequest(`${base}/mcp/${config.token}`, {
-          method: "DELETE",
-          headers: mcpHeaders,
-        })
-      ).response.status,
-      200,
+
+    // The retry for clients a rotation missed writes the stored key and never
+    // mints, so with no key it is refused with the same code, not answered
+    // with every client as failed.
+    await assertCommandErrorCode(
+      app,
+      "refresh_mcp_agents",
+      "MCP_REMOTE_KEY_MISSING",
     );
-    await app.invoke("stop_mcp_server");
-    assert.equal(await app.invoke("get_mcp_server_status"), false);
+    assert.ok(
+      (await app.invoke("list_mcp_agents")).every(
+        (agent) => agent.current === false,
+      ),
+      "with no key, no client holds the current one",
+    );
   });
 });
 
-test("REST and MCP share the browser automation rate limit", async () => {
+test("the agent console keeps notes, take-overs and the pause for connected agents", async () => {
+  await withApp("integrations-agent-console", async (app) => {
+    await seedTerms(app);
+    const empty = await app.invoke("get_agent_console");
+    assert.deepEqual(empty.sessions, []);
+    assert.deepEqual(empty.activity, []);
+    assert.deepEqual(empty.thread, []);
+    assert.deepEqual(empty.holds, []);
+    assert.equal(empty.paused, null);
+
+    const note = await app.invoke("send_agent_note", {
+      text: "  Use the EU proxies today  ",
+    });
+    assert.equal(note.kind, "note");
+    assert.equal(note.state, "pending");
+    assert.equal(note.text, "Use the EU proxies today");
+    assert.equal(note.session_id, null);
+    await assertCommandErrorCode(app, "send_agent_note", "AGENT_NOTE_EMPTY", {
+      text: "   ",
+    });
+    await assertCommandErrorCode(
+      app,
+      "send_agent_note",
+      "AGENT_TEXT_TOO_LONG",
+      {
+        text: "x".repeat(2001),
+      },
+    );
+    await assertCommandErrorCode(
+      app,
+      "send_agent_note",
+      "AGENT_SESSION_NOT_FOUND",
+      {
+        text: "hello",
+        sessionId: "missing-e2e-session",
+      },
+    );
+
+    await assertCommandErrorCode(
+      app,
+      "answer_agent_request",
+      "AGENT_REQUEST_NOT_FOUND",
+      {
+        requestId: 987654,
+        answer: "yes",
+      },
+    );
+    await assertCommandErrorCode(
+      app,
+      "dismiss_agent_request",
+      "AGENT_REQUEST_NOT_FOUND",
+      {
+        requestId: 987654,
+      },
+    );
+
+    const missingProfileId = "00000000-0000-4000-8000-00000000e2e0";
+    await assertCommandErrorCode(
+      app,
+      "take_over_profile",
+      "PROFILE_NOT_FOUND",
+      {
+        profileId: missingProfileId,
+      },
+    );
+    await assertCommandErrorCode(
+      app,
+      "show_profile_window",
+      "PROFILE_NOT_FOUND",
+      {
+        profileId: missingProfileId,
+      },
+    );
+
+    const profile = await app.invoke("create_browser_profile_new", {
+      name: "Agent Console Profile",
+      browserStr: "wayfern",
+      version: "150.0.7871.100",
+      releaseType: "stable",
+      proxyId: null,
+      vpnId: null,
+      wayfernConfig: { fingerprint: "{}" },
+      groupId: null,
+      ephemeral: false,
+      dnsBlocklist: null,
+      launchHook: null,
+    });
+    await assertCommandErrorCode(
+      app,
+      "show_profile_window",
+      "PROFILE_NOT_RUNNING",
+      {
+        profileId: profile.id,
+      },
+    );
+
+    const hold = await app.invoke("take_over_profile", {
+      profileId: profile.id,
+      note: "Checking the payment page",
+    });
+    assert.equal(hold.profile_id, profile.id);
+    assert.equal(hold.note, "Checking the payment page");
+    assert.equal(hold.request_id, null);
+    // A second take-over keeps the hold and updates its note.
+    await app.invoke("take_over_profile", {
+      profileId: profile.id,
+      note: "Still here",
+    });
+    let state = await app.invoke("get_agent_console");
+    assert.deepEqual(
+      state.holds.map((h) => [h.profile_id, h.note]),
+      [[profile.id, "Still here"]],
+    );
+
+    await app.invoke("hand_back_profile", {
+      profileId: profile.id,
+      note: "Done, you can continue",
+    });
+    state = await app.invoke("get_agent_console");
+    assert.deepEqual(state.holds, []);
+    const handBackNote = state.thread.find(
+      (item) => item.kind === "note" && item.text === "Done, you can continue",
+    );
+    assert.ok(
+      handBackNote,
+      "handing back with a note leaves the note for the agents",
+    );
+    assert.equal(handBackNote.profile_id, profile.id);
+    // Handing back a profile nobody holds is a no-op.
+    await app.invoke("hand_back_profile", { profileId: profile.id });
+
+    const pause = await app.invoke("set_agents_paused", {
+      paused: true,
+      note: "Lunch break",
+    });
+    assert.equal(pause.note, "Lunch break");
+    assert.equal(
+      (await app.invoke("get_agent_console")).paused.note,
+      "Lunch break",
+    );
+    assert.equal(
+      await app.invoke("set_agents_paused", { paused: false }),
+      null,
+    );
+    assert.equal((await app.invoke("get_agent_console")).paused, null);
+
+    await app.invoke("clear_agent_activity");
+    state = await app.invoke("get_agent_console");
+    assert.deepEqual(state.activity, []);
+    assert.ok(
+      state.thread.some((item) => item.text === "Use the EU proxies today"),
+      "clearing activity keeps the conversation",
+    );
+  });
+});
+
+const AGENT_PROFILE_ID = "00000000-0000-4000-8000-0000000a9e01";
+const AGENT_ROUTINE_ID = "00000000-0000-4000-8000-0000000a9e02";
+
+test("the agent stays off without the entitlement", async () => {
+  await withApp("integrations-agent-off", async (app) => {
+    // Signed out there is no agent: no cloud call, every command refuses by
+    // code.
+    const refused = "AGENT_NOT_ENTITLED";
+    await assertCommandErrorCode(app, "get_agent_credits", refused);
+    await assertCommandErrorCode(app, "list_agent_batches", refused);
+    await assertCommandErrorCode(app, "start_agent_batch", refused, {
+      request: { profileIds: [AGENT_PROFILE_ID], prompt: "Check the inbox" },
+    });
+    await assertCommandErrorCode(app, "get_agent_task_steps", refused, {
+      batchId: "b",
+      profileId: AGENT_PROFILE_ID,
+    });
+    await assertCommandErrorCode(app, "control_agent_task", refused, {
+      batchId: "b",
+      profileId: AGENT_PROFILE_ID,
+      action: "stop",
+    });
+    await assertCommandErrorCode(app, "answer_agent_approval", refused, {
+      batchId: "b",
+      profileId: AGENT_PROFILE_ID,
+      approvalId: "a",
+      approve: true,
+    });
+    await assertCommandErrorCode(app, "stop_agent_batch", refused, {
+      batchId: "b",
+    });
+    await assertCommandErrorCode(app, "retry_agent_batch", refused, {
+      batchId: "b",
+    });
+    await assertCommandErrorCode(app, "dismiss_agent_batch", refused, {
+      batchId: "b",
+    });
+    await assertCommandErrorCode(app, "list_agent_routines", refused);
+    const routine = {
+      name: "Inbox",
+      prompt: "Check the inbox",
+      profileIds: [AGENT_PROFILE_ID],
+    };
+    await assertCommandErrorCode(app, "create_agent_routine", refused, {
+      routine,
+    });
+    await assertCommandErrorCode(app, "update_agent_routine", refused, {
+      id: AGENT_ROUTINE_ID,
+      routine,
+    });
+    await assertCommandErrorCode(app, "delete_agent_routine", refused, {
+      id: AGENT_ROUTINE_ID,
+    });
+    await assertCommandErrorCode(app, "list_agent_routine_runs", refused, {
+      id: AGENT_ROUTINE_ID,
+    });
+    await assertCommandErrorCode(app, "run_agent_routine", refused, {
+      id: AGENT_ROUTINE_ID,
+    });
+  });
+});
+
+test("agent tasks and routines follow the engine contract", async () => {
+  await withApp(
+    "integrations-agent-tasks",
+    async (app) => {
+      await seedTerms(app);
+      const credits = await app.invoke("get_agent_credits");
+      assert.equal(credits.allowance, 10000);
+      assert.equal(credits.balance, credits.allowance - credits.used);
+
+      const profile = (name) =>
+        app.invoke("create_browser_profile_new", {
+          name,
+          browserStr: "wayfern",
+          version: "150.0.7871.100",
+          releaseType: "stable",
+          proxyId: null,
+          vpnId: null,
+          wayfernConfig: { fingerprint: "{}" },
+          groupId: null,
+          ephemeral: false,
+          dnsBlocklist: null,
+          launchHook: null,
+        });
+      const profiles = [
+        await profile("Agent One"),
+        await profile("Agent Two"),
+        await profile("Agent Three"),
+      ];
+      const ids = profiles.map((p) => p.id);
+      const start = (request) =>
+        app.invoke("start_agent_batch", {
+          request: { autonomy: "auto", ...request },
+        });
+      const batchOf = async (id) =>
+        (await app.invoke("list_agent_batches")).find((b) => b.id === id);
+      const settle = (id, description) =>
+        app.waitFor(
+          async () => {
+            const batch = await batchOf(id);
+            return batch?.finished ? batch : null;
+          },
+          { timeoutMs: 30_000, description },
+        );
+      const taskIn = async (id, profileId, status) =>
+        app.waitFor(
+          async () => {
+            const task = (await batchOf(id))?.tasks.find(
+              (t) => t.profileId === profileId,
+            );
+            return task?.status === status ? task : null;
+          },
+          { timeoutMs: 20_000, description: `${profileId} ${status}` },
+        );
+
+      // What the engine never sees: an empty prompt, a non-web start page, no
+      // profiles.
+      await assertCommandErrorCode(
+        app,
+        "start_agent_batch",
+        "AGENT_PROMPT_EMPTY",
+        {
+          request: { profileIds: ids, prompt: "   " },
+        },
+      );
+      await assertCommandErrorCode(
+        app,
+        "start_agent_batch",
+        "AGENT_START_URL_INVALID",
+        {
+          request: {
+            profileIds: ids,
+            prompt: "Read it",
+            startUrl: "file:///etc/hosts",
+          },
+        },
+      );
+      await assertCommandErrorCode(
+        app,
+        "start_agent_batch",
+        "AGENT_NO_PROFILES",
+        {
+          request: { profileIds: [], prompt: "Read it" },
+        },
+      );
+
+      // One prompt on three profiles, two at a time, each with its own stream.
+      const batch = await start({
+        profileIds: ids,
+        prompt: "Find the cheapest flight to Tirana",
+        startUrl: "https://flights.example.test",
+        concurrency: 2,
+      });
+      assert.equal(batch.tasks.length, 3);
+      assert.equal(batch.concurrency, 2);
+      assert.equal(batch.headless, false, "a task is watched, not headless");
+      const done = await settle(batch.id, "the three tasks");
+      assert.equal(done.tally.done, 3);
+      assert.equal(done.tally.creditsUsed, 3 * 42);
+      for (const task of done.tasks) {
+        assert.equal(task.status, "done");
+        assert.match(task.result, /cheapest/);
+        assert.equal(task.stepCount, 6);
+      }
+      const steps = await app.invoke("get_agent_task_steps", {
+        batchId: batch.id,
+        profileId: ids[0],
+      });
+      assert.deepEqual(
+        steps.map((s) => s.kind),
+        ["think", "act", "observe", "act", "observe", "think"],
+      );
+      assert.equal(steps[1].url, "https://flights.example.test");
+      await assertCommandErrorCode(
+        app,
+        "get_agent_task_steps",
+        "AGENT_TASK_NOT_FOUND",
+        { batchId: "missing", profileId: ids[0] },
+      );
+
+      // Asking before acting: the task waits for the person.
+      const asking = await start({
+        profileIds: [ids[0]],
+        prompt: "[approval] Submit the search",
+        autonomy: "ask",
+      });
+      const waiting = await taskIn(asking.id, ids[0], "needs_approval");
+      assert.match(waiting.approval.question, /Submit/);
+      await app.invoke("answer_agent_approval", {
+        batchId: asking.id,
+        profileId: ids[0],
+        approvalId: waiting.approval.approvalId,
+        approve: true,
+      });
+      assert.equal(
+        (await settle(asking.id, "the approved task")).tally.done,
+        1,
+      );
+
+      // One task per browser; steer, pause, resume and stop a slow one.
+      const slow = await start({
+        profileIds: [ids[1]],
+        prompt: "[slow] Read every message",
+      });
+      await taskIn(slow.id, ids[1], "running");
+      await assertCommandErrorCode(app, "start_agent_batch", "AGENT_BUSY", {
+        request: { profileIds: [ids[1]], prompt: "Something else" },
+      });
+      await assertCommandErrorCode(
+        app,
+        "control_agent_task",
+        "AGENT_ACTION_INVALID",
+        { batchId: slow.id, profileId: ids[1], action: "dance" },
+      );
+      await assertCommandErrorCode(
+        app,
+        "control_agent_task",
+        "AGENT_NOTE_EMPTY",
+        {
+          batchId: slow.id,
+          profileId: ids[1],
+          action: "steer",
+          message: "  ",
+        },
+      );
+      await app.invoke("control_agent_task", {
+        batchId: slow.id,
+        profileId: ids[1],
+        action: "steer",
+        message: "Only the unread ones",
+      });
+      await app.waitFor(
+        async () =>
+          (
+            await app.invoke("get_agent_task_steps", {
+              batchId: slow.id,
+              profileId: ids[1],
+            })
+          ).some((s) => s.text === "Noted: Only the unread ones"),
+        { description: "the steer reached the engine" },
+      );
+      await app.invoke("control_agent_task", {
+        batchId: slow.id,
+        profileId: ids[1],
+        action: "pause",
+      });
+      await taskIn(slow.id, ids[1], "paused");
+      await app.invoke("control_agent_task", {
+        batchId: slow.id,
+        profileId: ids[1],
+        action: "resume",
+      });
+      await taskIn(slow.id, ids[1], "running");
+      await assertCommandErrorCode(app, "dismiss_agent_batch", "AGENT_BUSY", {
+        batchId: slow.id,
+      });
+      await app.invoke("stop_agent_batch", { batchId: slow.id });
+      assert.equal(
+        (await settle(slow.id, "the stopped task")).tally.stopped,
+        1,
+      );
+
+      // Failures are retried on request, and only failures.
+      const failing = await start({
+        profileIds: [ids[0], ids[2]],
+        prompt: "[fail] Open the report",
+      });
+      const failed = await settle(failing.id, "the failed tasks");
+      assert.equal(failed.tally.failed, 2);
+      assert.equal(failed.tally.creditsUsed, 2 * 21);
+      assert.equal(failed.tasks[0].error, "The page did not load");
+      assert.equal(
+        await app.invoke("retry_agent_batch", { batchId: failing.id }),
+        2,
+      );
+      await app.waitFor(
+        async () => {
+          const again = await batchOf(failing.id);
+          return again.finished && again.tally.failed === 2 ? again : null;
+        },
+        { timeoutMs: 30_000, description: "the retried tasks" },
+      );
+      // A retry spends credits again; the first attempts still count.
+      assert.equal((await batchOf(failing.id)).tally.creditsUsed, 4 * 21);
+      await app.invoke("dismiss_agent_batch", { batchId: failing.id });
+      assert.equal(await batchOf(failing.id), undefined);
+      await assertCommandErrorCode(
+        app,
+        "retry_agent_batch",
+        "AGENT_BATCH_NOT_FOUND",
+        { batchId: failing.id },
+      );
+
+      // Routines: stored in the cloud, run headless, each run reported back.
+      await assertCommandErrorCode(
+        app,
+        "create_agent_routine",
+        "AGENT_SCHEDULE_INVALID",
+        {
+          routine: {
+            name: "Morning",
+            prompt: "Check the inbox",
+            profileIds: ids,
+            schedule: { cron: "every morning", timezone: "UTC" },
+          },
+        },
+      );
+      const routine = await app.invoke("create_agent_routine", {
+        routine: {
+          name: "  Morning inbox  ",
+          prompt: "Check the inbox",
+          startUrl: "https://mail.example.test",
+          profileIds: [ids[0], ids[2]],
+          schedule: { cron: "0 9 * * 1-5", timezone: "UTC" },
+          maxCreditsPerRun: 200,
+          concurrency: 1,
+          enabled: true,
+        },
+      });
+      assert.equal(routine.name, "Morning inbox");
+      const renamed = await app.invoke("update_agent_routine", {
+        id: routine.id,
+        routine: {
+          name: "Inbox sweep",
+          prompt: routine.prompt,
+          startUrl: routine.startUrl,
+          profileIds: routine.profileIds,
+          schedule: null,
+          maxCreditsPerRun: 200,
+          concurrency: 1,
+          enabled: true,
+        },
+      });
+      assert.equal(renamed.schedule, null);
+      assert.deepEqual(
+        (await app.invoke("list_agent_routines")).map((r) => r.name),
+        ["Inbox sweep"],
+      );
+      const run = await app.invoke("run_agent_routine", { id: routine.id });
+      assert.equal(run.routineId, routine.id);
+      assert.equal(run.headless, true, "a routine runs headless");
+      assert.equal(run.concurrency, 1);
+      assert.equal(run.maxCredits, 200);
+      assert.ok(run.tasks.every((task) => task.runId));
+      assert.equal((await settle(run.id, "the routine run")).tally.done, 2);
+      const history = await app.waitFor(
+        async () => {
+          const runs = await app.invoke("list_agent_routine_runs", {
+            id: routine.id,
+          });
+          return runs.every((r) => r.status === "done") ? runs : null;
+        },
+        { description: "the runs reported to the cloud" },
+      );
+      assert.equal(history.length, 2);
+      assert.ok(history.every((r) => r.creditsUsed === 42));
+      await app.invoke("delete_agent_routine", { id: routine.id });
+      assert.deepEqual(await app.invoke("list_agent_routines"), []);
+      await assertCommandErrorCode(
+        app,
+        "delete_agent_routine",
+        "AGENT_ROUTINE_NOT_FOUND",
+        { id: routine.id },
+      );
+    },
+    { extraEnv: { DONUT_E2E_AGENT_ENGINE: "mock" } },
+  );
+});
+
+test("the remote-control bridge refuses a signed-out desktop and stays off", async () => {
+  await withApp("integrations-mcp-remote", async (app) => {
+    await seedTerms(app);
+
+    // Off by default, and it must stay that way without an explicit opt-in: the
+    // bridge hands Donut cloud the ability to drive this browser, which is not
+    // something to switch on for somebody because their plan allows it.
+    const settings = await app.invoke("get_app_settings");
+    assert.equal(settings.mcp_remote_enabled, false);
+
+    const initial = await app.invoke("get_mcp_remote_status");
+    assert.equal(initial.enabled, false);
+    assert.equal(initial.connected, false);
+    assert.equal(initial.lastError, null);
+    assert.ok(initial.instanceId.length >= 8);
+
+    // Stable across calls, and persisted: the id is how this desktop reclaims
+    // its own connection after a blip, so a desktop that renamed itself on
+    // every read could never do so.
+    assert.equal(
+      (await app.invoke("get_mcp_remote_status")).instanceId,
+      initial.instanceId,
+    );
+
+    // A signed-out desktop has no credential to authenticate the socket with,
+    // so it is refused here rather than allowed to open one and be dropped.
+    assert.match(
+      await app.invokeError("start_mcp_remote_bridge"),
+      /"code":"MCP_REMOTE_REQUIRES_SIGN_IN"/,
+    );
+    // The bridge must not merely be un-enabled: it must not have been STARTED.
+    // The sign-in gate sits above `mcp_remote::start`, and `enabled` is the only
+    // half that says so: it is `is_running()`, which `start` flips synchronously
+    // before it spawns the reconnect loop. `connected` is not a substitute:
+    // it only goes true once the socket authenticates, which a signed-out
+    // desktop never manages, so it reads false whether or not the bridge was
+    // started and is dialling donutbrowser.com in the background.
+    const afterRefusedStart = await app.invoke("get_mcp_remote_status");
+    assert.equal(
+      afterRefusedStart.enabled,
+      false,
+      "a refused start must not have started the bridge task",
+    );
+    assert.equal(
+      afterRefusedStart.connected,
+      false,
+      "a refused start must not have opened a socket",
+    );
+    assert.equal(
+      (await app.invoke("get_app_settings")).mcp_remote_enabled,
+      false,
+      "a refused start must not leave the setting on, or the next launch dials a socket the user never enabled",
+    );
+
+    // Stopping something that is not running is a no-op, not an error: the
+    // desktop calls this on sign-out and on quit, and both must be safe.
+    const stoppedWhileOff = await app.invoke("stop_mcp_remote_bridge");
+    assert.equal(stoppedWhileOff.enabled, false);
+    assert.equal(stoppedWhileOff.connected, false);
+    assert.equal(stoppedWhileOff.instanceId, initial.instanceId);
+
+    // The no-op case says nothing about the PERSISTED effect, and that is the
+    // half that matters: `ensure_remote_bridge` re-opens the bridge on the next
+    // launch (and on the next sign-in, and on the ten-minute reconnect tick)
+    // from `mcp_remote_enabled` alone. So put the flag on disk the way a
+    // previously opted-in session would have left it, and stop again.
+    //
+    // Every field of the returned status is computed from in-memory bridge
+    // state (`enabled` is `is_running()`, `connected` is `is_connected()`), so
+    // dropping the settings write inside `stop_mcp_remote_bridge` leaves all
+    // three assertions above green while the internet-facing bridge comes back
+    // by itself. Only the on-disk flag tells a real stop from `Ok(status())`.
+    //
+    // `save_app_settings` is NOT how the flag gets there. It belongs to the
+    // start and stop commands alone: a settings save that carried it would
+    // switch the internet-facing bridge on for the next launch without ever
+    // passing the sign-in and terms gates those commands enforce. Prove the
+    // save cannot flip it, then seed the file directly.
+    const beforeSeed = await app.invoke("get_app_settings");
+    const saved = await app.invoke("save_app_settings", {
+      settings: { ...beforeSeed, mcp_remote_enabled: true },
+    });
+    assert.equal(
+      saved.mcp_remote_enabled,
+      false,
+      "a settings save must not be able to switch remote control on",
+    );
+    assert.equal(
+      (await app.invoke("get_app_settings")).mcp_remote_enabled,
+      false,
+      "nor may it reach disk through the save",
+    );
+
+    const settingsFile = path.join(
+      app.dataRoot,
+      "data",
+      "settings",
+      "app_settings.json",
+    );
+    const onDisk = JSON.parse(await readFile(settingsFile, "utf8"));
+    await writeFile(
+      settingsFile,
+      `${JSON.stringify({ ...onDisk, mcp_remote_enabled: true }, null, 2)}\n`,
+    );
+    assert.equal(
+      (await app.invoke("get_app_settings")).mcp_remote_enabled,
+      true,
+      "the seeded opt-in must reach disk, or the stop below proves nothing",
+    );
+
+    const stopped = await app.invoke("stop_mcp_remote_bridge");
+    assert.equal(stopped.enabled, false);
+    assert.equal(stopped.connected, false);
+    assert.equal(stopped.instanceId, initial.instanceId);
+    assert.equal(
+      (await app.invoke("get_app_settings")).mcp_remote_enabled,
+      false,
+      "stopping must clear the persisted opt-in, or the next launch re-opens the bridge the user just switched off",
+    );
+
+    // Entitlement is asked of the SERVER, because neither of the local answers
+    // is right: the cached entitlement is per-account, so an entitled
+    // enterprise team MEMBER reads as unentitled, and an open socket only
+    // proves the plan is active, not that remote control is allowed.
+    //
+    // Signed out there is no credential to ask with, and the honest outcome is
+    // a clean error the dialog swallows to leave the local cache in charge:
+    // never a crash, and never a fabricated `true`.
+    const entitlementError = await app.invokeError(
+      "get_remote_control_entitlement",
+    );
+    assert.match(entitlementError, /INTERNAL_ERROR|Not logged in/);
+
+    // The remote MCP credential, the `dmk_` key agents present to the remote
+    // endpoint. A fresh desktop holds none, and reports exactly that: the
+    // shape is `{ present, token_prefix }` with no plaintext anywhere in it.
+    assert.deepEqual(await app.invoke("get_mcp_remote_credential"), {
+      present: false,
+      token_prefix: null,
+    });
+
+    // Minting needs the session, so a signed-out desktop is refused with the
+    // same code as the bridge, and refused BEFORE anything is stored.
+    //
+    // Signed in, the answer is `{ token_prefix, failed_clients }`: the key is
+    // stored and its predecessor revoked before any client is rewritten, so a
+    // client that could not be rewritten is named there rather than turning
+    // the rotation into an error the dialog would answer by minting again.
+    assert.match(
+      await app.invokeError("rotate_mcp_remote_credential"),
+      /"code":"MCP_REMOTE_REQUIRES_SIGN_IN"/,
+    );
+    assert.equal(
+      (await app.invoke("get_mcp_remote_credential")).present,
+      false,
+      "a refused rotation must not have stored a credential",
+    );
+
+    // Forgetting nothing is a no-op, not an error: sign-out and the
+    // Integrations page both reach it without checking first.
+    await app.invoke("forget_mcp_remote_credential");
+    assert.deepEqual(await app.invoke("get_mcp_remote_credential"), {
+      present: false,
+      token_prefix: null,
+    });
+  });
+});
+
+test("the remote-control bridge refuses before the terms are accepted", async () => {
+  // `start_mcp_remote_bridge` has TWO gates (the Wayfern terms, then the
+  // signed-in check), and every other test seeds the terms first, so only the
+  // second one was ever reached. The first could have been deleted with the
+  // whole suite green, which would let a desktop that never accepted the terms
+  // open an internet-facing hook into itself.
+  //
+  // `wayfernTermsAccepted: false` is what makes this session different: the
+  // harness seeds the acceptance file by DEFAULT, so merely omitting the
+  // explicit `seedTerms` call leaves the terms accepted and this test proves
+  // nothing (it first ran that way and hit the sign-in gate instead).
+  await withApp(
+    "integrations-mcp-remote-terms",
+    async (app) => {
+      assert.match(
+        await app.invokeError("start_mcp_remote_bridge"),
+        /"code":"WAYFERN_TERMS_REQUIRED"/,
+      );
+
+      const status = await app.invoke("get_mcp_remote_status");
+      // `enabled` first, for the same reason as the sign-in gate: it is
+      // `is_running()` and flips inside `mcp_remote::start`, so it is what
+      // catches a gate that stopped sitting above the start. `connected` alone
+      // would stay false on a bridge that was started and merely never got a
+      // socket up.
+      assert.equal(
+        status.enabled,
+        false,
+        "the bridge may not have been started",
+      );
+      assert.equal(status.connected, false, "no socket may have been opened");
+      assert.equal(
+        (await app.invoke("get_app_settings")).mcp_remote_enabled,
+        false,
+        "a terms refusal must not leave the setting on either",
+      );
+    },
+    { wayfernTermsAccepted: false },
+  );
+});
+
+test("REST browser automation requests hit the shared automation rate limit", async () => {
   await withApp(
     "integrations-rate-limit",
     async (app) => {
@@ -1042,97 +1623,34 @@ test("REST and MCP share the browser automation rate limit", async () => {
       });
 
       const apiPort = await app.invoke("start_api_server", { port: 0 });
-      const mcpPort = await app.invoke("start_mcp_server");
-      const mcpConfig = await app.invoke("get_mcp_config");
       const apiBase = `http://127.0.0.1:${apiPort}`;
-      const mcpUrl = `http://127.0.0.1:${mcpPort}/mcp/${mcpConfig.token}`;
-
-      const initialized = await jsonRequest(mcpUrl, {
-        method: "POST",
-        body: {
-          jsonrpc: "2.0",
-          id: 1,
-          method: "initialize",
-          params: {
-            protocolVersion: "2025-11-25",
-            capabilities: {},
-            clientInfo: { name: "donut-e2e-rate-limit", version: "1" },
-          },
-        },
-      });
-      assert.equal(initialized.response.status, 200);
-      const mcpHeaders = {
-        "mcp-session-id": initialized.response.headers.get("mcp-session-id"),
-      };
-
       const missingProfileId = "00000000-0000-0000-0000-000000000000";
-      const first = await jsonRequest(
-        `${apiBase}/v1/profiles/${missingProfileId}/run`,
-        {
+
+      // The shared automation limiter sits innermost, past auth, so an
+      // authenticated automation call consumes a token even when the profile
+      // is missing (404). With the window set to 2/hour below the contract is
+      // exact: 404, 404, then 429 with a Retry-After. The limiter is shared
+      // with the MCP tool engine, whose branch has no automated coverage: it
+      // is reached only over the cloud bridge, and it needs the e2e-only
+      // override that `cargo test --lib` does not compile.
+      const run = () =>
+        jsonRequest(`${apiBase}/v1/profiles/${missingProfileId}/run`, {
           method: "POST",
           token: saved.api_token,
           body: {},
-        },
-      );
-      assert.equal(first.response.status, 404);
-
-      const second = await jsonRequest(mcpUrl, {
-        method: "POST",
-        headers: mcpHeaders,
-        body: {
-          jsonrpc: "2.0",
-          id: 2,
-          method: "tools/call",
-          params: {
-            name: "run_profile",
-            arguments: { profile_id: missingProfileId },
-          },
-        },
+        });
+      assert.equal((await run()).response.status, 404);
+      assert.equal((await run()).response.status, 404);
+      const limited = await run();
+      assert.equal(limited.response.status, 429);
+      assert.ok(Number(limited.response.headers.get("retry-after")) > 0);
+      // Only automation calls spend the budget: a plain read still answers.
+      const listed = await jsonRequest(`${apiBase}/v1/profiles`, {
+        method: "GET",
+        token: saved.api_token,
       });
-      assert.equal(second.response.status, 200);
-      assert.equal(second.value.error.code, -32000);
+      assert.equal(listed.response.status, 200);
 
-      const restLimited = await jsonRequest(
-        `${apiBase}/v1/profiles/${missingProfileId}/run`,
-        {
-          method: "POST",
-          token: saved.api_token,
-          body: {},
-        },
-      );
-      assert.equal(restLimited.response.status, 429);
-      assert.ok(Number(restLimited.response.headers.get("retry-after")) > 0);
-
-      const mcpLimited = await jsonRequest(mcpUrl, {
-        method: "POST",
-        headers: mcpHeaders,
-        body: {
-          jsonrpc: "2.0",
-          id: 3,
-          method: "tools/call",
-          params: {
-            name: "run_profile",
-            arguments: { profile_id: missingProfileId },
-          },
-        },
-      });
-      assert.equal(mcpLimited.response.status, 429);
-      assert.ok(Number(mcpLimited.response.headers.get("retry-after")) > 0);
-
-      const freeCall = await jsonRequest(mcpUrl, {
-        method: "POST",
-        headers: mcpHeaders,
-        body: {
-          jsonrpc: "2.0",
-          id: 4,
-          method: "tools/call",
-          params: { name: "list_profiles", arguments: {} },
-        },
-      });
-      assert.equal(freeCall.response.status, 200);
-      assert.equal(freeCall.value.error, undefined);
-
-      await app.invoke("stop_mcp_server");
       await app.invoke("stop_api_server");
     },
     {
@@ -1148,11 +1666,6 @@ test("offline cloud, update, team-lock, trial, and synchronizer contracts are de
   await withApp(
     "integrations-contracts",
     async (app) => {
-      await assertCommandErrorCode(
-        app,
-        "start_mcp_server",
-        "WAYFERN_TERMS_REQUIRED",
-      );
       assert.equal(await app.invoke("cloud_get_user"), null);
       assert.equal(await app.invoke("cloud_get_proxy_usage"), null);
       assert.ok(await app.invoke("cloud_get_wayfern_token"));
@@ -1179,31 +1692,122 @@ test("offline cloud, update, team-lock, trial, and synchronizer contracts are de
       });
       assert.match(removeError, /not found|session/i);
 
-      assert.equal(await app.invoke("check_for_app_updates"), null);
-      assert.equal(await app.invoke("check_for_app_updates_manual"), null);
+      // The controls a person uses on a live session. Without one to act on,
+      // each has to refuse by its own code rather than pretend it worked: the
+      // panel reads these back, and a silent success would leave a button
+      // claiming a state the backend never entered.
+      assert.match(
+        await app.invokeError("set_sync_session_paused", {
+          sessionId: "missing",
+          paused: true,
+        }),
+        /SYNC_SESSION_NOT_FOUND/,
+      );
+      assert.match(
+        await app.invokeError("set_sync_follower_held", {
+          sessionId: "missing",
+          followerProfileId: "missing",
+          held: true,
+        }),
+        /SYNC_SESSION_NOT_FOUND/,
+      );
+      assert.match(
+        await app.invokeError("arrange_sync_windows", {
+          sessionId: "missing",
+          layout: "grid",
+        }),
+        /SYNC_SESSION_NOT_FOUND/,
+      );
+      // An unknown layout never reaches the display: it fails to deserialise.
       assert.ok(
-        await invokeContract(app, "cloud_exchange_device_code", {
-          code: "DONUT-E2E-INVALID-CODE",
+        await app.invokeError("arrange_sync_windows", {
+          sessionId: "missing",
+          layout: "diagonal",
         }),
       );
-      assert.ok(await invokeContract(app, "cloud_refresh_profile"));
-      assert.ok(await invokeContract(app, "cloud_get_countries"));
-      assert.ok(
-        await invokeContract(app, "create_cloud_location_proxy", {
+
+      assert.equal(await app.invoke("check_for_app_updates"), null);
+      assert.equal(await app.invoke("check_for_app_updates_manual"), null);
+      await assertContract(
+        app,
+        "cloud_exchange_device_code",
+        {
+          // Any of these proves the command's BODY ran and reached its network
+          // layer, which is what the evidence is for. Pinning only the server's
+          // "invalid or expired login code" sentence made a test named
+          // "offline ... deterministic" depend on a live round-trip to
+          // api.donutbrowser.com: red offline, behind a proxy, when the
+          // unauthenticated challenge is rate-limited, or the day the backend
+          // rewords it, with no signal that the desktop is fine.
+          refusedWith:
+            /invalid or expired login code|failed to fetch challenge|challenge request failed/i,
+        },
+        { code: "DONUT-E2E-INVALID-CODE" },
+      );
+      await assertContract(app, "cloud_refresh_profile", {
+        refusedWith: /not logged in/i,
+      });
+      await assertContract(app, "cloud_get_countries", {
+        refusedWith: /not logged in/i,
+      });
+      await assertContract(
+        app,
+        "create_cloud_location_proxy",
+        { refusedWith: /no cloud proxy available/i },
+        {
           name: "E2E unavailable cloud proxy",
           country: "ZZ",
           region: null,
           city: null,
           isp: null,
-        }),
+        },
       );
-      assert.ok(await invokeContract(app, "cloud_refresh_wayfern_token"));
+      await assertContract(app, "cloud_refresh_wayfern_token", {
+        // Compared against the value the harness injected, NOT matched against
+        // a hex shape. Under the `e2e` feature this command returns
+        // WAYFERN_TEST_TOKEN, so a /^[0-9a-f]{32,}$/ assertion only proved the
+        // harness's own env var looks like a token: it validated the fixture
+        // and would have passed with the command's body deleted. Equality
+        // proves the command actually reached the token and returned it.
+        answers: (token) =>
+          assert.equal(
+            String(token),
+            process.env.WAYFERN_TEST_TOKEN,
+            "the command must return the token it was given, not a different value",
+          ),
+      });
 
-      assert.ok(await invokeContract(app, "trigger_manual_version_update"));
-      assert.ok(
-        await invokeContract(app, "clear_all_version_cache_and_refetch"),
-      );
-      assert.ok(await invokeContract(app, "check_for_browser_updates"));
+      await assertContract(app, "trigger_manual_version_update", {
+        answers: (report) => {
+          assert.ok(
+            Array.isArray(report),
+            "the update run must report per browser",
+          );
+          // Non-empty, or the per-entry loop below asserts nothing at all: an
+          // `[]` satisfied every check while the command did no work.
+          assert.ok(
+            report.length > 0,
+            `the update run must report at least one browser, got ${JSON.stringify(report)}`,
+          );
+          for (const entry of report) {
+            assert.ok(
+              typeof entry.browser === "string" && entry.browser.length > 0,
+              `every entry names its browser: ${JSON.stringify(entry)}`,
+            );
+            assert.equal(typeof entry.updated_successfully, "boolean");
+          }
+        },
+      });
+      await assertContract(app, "clear_all_version_cache_and_refetch", {
+        answers: (value) => assert.equal(value, null),
+      });
+      await assertContract(app, "check_for_browser_updates", {
+        answers: (updates) =>
+          assert.ok(
+            Array.isArray(updates),
+            `the update check must answer with a list, got ${JSON.stringify(updates)}`,
+          ),
+      });
       await app.invoke("dismiss_update_notification", {
         notificationId: "missing-e2e-notification",
       });
@@ -1253,6 +1857,12 @@ test("offline cloud, update, team-lock, trial, and synchronizer contracts are de
       assert.match(
         await app.invokeError("stop_remote_session", {
           sessionId: "missing-e2e-session",
+        }),
+        notSignedIn,
+      );
+      assert.match(
+        await app.invokeError("start_profile_remote_session", {
+          profileId: missingProfileId,
         }),
         notSignedIn,
       );
@@ -1382,6 +1992,161 @@ test("offline cloud, update, team-lock, trial, and synchronizer contracts are de
         }),
         /"code":"PROFILE_NOT_FOUND"/,
       );
+
+      // Schedules live in the cloud too, which checks the plan on every save
+      // and every fire; signed out, every call refuses with a code, and what
+      // the app can check itself is checked before anything is sent.
+      const scheduleId = "00000000-0000-0000-0000-000000000000";
+      assert.match(await app.invokeError("list_agent_schedules"), notSignedIn);
+
+      // The team's log is read in the cloud, by owners and admins only.
+      // Without a team seat there is no log to ask for.
+      assert.match(
+        await app.invokeError("list_team_activity", {
+          cursor: null,
+          limit: 50,
+        }),
+        /"code":"TEAM_ACTIVITY_FORBIDDEN"/,
+      );
+      assert.match(
+        await app.invokeError("export_team_activity_csv", {
+          path: "/nonexistent/activity.csv",
+          filter: { targetType: "profile" },
+        }),
+        /"code":"TEAM_ACTIVITY_FORBIDDEN"/,
+      );
+      assert.match(
+        await app.invokeError("list_team_members"),
+        /"code":"TEAM_ACCESS_FORBIDDEN"/,
+      );
+      assert.match(
+        await app.invokeError("set_team_member_access", {
+          userId: "u-1",
+          groups: ["g1"],
+        }),
+        /"code":"TEAM_ACCESS_FORBIDDEN"/,
+      );
+      assert.match(
+        await app.invokeError("create_agent_schedule", {
+          schedule: {
+            name: "Nightly",
+            recipeId: "r",
+            target: "fleet",
+            profileIds: ["p"],
+          },
+        }),
+        notSignedIn,
+      );
+      assert.match(
+        await app.invokeError("create_agent_schedule", {
+          schedule: ["not", "an", "object"],
+        }),
+        /"code":"AGENT_SCHEDULE_INVALID"/,
+      );
+      assert.match(
+        await app.invokeError("update_agent_schedule", {
+          id: scheduleId,
+          patch: { enabled: false },
+        }),
+        notSignedIn,
+      );
+      assert.match(
+        await app.invokeError("update_agent_schedule", { id: "  ", patch: {} }),
+        /"code":"AGENT_SCHEDULE_NOT_FOUND"/,
+      );
+      assert.match(
+        await app.invokeError("delete_agent_schedule", { id: scheduleId }),
+        notSignedIn,
+      );
+      assert.match(
+        await app.invokeError("run_agent_schedule_now", { id: scheduleId }),
+        notSignedIn,
+      );
+      assert.match(
+        await app.invokeError("list_agent_schedule_runs", { id: scheduleId }),
+        notSignedIn,
+      );
+      assert.match(
+        await app.invokeError("test_agent_schedule_notice", { id: scheduleId }),
+        notSignedIn,
+      );
+
+      // Recipes live in the cloud; signed out, every call refuses with a code.
+      assert.match(await app.invokeError("get_agent_recipes"), notSignedIn);
+      assert.match(
+        await app.invokeError("create_agent_recipe", {
+          name: "E2E recipe",
+          steps: [{ type: "navigate", url: "https://example.com" }],
+        }),
+        notSignedIn,
+      );
+      assert.match(
+        await app.invokeError("update_agent_recipe", {
+          id: "00000000-0000-0000-0000-000000000000",
+          name: "E2E recipe",
+          steps: [{ type: "navigate", url: "https://example.com" }],
+        }),
+        notSignedIn,
+      );
+      assert.match(
+        await app.invokeError("delete_agent_recipe", {
+          id: "00000000-0000-0000-0000-000000000000",
+        }),
+        notSignedIn,
+      );
+      const run = {
+        recipeId: "00000000-0000-0000-0000-000000000000",
+        profileId: "00000000-0000-0000-0000-000000000001",
+        name: "E2E run",
+      };
+      assert.match(
+        await app.invokeError("run_agent_recipe_now", {
+          ...run,
+          target: "desktop",
+        }),
+        notSignedIn,
+      );
+      // A run that names no place to run, or a fleet run with no OS the fleet
+      // leases, is refused before any network call.
+      assert.match(
+        await app.invokeError("run_agent_recipe_now", {
+          ...run,
+          target: "moon",
+        }),
+        /"code":"AGENT_TARGET_INVALID"/,
+      );
+      assert.match(
+        await app.invokeError("run_agent_recipe_now", {
+          ...run,
+          target: "fleet",
+          platform: "android",
+        }),
+        /"code":"AGENT_PLATFORM_INVALID"/,
+      );
+      assert.match(
+        await app.invokeError("create_agent_recipe", {
+          name: "  ",
+          steps: [{ type: "navigate", url: "https://example.com" }],
+        }),
+        /"code":"NAME_CANNOT_BE_EMPTY"/,
+      );
+      for (const steps of [
+        [],
+        ["open the dashboard"],
+        [{ url: "https://example.com" }],
+        [{ type: "teleport" }],
+        [{ type: "click" }],
+        [{ type: "click", selector: "#buy", locator: { role: "button" } }],
+      ]) {
+        assert.match(
+          await app.invokeError("create_agent_recipe", {
+            name: "E2E recipe",
+            steps,
+          }),
+          /"code":"AGENT_RECIPE_INVALID"/,
+          `${JSON.stringify(steps)} must be refused before any network call`,
+        );
+      }
 
       const trial = await app.invoke("get_commercial_trial_status");
       assert.ok(trial && typeof trial === "object");

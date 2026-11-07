@@ -1,28 +1,30 @@
 //! Key material for profile import.
 //!
-//! Wayfern deliberately does not use the OS keyring. Every `os_crypt_async`
-//! key provider is patched to read (or mint) `<user-data-dir>/os_crypt_key`
-//! instead, so a profile directory is self-contained and portable. See
-//! `wayfern/patches/extra/fingerprint/components-os_crypt-async-browser-*`.
+//! A Donut profile keeps its os_crypt key material in
+//! `<user-data-dir>/os_crypt_key` rather than the OS keyring, so a profile
+//! directory is self-contained and portable.
 //!
 //! That portability is exactly why an imported Chrome profile carries nothing:
 //! its secrets are sealed with a key held in the macOS Keychain / Windows DPAPI
-//! / the Freedesktop secret service, and Wayfern never looks there. Import has
-//! to open the source's lock and re-seal everything with Wayfern's.
+//! / the Freedesktop secret service, which the profile directory does not
+//! contain. Import has to open the source's lock and re-seal everything with
+//! the profile's own key.
 //!
-//! The on-disk format is per-platform and NOT interchangeable, matching the
-//! provider that owns each tag in the patched Chromium 151 tree:
+//! The key file holds one of Chromium's two key formats: the raw 32-byte
+//! AES-256-GCM key Chromium uses on Windows, or the password Chromium feeds to
+//! PBKDF2 on macOS and Linux. The format of the file and the tag of each record
+//! select the cipher, the same on every host ([`key_for_tag`]):
 //!
-//! | Host    | `os_crypt_key`      | Derivation                          | Cipher       | Tag   |
-//! |---------|---------------------|-------------------------------------|--------------|-------|
-//! | macOS   | `base64(16 bytes)`  | PBKDF2-HMAC-SHA1(saltysalt, 1003)   | AES-128-CBC  | `v10` |
-//! | Linux   | `base64(16 bytes)`  | PBKDF2-HMAC-SHA1(saltysalt, 1)      | AES-128-CBC  | `v11` |
-//! | Windows | 32 raw bytes        | none, the bytes are the key         | AES-256-GCM  | `v10` |
+//! | `os_crypt_key`           | Tag   | Cipher       | Key                                       |
+//! |--------------------------|-------|--------------|-------------------------------------------|
+//! | 32 raw bytes             | `v10` | AES-256-GCM  | the bytes                                 |
+//! | any other bytes          | `v10` | AES-128-CBC  | PBKDF2-HMAC-SHA1(contents, saltysalt, 1003) |
+//! | any                      | `v11` | AES-128-CBC  | PBKDF2-HMAC-SHA1(contents, saltysalt, 1)  |
 //!
-//! Linux must write `v11`, not `v10`: `PosixKeyProvider` owns `v10` with the
-//! hardcoded "peanuts" password and `Encryptor::DecryptData` dispatches on the
-//! tag prefix, so a `v10` record on Linux would be decrypted with the wrong key
-//! forever.
+//! A new key file is minted in the host's format and records are written under
+//! the host's tag (`v10` on macOS and Windows, `v11` on Linux), so a profile
+//! created here reads exactly like one Chromium wrote on this OS. Linux writes
+//! `v11`, not `v10`: Chromium's `PosixKeyProvider` owns `v10` there.
 
 use aes::cipher::{block_padding::Pkcs7, BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -40,13 +42,13 @@ type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 
 /// Chromium's fixed PBKDF2 salt for every CBC-based os_crypt provider.
-// Only the CBC hosts derive a key; Windows uses the file's bytes directly.
-#[allow(dead_code)]
 pub const SALT: &[u8] = b"saltysalt";
 /// Chromium's fixed CBC IV: sixteen spaces.
 pub const CBC_IV: [u8; 16] = [b' '; 16];
 /// AES-256-GCM nonce length, prepended to the ciphertext by `Encryptor::Key::Encrypt`.
 const GCM_NONCE_LEN: usize = 12;
+/// Length of a raw AES-256-GCM key file, the format Chromium uses on Windows.
+pub const GCM_KEY_LEN: usize = 32;
 /// The `os_crypt_key` name, at the root of the user-data dir.
 pub const KEY_FILE_NAME: &str = "os_crypt_key";
 
@@ -66,12 +68,18 @@ pub const EMPTY_PASSWORD_KEY: [u8; 16] = [
 #[allow(dead_code)]
 pub const POSIX_FALLBACK_PASSWORD: &[u8] = b"peanuts";
 
-/// PBKDF2 iteration counts, per the provider that owns each platform.
-// Each host only ever derives with its own count, but both are needed to read
-// a profile produced on the other one.
-#[allow(dead_code)]
+/// `PBKDF2-HMAC-SHA1(password = "peanuts", salt = "saltysalt", iterations = 1)`.
+///
+/// Linux Chromium seals `v10` records under this fixed key when it has no
+/// other, and such records keep it when the profile moves to another OS, so
+/// every AES-128-CBC decrypt falls back to it after [`EMPTY_PASSWORD_KEY`].
+pub const POSIX_FALLBACK_KEY: [u8; 16] = [
+  0xfd, 0x62, 0x1f, 0xe5, 0xa2, 0xb4, 0x02, 0x53, 0x9d, 0xfa, 0x14, 0x7c, 0xa9, 0x27, 0x27, 0x78,
+];
+
+/// PBKDF2 iteration counts: macOS Chromium derives its `v10` key with 1003,
+/// Linux Chromium derives its keys with 1.
 pub const MAC_ITERATIONS: u32 = 1003;
-#[allow(dead_code)]
 pub const POSIX_ITERATIONS: u32 = 1;
 
 /// Derive a 16-byte AES-128 key the way every CBC os_crypt provider does.
@@ -79,9 +87,6 @@ pub const POSIX_ITERATIONS: u32 = 1;
 /// `password` is the raw bytes, never trimmed: Chromium passes the exact
 /// `ReadFileToString` result to the KDF, so normalising here would silently
 /// produce a different key and every decrypt would fail.
-// Called from the mac and Linux branches only: `DPAPIKeyProvider` takes the
-// 32 bytes on disk as the AES-256 key with no derivation step at all.
-#[allow(dead_code)]
 pub fn derive_key(password: &[u8], iterations: u32) -> [u8; 16] {
   let mut key = [0u8; 16];
   // ring rather than the `pbkdf2` crate: sha1 0.11 (digest 0.11) and
@@ -96,18 +101,60 @@ pub fn derive_key(password: &[u8], iterations: u32) -> [u8; 16] {
   key
 }
 
+/// The key for records tagged `tag` in a profile whose `os_crypt_key` holds
+/// `contents`, or `None` for an empty file or a tag no key file serves. The
+/// file's format decides, never the host, so a profile written on any OS reads
+/// the same everywhere:
+///
+/// - 32 raw bytes: `v10` is AES-256-GCM keyed by the bytes.
+/// - any other contents: `v10` is AES-128-CBC keyed by
+///   PBKDF2-HMAC-SHA1(contents, "saltysalt", 1003).
+/// - any contents: `v11` is AES-128-CBC keyed by
+///   PBKDF2-HMAC-SHA1(contents, "saltysalt", 1).
+pub fn key_for_tag(contents: &[u8], tag: &[u8]) -> Option<CryptoKey> {
+  if contents.is_empty() {
+    return None;
+  }
+  match tag {
+    b"v10" => Some(match <[u8; GCM_KEY_LEN]>::try_from(contents) {
+      Ok(raw) => CryptoKey::Aes256Gcm(raw),
+      Err(_) => CryptoKey::Aes128Cbc(derive_key(contents, MAC_ITERATIONS)),
+    }),
+    b"v11" => Some(CryptoKey::Aes128Cbc(derive_key(contents, POSIX_ITERATIONS))),
+    _ => None,
+  }
+}
+
 /// One os_crypt cipher, keyed. Which variant applies is decided by the tag the
-/// record carries, never by the host platform.
+/// record carries and the format of the key file, never by the host platform.
 #[derive(Clone)]
 pub enum CryptoKey {
   Aes128Cbc([u8; 16]),
-  // Only Windows keys with GCM, but the variant has to exist everywhere so the
-  // tag dispatch in `SourceKeyring` stays platform-independent.
-  #[allow(dead_code)]
   Aes256Gcm([u8; 32]),
 }
 
 impl CryptoKey {
+  /// This key, then, for AES-128-CBC, the fixed keys Chromium retries a CBC
+  /// record with when it does not open: the empty password
+  /// ([`EMPTY_PASSWORD_KEY`]) and Linux's fixed password
+  /// ([`POSIX_FALLBACK_KEY`]). A raw key file's `v10` records can also be
+  /// AES-128-CBC, keyed by PBKDF2(the 32 bytes, "saltysalt", 1003) or by
+  /// Linux's fixed password, so an AES-256-GCM key falls back to those two.
+  pub fn with_fallbacks(&self) -> Vec<CryptoKey> {
+    match self {
+      Self::Aes128Cbc(_) => vec![
+        self.clone(),
+        Self::Aes128Cbc(EMPTY_PASSWORD_KEY),
+        Self::Aes128Cbc(POSIX_FALLBACK_KEY),
+      ],
+      Self::Aes256Gcm(raw) => vec![
+        self.clone(),
+        Self::Aes128Cbc(derive_key(raw, MAC_ITERATIONS)),
+        Self::Aes128Cbc(POSIX_FALLBACK_KEY),
+      ],
+    }
+  }
+
   /// Decrypt a *tagless* ciphertext (the caller has already stripped the
   /// 3-byte version prefix).
   pub fn decrypt(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
@@ -192,37 +239,17 @@ impl TargetKey {
     }
   }
 
-  /// Build the key from the raw `os_crypt_key` file contents.
+  /// Build the key from the raw `os_crypt_key` file contents: the host's tag,
+  /// keyed by the file's format ([`key_for_tag`]). A key file another OS wrote
+  /// works as well as one minted here, so it is never replaced.
   ///
-  /// Returns `None` when the contents cannot key the host cipher — on Windows
-  /// that means anything other than exactly 32 bytes, which is what
-  /// `DPAPIKeyProvider` requires before it will adopt a portable key.
+  /// Returns `None` only for an empty file.
   fn from_file_contents(contents: &[u8]) -> Option<Self> {
-    if contents.is_empty() {
-      return None;
-    }
-    #[cfg(target_os = "windows")]
-    {
-      let bytes: [u8; 32] = contents.try_into().ok()?;
-      Some(Self {
-        key: CryptoKey::Aes256Gcm(bytes),
-        tag: Self::host_tag(),
-      })
-    }
-    #[cfg(target_os = "macos")]
-    {
-      Some(Self {
-        key: CryptoKey::Aes128Cbc(derive_key(contents, MAC_ITERATIONS)),
-        tag: Self::host_tag(),
-      })
-    }
-    #[cfg(target_os = "linux")]
-    {
-      Some(Self {
-        key: CryptoKey::Aes128Cbc(derive_key(contents, POSIX_ITERATIONS)),
-        tag: Self::host_tag(),
-      })
-    }
+    let tag = Self::host_tag();
+    Some(Self {
+      key: key_for_tag(contents, tag)?,
+      tag,
+    })
   }
 
   /// Fresh key material in the host platform's `os_crypt_key` format.
@@ -248,25 +275,19 @@ impl TargetKey {
   /// Read the existing `os_crypt_key`, or mint and persist one.
   ///
   /// Writing eagerly at import time — rather than letting the first launch do
-  /// it — is deliberate. The mac and Linux patches have no `else` branch when
-  /// the write fails, so the browser would run on an in-memory key that dies
-  /// with the process and orphans everything it wrote. Failing here instead
-  /// turns that silent data loss into a visible import error.
+  /// it — is deliberate: a key the browser cannot persist would live only in
+  /// memory, die with the process, and orphan everything written with it.
+  /// Failing here instead turns that silent data loss into a visible import
+  /// error.
   pub fn ensure(user_data_dir: &Path) -> Result<Self, String> {
     let key_file = user_data_dir.join(KEY_FILE_NAME);
 
+    // Any non-empty key file keys every tag, whichever OS wrote it, and the
+    // profile's existing records depend on it, so it is reused as it is.
     if let Ok(existing) = std::fs::read(&key_file) {
       if let Some(key) = Self::from_file_contents(&existing) {
         return Ok(key);
       }
-      // Present but unusable (a Windows-format key on macOS, say, or a
-      // truncated write). Replacing it is safe only because import always
-      // re-encrypts into whatever key we end up with.
-      log::warn!(
-        "Replacing unusable {KEY_FILE_NAME} ({} bytes) at {}",
-        existing.len(),
-        key_file.display()
-      );
     }
 
     std::fs::create_dir_all(user_data_dir)
@@ -362,207 +383,18 @@ impl SourceKeyring {
       return Decrypted::Unrecoverable;
     };
 
-    if let Some(plaintext) = key.decrypt(body) {
-      return Decrypted::Value(plaintext);
+    // Chromium's own fallbacks for CBC records sealed with a fixed key.
+    match key
+      .with_fallbacks()
+      .iter()
+      .find_map(|candidate| candidate.decrypt(body))
+    {
+      Some(plaintext) => Decrypted::Value(plaintext),
+      None => Decrypted::Unrecoverable,
     }
-
-    // Chromium's own fallback for CBC records sealed with an empty password.
-    if matches!(key, CryptoKey::Aes128Cbc(_)) {
-      if let Some(plaintext) = CryptoKey::Aes128Cbc(EMPTY_PASSWORD_KEY).decrypt(body) {
-        return Decrypted::Value(plaintext);
-      }
-    }
-
-    Decrypted::Unrecoverable
   }
 }
 
 #[cfg(test)]
-mod tests {
-  use super::*;
-  use tempfile::TempDir;
-
-  #[test]
-  fn empty_password_key_matches_chromium_constant() {
-    // Locks the constant against the value Chromium hardcodes in encryptor.cc.
-    assert_eq!(derive_key(b"", POSIX_ITERATIONS), EMPTY_PASSWORD_KEY);
-  }
-
-  #[test]
-  fn peanuts_key_matches_known_vector() {
-    // PBKDF2-HMAC-SHA1("peanuts", "saltysalt", 1, 16). Any drift here silently
-    // breaks every Linux `--password-store=basic` import.
-    assert_eq!(
-      derive_key(POSIX_FALLBACK_PASSWORD, POSIX_ITERATIONS),
-      [
-        0xfd, 0x62, 0x1f, 0xe5, 0xa2, 0xb4, 0x02, 0x53, 0x9d, 0xfa, 0x14, 0x7c, 0xa9, 0x27, 0x27,
-        0x78
-      ]
-    );
-  }
-
-  #[test]
-  fn cbc_round_trip() {
-    let key = CryptoKey::Aes128Cbc(derive_key(b"hunter2", MAC_ITERATIONS));
-    let sealed = key.encrypt(b"session-token").expect("encrypt");
-    assert_eq!(key.decrypt(&sealed).expect("decrypt"), b"session-token");
-  }
-
-  #[test]
-  fn cbc_round_trip_empty_plaintext() {
-    let key = CryptoKey::Aes128Cbc(derive_key(b"hunter2", MAC_ITERATIONS));
-    let sealed = key.encrypt(b"").expect("encrypt");
-    // PKCS7 always emits a full padding block, so this must not be empty.
-    assert_eq!(sealed.len(), 16);
-    assert!(key.decrypt(&sealed).expect("decrypt").is_empty());
-  }
-
-  #[test]
-  fn gcm_round_trip_with_fresh_nonce_each_time() {
-    let key = CryptoKey::Aes256Gcm([7u8; 32]);
-    let a = key.encrypt(b"session-token").expect("encrypt");
-    let b = key.encrypt(b"session-token").expect("encrypt");
-    assert_ne!(a, b, "nonce must be random per call");
-    assert_eq!(key.decrypt(&a).expect("decrypt"), b"session-token");
-    assert_eq!(key.decrypt(&b).expect("decrypt"), b"session-token");
-  }
-
-  #[test]
-  fn gcm_rejects_tampered_ciphertext() {
-    let key = CryptoKey::Aes256Gcm([7u8; 32]);
-    let mut sealed = key.encrypt(b"session-token").expect("encrypt");
-    let last = sealed.len() - 1;
-    sealed[last] ^= 0xff;
-    assert!(key.decrypt(&sealed).is_none());
-  }
-
-  #[test]
-  fn target_key_is_stable_across_calls() {
-    let dir = TempDir::new().unwrap();
-    let first = TargetKey::ensure(dir.path()).expect("mint");
-    let sealed = first.encrypt(b"value").expect("encrypt");
-
-    let second = TargetKey::ensure(dir.path()).expect("reuse");
-    // Re-running import over the same directory must not orphan what the
-    // previous run wrote.
-    let key_file = std::fs::read(dir.path().join(KEY_FILE_NAME)).unwrap();
-    let reloaded = TargetKey::from_file_contents(&key_file).expect("reload");
-    assert_eq!(
-      reloaded.encrypt(b"probe").map(|v| v[..3].to_vec()),
-      second.encrypt(b"probe").map(|v| v[..3].to_vec())
-    );
-
-    let mut keyring = SourceKeyring::default();
-    let contents = std::fs::read(dir.path().join(KEY_FILE_NAME)).unwrap();
-    install_host_key(&mut keyring, &contents);
-    match keyring.decrypt(&sealed) {
-      Decrypted::Value(v) => assert_eq!(v, b"value"),
-      _ => panic!("target key must round-trip through the source keyring"),
-    }
-  }
-
-  #[test]
-  fn minted_key_matches_wayfern_file_format() {
-    let dir = TempDir::new().unwrap();
-    TargetKey::ensure(dir.path()).expect("mint");
-    let contents = std::fs::read(dir.path().join(KEY_FILE_NAME)).unwrap();
-
-    #[cfg(target_os = "windows")]
-    assert_eq!(
-      contents.len(),
-      32,
-      "DPAPIKeyProvider only adopts a 32-byte portable key"
-    );
-
-    #[cfg(not(target_os = "windows"))]
-    {
-      // Wayfern writes base64(16 random bytes) = 24 ASCII chars.
-      assert_eq!(contents.len(), 24);
-      let text = String::from_utf8(contents).expect("ascii");
-      assert!(
-        base64::engine::general_purpose::STANDARD
-          .decode(&text)
-          .map(|b| b.len())
-          == Ok(16),
-        "expected base64 of 16 bytes, got {text}"
-      );
-    }
-
-    #[cfg(unix)]
-    {
-      use std::os::unix::fs::PermissionsExt;
-      let mode = std::fs::metadata(dir.path().join(KEY_FILE_NAME))
-        .unwrap()
-        .permissions()
-        .mode();
-      assert_eq!(mode & 0o777, 0o600);
-    }
-  }
-
-  #[test]
-  fn unknown_tag_is_treated_as_plaintext_not_as_loss() {
-    let keyring = SourceKeyring::default();
-    assert!(matches!(
-      keyring.decrypt(b"plain cookie value"),
-      Decrypted::NotEncrypted
-    ));
-  }
-
-  #[test]
-  fn app_bound_records_are_flagged_unrecoverable() {
-    let keyring = SourceKeyring::default();
-    let mut sealed = b"v20".to_vec();
-    sealed.extend_from_slice(&[0u8; 40]);
-    assert!(matches!(keyring.decrypt(&sealed), Decrypted::Unrecoverable));
-    assert!(
-      keyring.saw_app_bound.get(),
-      "v20 must be reported to the user, not silently dropped"
-    );
-  }
-
-  #[test]
-  fn missing_key_for_known_tag_is_unrecoverable() {
-    let keyring = SourceKeyring::default();
-    let mut sealed = b"v10".to_vec();
-    sealed.extend_from_slice(&[0u8; 32]);
-    assert!(matches!(keyring.decrypt(&sealed), Decrypted::Unrecoverable));
-  }
-
-  #[test]
-  fn empty_password_fallback_recovers_the_record() {
-    // A record sealed with the empty-password key must still open when the
-    // keyring holds a different primary key, mirroring Chromium.
-    let sealed_body = CryptoKey::Aes128Cbc(EMPTY_PASSWORD_KEY)
-      .encrypt(b"legacy")
-      .unwrap();
-    let mut stored = b"v10".to_vec();
-    stored.extend_from_slice(&sealed_body);
-
-    let keyring = SourceKeyring {
-      v10: Some(CryptoKey::Aes128Cbc(derive_key(b"a different key", 1003))),
-      ..Default::default()
-    };
-    match keyring.decrypt(&stored) {
-      Decrypted::Value(v) => assert_eq!(v, b"legacy"),
-      _ => panic!("empty-password fallback must be attempted"),
-    }
-  }
-
-  /// Load the host-format key into a keyring under the host tag, for tests
-  /// that need to verify what we wrote is what Wayfern will read.
-  fn install_host_key(keyring: &mut SourceKeyring, contents: &[u8]) {
-    #[cfg(target_os = "windows")]
-    {
-      let bytes: [u8; 32] = contents.try_into().unwrap();
-      keyring.v10 = Some(CryptoKey::Aes256Gcm(bytes));
-    }
-    #[cfg(target_os = "macos")]
-    {
-      keyring.v10 = Some(CryptoKey::Aes128Cbc(derive_key(contents, MAC_ITERATIONS)));
-    }
-    #[cfg(target_os = "linux")]
-    {
-      keyring.v11 = Some(CryptoKey::Aes128Cbc(derive_key(contents, POSIX_ITERATIONS)));
-    }
-  }
-}
+#[path = "os_crypt_tests.rs"]
+mod tests;

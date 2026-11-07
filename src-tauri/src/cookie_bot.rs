@@ -1,10 +1,8 @@
 //! Cookie-bot transport.
 //!
-//! The bot warms a profile's cookies overnight by driving it on a leased
-//! remote host. NONE of that lives here: the schedule, the calendar maths, the
-//! preset expansion, the site ordering, the dwell and scroll model, the pooled
-//! budget and the nightly dispatcher are all held by donutbrowser-infra and
-//! the Wayfern manager.
+//! The bot warms a profile's cookies overnight by driving it on a remote host.
+//! None of that behaviour lives here: the schedule and everything the bot
+//! actually does are owned by the cloud API.
 //!
 //! This module is the wire only. It sends the user's own scalars — when to
 //! run, for how long, which of their sites, which server-issued preset id —
@@ -14,15 +12,20 @@
 
 use crate::cloud_errors::{self, BackendFailure, FailureCodes};
 use crate::profile::types::BrowserProfile;
+use crate::sync::encryption::{remote_seal, RemoteSeal};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::sync::OnceLock;
+use std::collections::HashSet;
 use std::time::Duration;
 
-/// Operating systems the fleet can lease. Linux is refused by the manager, so
-/// refusing it here turns a nightly failure at 02:00 into a refusal at the
-/// moment the user picks the profile.
-pub const BOT_PLATFORMS: [&str; 2] = ["windows", "macos"];
+/// Operating systems a remote run can be scheduled on. Anything else (a mobile
+/// OS, a typo) has no host, so it is refused here rather than as a failed run
+/// at 02:00.
+pub const BOT_PLATFORMS: [&str; 3] = ["windows", "macos", "linux"];
+
+const MAX_PROFILE_NAME_UNITS: usize = 200;
+
+static ENROLLED_PROFILES: std::sync::Mutex<Option<HashSet<String>>> = std::sync::Mutex::new(None);
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -139,7 +142,7 @@ pub struct CookieBotSchedule {
   #[serde(default)]
   pub slots: Vec<CookieBotSlot>,
   pub timezone: String,
-  /// Server-issued preset id. Opaque here — what it expands to is infra's.
+  /// Server-issued preset id. Opaque here — what it expands to is the server's.
   pub preset: String,
   /// The template the sites came from, or `None` for the user's own list.
   ///
@@ -164,9 +167,9 @@ pub struct CookieBotSchedule {
   pub encrypted_sync: bool,
   #[serde(default)]
   pub has_proxy: bool,
-  /// Whether that exit is one a leased fleet host could dial. Defaults to false
-  /// on an older server that does not send it, which reads as "not reachable"
-  /// and is the safe direction.
+  /// Whether that exit is one a remote host could dial. Defaults to false on an
+  /// older server that does not send it, which reads as "not reachable" and is
+  /// the safe direction.
   #[serde(default)]
   pub proxy_remote_reachable: bool,
   #[serde(default)]
@@ -176,6 +179,10 @@ pub struct CookieBotSchedule {
   /// When those facts were last refreshed.
   #[serde(default)]
   pub profile_state_at: Option<String>,
+  /// The last check of the profile's proxy or VPN from this computer. Never
+  /// sent by the server; filled in from local state.
+  #[serde(default)]
+  pub exit_check: Option<crate::cookie_bot_exit::ExitCheckView>,
 
   /// Why tonight would be refused, or `None`.
   ///
@@ -252,7 +259,7 @@ pub struct CookieBotScheduleInput {
   // Defaulting is safe in exactly one direction: `bool::default()` is false, so
   // an unstamped input reads as "no sync, no proxy" and is REFUSED. The failure
   // this must never have is the opposite one, a defaulted `has_proxy: true`
-  // warming a profile out of the fleet's own datacenter address.
+  // warming a profile out of the remote host's own address.
   #[serde(default)]
   pub sync_enabled: bool,
   #[serde(default)]
@@ -265,6 +272,8 @@ pub struct CookieBotScheduleInput {
   pub touch_fingerprint: bool,
   #[serde(default)]
   pub sticky_exit: bool,
+  #[serde(default)]
+  pub exit_alive: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -344,8 +353,8 @@ pub struct CookieBotRun {
   #[serde(default)]
   pub max_minutes: u32,
   /// How many browser sessions this night is split into, and which one is
-  /// running. A night longer than one session's cap is checkpointed at each
-  /// boundary, and "chunk 2 of 3" is the only honest way to report that.
+  /// running. "chunk 2 of 3" is the only honest way to report a night the
+  /// server split.
   #[serde(default)]
   pub chunks_total: u32,
   #[serde(default)]
@@ -403,10 +412,8 @@ pub struct CookieBotPreset {
 /// A server-owned browsing template: a named answer to "what is this profile
 /// for", which the user picks INSTEAD of typing a site list.
 ///
-/// Carries no URLs, and must not gain any. The pool a template draws from is
-/// server-side for the same reason a preset's browsing model is: a published
-/// list is one a retailer can filter, and each profile is given its own sample
-/// so the template never becomes a fleet-wide fingerprint.
+/// Carries no URLs, and must not gain any: the site pool a template draws from
+/// is server-owned, and a published list is one a retailer can filter.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CookieBotTemplate {
   pub id: String,
@@ -506,8 +513,8 @@ pub struct RemoteHoursMember {
   pub bot_hours: f64,
 }
 
-/// The single pooled remote-hour budget. Bot and interactive hours share it;
-/// the breakdown is reporting, never a sub-cap.
+/// The remote-hour budget as the server reports it, with the bot/interactive
+/// breakdown it sends.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RemoteHoursQuota {
   pub granted_hours: f64,
@@ -602,19 +609,32 @@ pub struct CookieBotUsage {
 
 // --- Client-side preconditions ---------------------------------------------
 
+/// [`bot_precondition`] for this device as it is now: also refused while the
+/// account syncs with its own server, which the bot's hosts cannot reach.
+pub fn run_precondition(profile: &BrowserProfile) -> Result<(), String> {
+  if let Some(refusal) = crate::sync::account_server::cloud_run_refusal() {
+    return Err(refusal);
+  }
+  let seal = remote_seal(profile, crate::sync::encryption::has_e2e_password());
+  if seal == Some(RemoteSeal::SyncPassword) {
+    return Err(error("SYNC_PASSWORD_BLOCKS_REMOTE_RUN", &[]));
+  }
+  bot_precondition(profile, &exit_reachability(profile))
+}
+
 /// Whether this profile could ever be warmed by the bot.
 ///
 /// The server is authoritative — it re-checks all of this and owns the parts
 /// the client cannot see — but a profile that can never qualify should never
-/// reach a confirm dialog, an hour of quota or a leased host. Returns the
+/// reach a confirm dialog, an hour of quota or a remote host. Returns the
 /// `{"code":…}` string a Tauri command surfaces directly.
 pub fn bot_precondition(
   profile: &BrowserProfile,
   exit: &crate::remote_exit::ExitReachability,
 ) -> Result<(), String> {
   if !profile.is_sync_enabled() {
-    // The host materialises the profile by pulling it from donut-sync. A
-    // local-only profile has nothing there, so there is no path to a run.
+    // A remote run obtains the profile through sync, so a local-only profile
+    // has nothing there and there is no path to a run.
     return Err(error("COOKIE_BOT_REQUIRES_CLOUD_SYNC", &[]));
   }
   if profile.is_encrypted_sync() {
@@ -622,7 +642,7 @@ pub fn bot_precondition(
     // ciphertext and push the corruption back over the real profile.
     return Err(error("COOKIE_BOT_ENCRYPTED_SYNC_UNSUPPORTED", &[]));
   }
-  let Some(platform) = profile.resolved_os() else {
+  let Some(platform) = profile.remote_platform() else {
     return Err(error("COOKIE_BOT_UNKNOWN_PLATFORM", &[]));
   };
   if !BOT_PLATFORMS.contains(&platform) {
@@ -632,16 +652,16 @@ pub fn bot_precondition(
     ));
   }
   if profile.proxy_id.is_none() && profile.vpn_id.is_none() {
-    // Without one the run egresses from the fleet's own datacenter address.
-    // Hours of traffic from a hosting ASN is worse for the profile's identity
-    // than not warming it at all.
+    // Without one the run egresses from the remote host's own address instead
+    // of the user's exit, which is worse for the profile's identity than not
+    // warming it at all.
     return Err(error("COOKIE_BOT_REQUIRES_EXIT_NODE", &[]));
   }
-  // ...and the exit has to be one the leased host can reach. The profile and its
-  // proxy record are pulled onto the fleet with no address rewriting, so
-  // 127.0.0.1 arrives meaning THAT host's loopback — an ordinary mistake (an SSH
-  // tunnel, a local MITM proxy, a locally-run SOCKS client), and by the time the
-  // run fails an hour has been leased and billed.
+  // ...and the exit has to be one a remote host can reach. Addresses are not
+  // rewritten in transit, so a proxy recorded as 127.0.0.1 arrives meaning THAT
+  // machine's own loopback — an ordinary mistake (an SSH tunnel, a local MITM
+  // proxy, a locally-run SOCKS client) that costs the user an hour of quota
+  // before it fails.
   //
   // Taken as an ARGUMENT rather than resolved here, for the same reason
   // `ProfileState` is required rather than defaulted: resolving it needs the
@@ -649,6 +669,18 @@ pub fn bot_precondition(
   // no test can set up and every caller silently depends on. `exit_reachability`
   // is the one place that resolution happens; this stays a pure predicate over
   // facts it is handed.
+  // A protocol a remote host cannot speak is a PERMANENT refusal, and it has to
+  // say so in its own words. A VLESS server is publicly routable, so the
+  // reachability question answers "yes" and the older message ("use a proxy with
+  // a public address") sends the user to fix an address that was never wrong; an
+  // enrolment accepted on that answer then fails remotely, once per scheduled
+  // run, until someone notices.
+  if let crate::remote_exit::ExitReachability::UnsupportedKind { kind, .. } = exit {
+    return Err(error(
+      "COOKIE_BOT_PROXY_KIND_UNSUPPORTED",
+      &[("kind", kind.as_str())],
+    ));
+  }
   if !exit.is_remote() {
     return Err(error("COOKIE_BOT_REQUIRES_REMOTE_EXIT_NODE", &[]));
   }
@@ -660,36 +692,49 @@ pub fn bot_precondition(
 /// The server holds the schedule; the PROFILE lives in the user's sync
 /// namespace, so `sync_enabled`, `has_proxy` and the rest are only knowable
 /// here. It requires them on every write rather than defaulting them, because
-/// a defaulted `has_proxy` is a profile warmed out of the fleet's own
-/// datacenter address.
+/// a defaulted `has_proxy` is a profile warmed out of the remote host's own
+/// address.
 ///
 /// Derived in one place so the Tauri, REST and MCP call sites cannot drift into
 /// three different answers about the same profile.
 pub fn profile_state(profile: &BrowserProfile) -> ProfileState {
+  profile_state_from(
+    profile,
+    crate::sync::encryption::has_e2e_password(),
+    crate::cookie_bot_exit::exit_alive(profile),
+  )
+}
+
+/// [`profile_state`] with the facts of this computer handed in.
+fn profile_state_from(
+  profile: &BrowserProfile,
+  sync_password_stored: bool,
+  exit_alive: bool,
+) -> ProfileState {
   ProfileState {
     sync_enabled: profile.is_sync_enabled(),
-    encrypted_sync: profile.is_encrypted_sync(),
+    encrypted_sync: remote_seal(profile, sync_password_stored).is_some(),
     // A VPN is an exit node just as much as a proxy is; the server only asks
     // whether the traffic leaves through something the user brought.
     has_proxy: profile.proxy_id.is_some() || profile.vpn_id.is_some(),
     // ...and, separately, whether anyone OTHER than this machine could use it.
     // `has_proxy` answers "did the user bring an exit"; this answers "is that
-    // exit an address a leased host can dial". They disagree for every local
-    // proxy, which is the case that used to be accepted and then fail on the
-    // fleet. See `remote_exit`.
+    // exit an address a remote host can dial". They disagree for every local
+    // proxy, which is the case that used to be accepted and then fail remotely.
+    // See `remote_exit`.
     proxy_remote_reachable: exit_reachability(profile).is_remote(),
     // Always false: this data model has no mobile/touch profile. `resolved_os`
-    // yields only windows, macos or linux, and `bot_precondition` already
-    // refuses everything but the first two. Reported rather than omitted so the
-    // server keeps one required shape, and it stays authoritative — it sees the
-    // real fingerprint on the host and can still refuse a run this cannot know
-    // to reject.
+    // yields only windows, macos or linux, and all three are supported
+    // remotely. Reported rather than omitted so the server keeps one
+    // required shape, and it stays authoritative: it sees the real fingerprint
+    // on the host and can still refuse a run this cannot know to reject.
     touch_fingerprint: false,
     // A VPN is one persistent tunnel, so the night's chunks share an exit. A
     // stored proxy may rotate per connection, and claiming stickiness we cannot
-    // guarantee is worse than declining it: the server's fallback is to run the
-    // night as a single chunk, which is the safe answer either way.
+    // guarantee is worse than declining it, so the conservative answer is the
+    // safe one either way.
     sticky_exit: profile.vpn_id.is_some(),
+    exit_alive,
   }
 }
 
@@ -700,10 +745,12 @@ pub struct ProfileState {
   pub sync_enabled: bool,
   pub encrypted_sync: bool,
   pub has_proxy: bool,
-  /// Whether that exit is an address a leased fleet host can dial.
+  /// Whether that exit is an address a remote host can dial.
   pub proxy_remote_reachable: bool,
   pub touch_fingerprint: bool,
   pub sticky_exit: bool,
+  /// False once checks from this computer confirm the exit cannot be reached.
+  pub exit_alive: bool,
 }
 
 /// Whether this profile's exit could be used from a host that is not this one.
@@ -713,7 +760,8 @@ pub struct ProfileState {
 /// even then would have to re-derive what the browser will actually dial.
 ///
 /// A profile carrying BOTH a proxy and a VPN is judged on the proxy: that is
-/// what the browser is pointed at, and it is the address the fleet has to reach.
+/// what the browser is pointed at, and it is the address a remote host has to
+/// reach.
 pub fn exit_reachability(profile: &BrowserProfile) -> crate::remote_exit::ExitReachability {
   use crate::remote_exit::{classify_proxy, classify_wireguard_endpoint, ExitReachability};
 
@@ -765,6 +813,7 @@ impl CookieBotScheduleInput {
     self.proxy_remote_reachable = state.proxy_remote_reachable;
     self.touch_fingerprint = state.touch_fingerprint;
     self.sticky_exit = state.sticky_exit;
+    self.exit_alive = state.exit_alive;
     self
   }
 }
@@ -801,14 +850,20 @@ pub async fn list_schedules(scope: Option<&str>) -> Result<CookieBotScheduleList
   let query = scope
     .map(|s| vec![("scope".to_string(), s.to_string())])
     .unwrap_or_default();
-  request(
+  let list: CookieBotScheduleList = request(
     reqwest::Method::GET,
     format!("{}/schedules", base()),
     query,
     None,
     SCHEDULE_CODES,
   )
-  .await
+  .await?;
+  if scope.is_none_or(|requested| requested == "mine") {
+    record_own_schedules(&mut enrolled_profiles(), &list);
+  }
+  let mut list = list;
+  crate::cookie_bot_exit::attach_views(&mut list.schedules);
+  Ok(list)
 }
 
 /// This profile's enrolment, or `None` when there is none.
@@ -826,8 +881,16 @@ pub async fn get_schedule(profile_id: &str) -> Result<Option<CookieBotSchedule>,
   .await;
 
   match result {
-    Ok(envelope) => Ok(Some(envelope.schedule)),
-    Err(e) if e.code() == "COOKIE_BOT_NOT_ENROLLED" => Ok(None),
+    Ok(envelope) => {
+      record_enrolment(&mut enrolled_profiles(), profile_id, true);
+      let mut schedule = envelope.schedule;
+      crate::cookie_bot_exit::attach_views(std::slice::from_mut(&mut schedule));
+      Ok(Some(schedule))
+    }
+    Err(e) if e.code() == "COOKIE_BOT_NOT_ENROLLED" => {
+      record_enrolment(&mut enrolled_profiles(), profile_id, false);
+      Ok(None)
+    }
     Err(e) => Err(e),
   }
 }
@@ -860,14 +923,17 @@ pub async fn save_schedule(
     );
   }
 
-  request(
+  let saved: CookieBotScheduleSaved = request(
     reqwest::Method::PUT,
     format!("{}/schedules/{}", base(), urlencoding::encode(profile_id)),
     Vec::new(),
     Some(body),
     SCHEDULE_CODES,
   )
-  .await
+  .await?;
+  record_enrolment(&mut enrolled_profiles(), profile_id, true);
+  crate::cookie_bot_exit::check_after_enrolment(profile_id);
+  Ok(saved)
 }
 
 /// Re-declare the profile facts the server cannot observe for itself.
@@ -877,8 +943,162 @@ pub async fn save_schedule(
 pub async fn update_profile_state(
   profile_id: &str,
   state: ProfileState,
-  timezone: Option<&str>,
+  identity: &ProfileIdentity,
 ) -> Result<CookieBotSchedule, CookieBotError> {
+  let body = profile_state_body(state, identity);
+
+  let envelope: ScheduleEnvelope = request(
+    reqwest::Method::POST,
+    format!(
+      "{}/schedules/{}/profile-state",
+      base(),
+      urlencoding::encode(profile_id)
+    ),
+    Vec::new(),
+    Some(body),
+    SCHEDULE_CODES,
+  )
+  .await?;
+  Ok(envelope.schedule)
+}
+
+/// Push this profile's current facts to the server, without blocking the edit
+/// that changed them.
+///
+/// The server refuses a run on the copy the desktop last declared —
+/// `has_proxy: false` is `proxy_required`, and that check exists because a run
+/// without an exit node egresses from the remote host's own address.
+/// Nothing but a full schedule write refreshed that copy, so detaching a proxy
+/// from an enrolled profile left `has_proxy: true` on the row and the night ran
+/// anyway. This closes that gap at the moment the profile changes.
+///
+/// Silent on failure by design: a profile edit must not fail because the cloud
+/// is unreachable, an unenrolled profile answers `COOKIE_BOT_NOT_ENROLLED`
+/// which is the normal case, and the next edit re-declares the same facts.
+pub fn report_profile_state(profile: &BrowserProfile) {
+  let profile_id = profile.id.to_string();
+  if !should_report(&enrolled_profiles(), &profile_id) {
+    return;
+  }
+  let state = profile_state(profile);
+  let identity = profile_identity(profile);
+  tauri::async_runtime::spawn(async move {
+    send_profile_state(profile_id, state, identity).await;
+  });
+}
+
+/// Re-declare the profile's facts now, even when they did not change, which
+/// moves `profile_state_at` and so lifts a block the server holds until then.
+pub async fn declare_profile_state(profile: &BrowserProfile) {
+  send_profile_state(
+    profile.id.to_string(),
+    profile_state(profile),
+    profile_identity(profile),
+  )
+  .await;
+}
+
+async fn send_profile_state(profile_id: String, state: ProfileState, identity: ProfileIdentity) {
+  if crate::cloud_auth::CLOUD_AUTH.is_logged_in().await {
+    match update_profile_state(&profile_id, state, &identity).await {
+      Ok(_) => {
+        STATE_REPORT.succeeded(&format!("profile={profile_id}"));
+        record_enrolment(&mut enrolled_profiles(), &profile_id, true);
+        log::debug!("Cookie bot profile state re-declared profile={profile_id}");
+      }
+      // Not enrolled is the common answer and not worth a log line at warn.
+      Err(e) if e.code() == "COOKIE_BOT_NOT_ENROLLED" => {
+        STATE_REPORT.succeeded(&format!("profile={profile_id}"));
+        record_enrolment(&mut enrolled_profiles(), &profile_id, false);
+      }
+      Err(e) => STATE_REPORT.failed(&format!("profile={profile_id}"), e),
+    }
+  }
+}
+
+static STATE_REPORT: crate::log_streak::KeyedStreak =
+  crate::log_streak::KeyedStreak::new(module_path!(), "Cookie bot profile state report");
+
+pub fn report_profiles_using_proxy(proxy_id: &str) {
+  report_matching(|profile| profile.proxy_id.as_deref() == Some(proxy_id));
+}
+
+pub fn report_profiles_using_vpn(vpn_id: &str) {
+  report_matching(|profile| profile.vpn_id.as_deref() == Some(vpn_id));
+}
+
+fn report_matching(matches: impl Fn(&BrowserProfile) -> bool) {
+  let Ok(profiles) = crate::profile::ProfileManager::instance().list_profiles() else {
+    return;
+  };
+  for profile in profiles.iter().filter(|profile| matches(profile)) {
+    report_profile_state(profile);
+  }
+}
+
+pub async fn report_enrolled_profiles() {
+  let auth = &crate::cloud_auth::CLOUD_AUTH;
+  if !auth.is_logged_in().await || !auth.can_use_cookie_bot().await {
+    return;
+  }
+  let list = match list_schedules(None).await {
+    Ok(list) => list,
+    Err(e) => {
+      log::debug!("Cookie bot schedules not listed at startup err=\"{e}\"");
+      return;
+    }
+  };
+  let Ok(profiles) = crate::profile::ProfileManager::instance().list_profiles() else {
+    return;
+  };
+  for profile in enrolled_local_profiles(&list, profiles) {
+    send_profile_state(
+      profile.id.to_string(),
+      profile_state(&profile),
+      profile_identity(&profile),
+    )
+    .await;
+  }
+}
+
+fn enrolled_local_profiles(
+  list: &CookieBotScheduleList,
+  profiles: Vec<BrowserProfile>,
+) -> Vec<BrowserProfile> {
+  let enrolled: HashSet<&str> = list
+    .schedules
+    .iter()
+    .map(|schedule| schedule.profile_id.as_str())
+    .collect();
+  profiles
+    .into_iter()
+    .filter(|profile| enrolled.contains(profile.id.to_string().as_str()))
+    .collect()
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProfileIdentity {
+  pub timezone: Option<String>,
+  pub platform: Option<String>,
+  pub profile_name: Option<String>,
+}
+
+pub fn profile_identity(profile: &BrowserProfile) -> ProfileIdentity {
+  let name = profile.name.trim();
+  ProfileIdentity {
+    timezone: crate::fingerprint_consistency::fingerprint_timezone(profile)
+      .map(|zone| zone.trim().to_string())
+      .filter(|zone| !zone.is_empty()),
+    platform: profile
+      .remote_platform()
+      .filter(|os| BOT_PLATFORMS.contains(os))
+      .map(str::to_string),
+    profile_name: (!name.is_empty() && name.encode_utf16().count() <= MAX_PROFILE_NAME_UNITS)
+      .then(|| name.to_string()),
+  }
+}
+
+fn profile_state_body(state: ProfileState, identity: &ProfileIdentity) -> serde_json::Value {
   let mut body = serde_json::Map::new();
   body.insert("sync_enabled".to_string(), state.sync_enabled.into());
   body.insert("encrypted_sync".to_string(), state.encrypted_sync.into());
@@ -892,69 +1112,69 @@ pub async fn update_profile_state(
     state.touch_fingerprint.into(),
   );
   body.insert("sticky_exit".to_string(), state.sticky_exit.into());
-  if let Some(zone) = timezone {
-    body.insert("timezone".to_string(), zone.into());
+  body.insert("exit_alive".to_string(), state.exit_alive.into());
+  if let Some(zone) = &identity.timezone {
+    body.insert("timezone".to_string(), zone.as_str().into());
   }
-
-  let envelope: ScheduleEnvelope = request(
-    reqwest::Method::POST,
-    format!(
-      "{}/schedules/{}/profile-state",
-      base(),
-      urlencoding::encode(profile_id)
-    ),
-    Vec::new(),
-    Some(serde_json::Value::Object(body)),
-    SCHEDULE_CODES,
-  )
-  .await?;
-  Ok(envelope.schedule)
+  if let Some(platform) = &identity.platform {
+    body.insert("platform".to_string(), platform.as_str().into());
+  }
+  if let Some(name) = &identity.profile_name {
+    body.insert("profile_name".to_string(), name.as_str().into());
+  }
+  serde_json::Value::Object(body)
 }
 
-/// Push this profile's current facts to the server, without blocking the edit
-/// that changed them.
-///
-/// The server refuses a run on the copy the desktop last declared —
-/// `has_proxy: false` is `proxy_required`, and that check exists because a run
-/// without an exit node egresses from the leased host's own datacenter address.
-/// Nothing but a full schedule write refreshed that copy, so detaching a proxy
-/// from an enrolled profile left `has_proxy: true` on the row and the night ran
-/// anyway. This closes that gap at the moment the profile changes.
-///
-/// Silent on failure by design: a profile edit must not fail because the cloud
-/// is unreachable, an unenrolled profile answers `COOKIE_BOT_NOT_ENROLLED`
-/// which is the normal case, and the next edit re-declares the same facts.
-pub fn report_profile_state(profile: &BrowserProfile) {
-  let profile_id = profile.id.to_string();
-  let state = profile_state(profile);
-  tauri::async_runtime::spawn(async move {
-    if !crate::cloud_auth::CLOUD_AUTH.is_logged_in().await {
-      return;
+pub fn forget_enrolments() {
+  *enrolled_profiles() = None;
+}
+
+fn enrolled_profiles() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
+  ENROLLED_PROFILES
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn should_report(enrolled: &Option<HashSet<String>>, profile_id: &str) -> bool {
+  enrolled.as_ref().is_none_or(|ids| ids.contains(profile_id))
+}
+
+fn record_enrolment(enrolled: &mut Option<HashSet<String>>, profile_id: &str, is_enrolled: bool) {
+  if let Some(ids) = enrolled.as_mut() {
+    if is_enrolled {
+      ids.insert(profile_id.to_string());
+    } else {
+      ids.remove(profile_id);
     }
-    match update_profile_state(&profile_id, state, None).await {
-      Ok(_) => {
-        log::debug!("Re-declared cookie-bot profile state for {profile_id}");
-      }
-      // Not enrolled is the common answer and not worth a log line at warn.
-      Err(e) if e.code() == "COOKIE_BOT_NOT_ENROLLED" => {}
-      Err(e) => {
-        log::warn!("Could not re-declare cookie-bot profile state for {profile_id}: {e}");
-      }
-    }
-  });
+  }
+}
+
+fn record_own_schedules(enrolled: &mut Option<HashSet<String>>, list: &CookieBotScheduleList) {
+  if list.scope.as_deref() == Some("team") {
+    return;
+  }
+  *enrolled = Some(
+    list
+      .schedules
+      .iter()
+      .map(|schedule| schedule.profile_id.clone())
+      .collect(),
+  );
 }
 
 /// Turn the bot off for this profile. Safe to repeat: deleting an enrolment
 /// that is already gone succeeds with `deleted: false`.
 pub async fn delete_schedule(profile_id: &str) -> Result<CookieBotScheduleDeleted, CookieBotError> {
-  request(
+  let deleted: CookieBotScheduleDeleted = request(
     reqwest::Method::DELETE,
     format!("{}/schedules/{}", base(), urlencoding::encode(profile_id)),
     Vec::new(),
     None,
     SCHEDULE_CODES,
   )
-  .await
+  .await?;
+  record_enrolment(&mut enrolled_profiles(), profile_id, false);
+  Ok(deleted)
 }
 
 /// Ask, without writing anything, who else already warms this profile.
@@ -1046,10 +1266,10 @@ pub async fn run_now(
 
 /// Stop a run that is still going.
 ///
-/// A 503 here means the fleet could not be reached and the browser is still
-/// up, so the run stays `running` rather than being marked cancelled under a
-/// live browser — retiring a row while something is still writing the cookie
-/// jar is the two-writer case the profile lock exists to prevent.
+/// A 503 here means the remote host could not be reached and the browser is
+/// still up, so the run stays `running` rather than being marked cancelled
+/// under a live browser — retiring a row while something is still writing the
+/// cookie jar is the two-writer case the profile lock exists to prevent.
 pub async fn cancel_run(run_id: &str) -> Result<CookieBotRun, CookieBotError> {
   let envelope: RunEnvelope = request(
     reqwest::Method::DELETE,
@@ -1197,7 +1417,7 @@ pub async fn delete_user_template(id: &str) -> Result<bool, CookieBotError> {
 /// in a Japanese UI is the failure the `{"code":…}` convention exists to stop.
 fn command_error(context: &str, err: CookieBotError) -> String {
   log::warn!(
-    "Cookie bot {context} failed: {} (HTTP {})",
+    "Cookie bot request failed action=\"{context}\" code={} status={}",
     err.code(),
     err.status()
   );
@@ -1279,22 +1499,20 @@ pub async fn remote_hours_quota() -> Result<RemoteHoursQuota, CookieBotError> {
 
 // --- Transport --------------------------------------------------------------
 
-fn http() -> &'static reqwest::Client {
-  static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-  CLIENT.get_or_init(|| {
-    reqwest::Client::builder()
+fn http() -> reqwest::Client {
+  static CLIENT: crate::app_proxy::SharedClient = crate::app_proxy::SharedClient::new(|builder| {
+    builder
       .timeout(REQUEST_TIMEOUT)
       .connect_timeout(CONNECT_TIMEOUT)
-      .build()
-      .unwrap_or_else(|_| reqwest::Client::new())
-  })
+  });
+  CLIENT.get()
 }
 
 /// Append a percent-encoded query string.
 ///
 /// Built here rather than left to the HTTP client so a profile id or a keyset
 /// cursor containing a `&` cannot smuggle a second parameter into the request.
-fn with_query(url: &str, query: &[(String, String)]) -> String {
+pub(crate) fn with_query(url: &str, query: &[(String, String)]) -> String {
   if query.is_empty() {
     return url.to_string();
   }
@@ -1380,9 +1598,173 @@ mod tests {
     }
   }
 
+  fn profile_in_zone(zone: &str) -> BrowserProfile {
+    let mut profile = eligible_profile();
+    profile.wayfern_config = Some(crate::wayfern_manager::WayfernConfig {
+      fingerprint: Some(serde_json::json!({ "timezone": zone, "language": "de-DE" }).to_string()),
+      ..Default::default()
+    });
+    profile
+  }
+
+  #[test]
+  fn a_report_names_the_zone_the_platform_and_the_profile() {
+    // A Wayfern profile created on macOS runs on a Linux host.
+    let identity = profile_identity(&profile_in_zone("Europe/Berlin"));
+    assert_eq!(
+      identity,
+      ProfileIdentity {
+        timezone: Some("Europe/Berlin".to_string()),
+        platform: Some("linux".to_string()),
+        profile_name: Some("warm me".to_string()),
+      }
+    );
+
+    let body = profile_state_body(
+      profile_state_from(&eligible_profile(), false, true),
+      &identity,
+    );
+    assert_eq!(body["timezone"], "Europe/Berlin");
+    assert_eq!(body["platform"], "linux");
+    assert_eq!(body["profile_name"], "warm me");
+    assert_eq!(body["has_proxy"], true);
+    assert_eq!(body["sync_enabled"], true);
+  }
+
+  #[test]
+  fn a_report_leaves_out_what_the_server_would_refuse() {
+    let mut profile = eligible_profile();
+    profile.host_os = Some("android".to_string());
+    profile.name = "n".repeat(MAX_PROFILE_NAME_UNITS + 1);
+    let identity = profile_identity(&profile);
+    assert_eq!(identity, ProfileIdentity::default());
+
+    let body = profile_state_body(profile_state_from(&profile, false, true), &identity);
+    for key in ["timezone", "platform", "profile_name"] {
+      assert!(body.get(key).is_none(), "{key} must be omitted");
+    }
+    assert!(body.get("sync_enabled").is_some());
+  }
+
+  #[test]
+  fn a_profile_name_is_measured_the_way_the_server_measures_it() {
+    let mut profile = eligible_profile();
+    profile.name = "😀".repeat(MAX_PROFILE_NAME_UNITS / 2);
+    assert!(profile_identity(&profile).profile_name.is_some());
+    profile.name = "😀".repeat(MAX_PROFILE_NAME_UNITS / 2 + 1);
+    assert!(profile_identity(&profile).profile_name.is_none());
+    profile.name = "   ".to_string();
+    assert!(profile_identity(&profile).profile_name.is_none());
+  }
+
+  fn schedule_list(scope: Option<&str>, ids: &[&str]) -> CookieBotScheduleList {
+    let schedules = ids
+      .iter()
+      .map(|id| {
+        serde_json::from_value(serde_json::json!({
+          "profile_id": id, "profile_name": "p", "platform": "macos", "enabled": true,
+          "run_at_minute": 0, "days_mask": 1, "timezone": "UTC", "preset": "light",
+          "max_minutes": 20
+        }))
+        .expect("a minimal schedule")
+      })
+      .collect();
+    CookieBotScheduleList {
+      schedules,
+      team_id: None,
+      scope: scope.map(str::to_string),
+    }
+  }
+
+  #[test]
+  fn only_enrolled_profiles_are_reported_once_the_enrolments_are_known() {
+    let mut enrolled = None;
+    assert!(should_report(&enrolled, "any"));
+
+    record_own_schedules(&mut enrolled, &schedule_list(Some("mine"), &["p1"]));
+    assert!(should_report(&enrolled, "p1"));
+    assert!(!should_report(&enrolled, "p2"));
+
+    record_enrolment(&mut enrolled, "p2", true);
+    assert!(should_report(&enrolled, "p2"));
+    record_enrolment(&mut enrolled, "p1", false);
+    assert!(!should_report(&enrolled, "p1"));
+  }
+
+  #[test]
+  fn a_team_listing_does_not_replace_the_callers_own_enrolments() {
+    let mut enrolled = None;
+    record_own_schedules(&mut enrolled, &schedule_list(Some("mine"), &["mine-1"]));
+    record_own_schedules(
+      &mut enrolled,
+      &schedule_list(Some("team"), &["mine-1", "teammate-1"]),
+    );
+    assert!(should_report(&enrolled, "mine-1"));
+    assert!(!should_report(&enrolled, "teammate-1"));
+  }
+
+  #[test]
+  fn an_unknown_enrolment_list_is_not_filled_in_by_single_answers() {
+    let mut enrolled = None;
+    record_enrolment(&mut enrolled, "p1", false);
+    assert!(enrolled.is_none());
+    assert!(should_report(&enrolled, "p1"));
+  }
+
+  #[test]
+  fn startup_reports_every_enrolled_profile_this_machine_has() {
+    let mut here = eligible_profile();
+    here.id = uuid::Uuid::from_u128(1);
+    let mut elsewhere = eligible_profile();
+    elsewhere.id = uuid::Uuid::from_u128(2);
+    let list = schedule_list(Some("mine"), &[&here.id.to_string(), "not-on-this-machine"]);
+    let picked = enrolled_local_profiles(&list, vec![here.clone(), elsewhere]);
+    assert_eq!(picked.len(), 1);
+    assert_eq!(picked[0].id, here.id);
+  }
+
+  #[test]
+  fn uploads_and_startup_re_declare_the_profile_state() {
+    let engine = include_str!("sync/engine.rs");
+    let lib = include_str!("lib.rs");
+    let upload_proxy = engine
+      .split("async fn upload_proxy(")
+      .nth(1)
+      .expect("upload_proxy must exist");
+    assert!(upload_proxy[..upload_proxy.find("\n  }").unwrap()]
+      .contains("crate::cookie_bot::report_profiles_using_proxy(&proxy.id);"));
+    let upload_vpn = engine
+      .split("async fn upload_vpn(")
+      .nth(1)
+      .expect("upload_vpn must exist");
+    assert!(upload_vpn[..upload_vpn.find("\n  }").unwrap()]
+      .contains("crate::cookie_bot::report_profiles_using_vpn(&vpn.id);"));
+    let profile_sync = engine
+      .split("async fn sync_profile_inner(")
+      .nth(1)
+      .expect("sync_profile_inner must exist");
+    let profile_sync = &profile_sync[..profile_sync.find("\n  }").unwrap()];
+    let uploaded = profile_sync
+      .find(".upload_manifest(")
+      .expect("the manifest upload");
+    let reported = profile_sync
+      .find("crate::cookie_bot::report_profile_state(&updated_profile);")
+      .expect("the report after a finished upload");
+    assert!(uploaded < reported);
+    assert!(lib.contains("tauri::async_runtime::spawn(cookie_bot::report_enrolled_profiles());"));
+    let auth = include_str!("cloud_auth.rs");
+    let clear = auth
+      .split("async fn clear_auth(&self)")
+      .nth(1)
+      .expect("clear_auth must exist");
+    assert!(
+      clear[..clear.find("\n  }").unwrap()].contains("crate::cookie_bot::forget_enrolments();")
+    );
+  }
+
   #[test]
   fn the_profile_facts_the_server_requires_are_derived_from_the_profile() {
-    let state = profile_state(&eligible_profile());
+    let state = profile_state_from(&eligible_profile(), false, true);
 
     assert!(state.sync_enabled);
     assert!(!state.encrypted_sync);
@@ -1403,7 +1785,7 @@ mod tests {
       ..eligible_profile()
     };
 
-    let state = profile_state(&profile);
+    let state = profile_state_from(&profile, false, true);
 
     assert!(state.has_proxy);
     assert!(state.sticky_exit);
@@ -1417,7 +1799,7 @@ mod tests {
       ..eligible_profile()
     };
 
-    assert!(!profile_state(&profile).has_proxy);
+    assert!(!profile_state_from(&profile, false, true).has_proxy);
   }
 
   fn code_of(err: &str) -> String {
@@ -1430,9 +1812,9 @@ mod tests {
 
   #[test]
   fn a_local_only_profile_has_no_path_to_a_run() {
-    // The host obtains the profile from donut-sync. Without sync there is
-    // nothing to pull, so the run would warm an empty browser and then push
-    // that emptiness over the user's real profile.
+    // A remote run obtains the profile through sync, so a local-only profile
+    // has nothing there: the run would warm an empty browser and then push that
+    // emptiness over the user's real profile.
     let mut profile = eligible_profile();
     profile.sync_mode = SyncMode::Disabled;
     let err = bot_precondition(&profile, &ExitReachability::Remote)
@@ -1452,17 +1834,64 @@ mod tests {
   }
 
   #[test]
-  fn linux_is_refused_at_enrolment_rather_than_at_two_in_the_morning() {
+  fn a_sync_password_seals_a_profile_on_regular_sync_too() {
+    // The password seals the metadata and the proxy of every synced profile,
+    // so a host could read neither, whatever the profile's own sync mode.
+    let profile = eligible_profile();
+    assert!(profile_state_from(&profile, true, true).encrypted_sync);
+    assert!(!profile_state_from(&profile, false, true).encrypted_sync);
+    assert_eq!(remote_seal(&profile, true), Some(RemoteSeal::SyncPassword));
+    assert_eq!(remote_seal(&profile, false), None);
+
+    let mut local = eligible_profile();
+    local.sync_mode = SyncMode::Disabled;
+    assert_eq!(remote_seal(&local, true), None, "nothing of it is uploaded");
+  }
+
+  #[test]
+  fn a_confirmed_dead_exit_is_declared() {
+    let state = profile_state_from(&eligible_profile(), false, false);
+    assert!(!state.exit_alive);
+    let input = CookieBotScheduleInput::default().with_profile_state(state);
+    assert!(!input.exit_alive);
+    assert_eq!(
+      profile_state_body(state, &ProfileIdentity::default())["exit_alive"],
+      false
+    );
+  }
+
+  #[test]
+  fn an_os_the_fleet_cannot_lease_is_refused_at_enrolment_rather_than_at_two_in_the_morning() {
+    // A profile bound to its OS runs on a host of the OS that created it.
     let mut profile = eligible_profile();
-    profile.host_os = Some("linux".to_string());
+    profile.browser = "camoufox".to_string();
+    profile.host_os = Some("android".to_string());
     let err = bot_precondition(&profile, &ExitReachability::Remote)
-      .expect_err("linux has no host to lease");
+      .expect_err("android has no host to lease");
     let parsed: serde_json::Value = serde_json::from_str(&err).expect("valid envelope");
     assert_eq!(parsed["code"], "COOKIE_BOT_UNSUPPORTED_PLATFORM");
     assert_eq!(
-      parsed["params"]["platform"], "linux",
+      parsed["params"]["platform"], "android",
       "the message must name the platform that cannot run"
     );
+  }
+
+  #[test]
+  fn a_linux_profile_passes_the_platform_check() {
+    // Linux is a supported remote platform, so a linux profile is judged on
+    // the same preconditions as the other two rather than refused for its OS.
+    let mut profile = eligible_profile();
+    profile.host_os = Some("linux".to_string());
+    assert!(bot_precondition(&profile, &ExitReachability::Remote).is_ok());
+
+    // ...and it reaches the NEXT precondition when it fails one: the refusal a
+    // linux profile with no exit gets is the exit-node code, not the platform
+    // code.
+    profile.proxy_id = None;
+    profile.vpn_id = None;
+    let err = bot_precondition(&profile, &ExitReachability::None)
+      .expect_err("datacenter egress must be refused for linux as for any OS");
+    assert_eq!(code_of(&err), "COOKIE_BOT_REQUIRES_EXIT_NODE");
   }
 
   #[test]
@@ -1523,9 +1952,31 @@ mod tests {
   }
 
   #[test]
+  fn a_proxy_kind_the_fleet_cannot_dial_gets_its_own_refusal() {
+    // The repeated-nightly-failure case. This must NOT collapse into
+    // REQUIRES_REMOTE_EXIT_NODE: that sentence tells the user their proxy's
+    // address is unreachable, and a VLESS server's address is perfectly
+    // reachable — the fix is a different protocol, not a different address.
+    let err = bot_precondition(
+      &eligible_profile(),
+      &ExitReachability::UnsupportedKind {
+        kind: "VLESS".to_string(),
+        source: "proxy",
+      },
+    )
+    .expect_err("no fleet host runs the xray sidecar VLESS needs");
+
+    assert_eq!(code_of(&err), "COOKIE_BOT_PROXY_KIND_UNSUPPORTED");
+    // The protocol travels in `params` so the sentence can name it rather than
+    // saying "this proxy type" and leaving the user to guess which one.
+    let parsed: serde_json::Value = serde_json::from_str(&err).expect("an error envelope");
+    assert_eq!(parsed["params"]["kind"], "VLESS");
+  }
+
+  #[test]
   fn an_exit_we_could_not_read_is_refused_too() {
     // Fails closed. Refusing a working setup costs one support question;
-    // accepting a broken one burns a leased hour and damages an identity.
+    // accepting a broken one burns an hour of quota and damages an identity.
     let err = bot_precondition(
       &eligible_profile(),
       &ExitReachability::Unknown {
@@ -1538,8 +1989,7 @@ mod tests {
     assert_eq!(code_of(&err), "COOKIE_BOT_REQUIRES_REMOTE_EXIT_NODE");
   }
 
-  /// A verbatim `CookieBotScheduleView`, field for field, as `toScheduleView`
-  /// in donutbrowser-infra's `cookie-bot.service.ts` builds it.
+  /// A verbatim schedule payload, field for field, as the cloud API sends it.
   const SERVER_SCHEDULE_VIEW: &str = r#"{
     "profile_id":"p1","profile_name":"Yu","platform":"macos","enabled":true,
     "run_at_minute":120,"days_mask":127,
@@ -1555,10 +2005,9 @@ mod tests {
 
   #[test]
   fn the_schedule_payload_matches_what_the_backend_sends() {
-    // Pinned against the Schedule shape in donutbrowser-infra's
-    // cookie-bot controller. A field name that drifts makes every read fail
-    // at the decode step, which surfaces as "something went wrong" with no
-    // hint that the contract moved.
+    // Pinned against the schedule shape the cloud API serves. A field name
+    // that drifts makes every read fail at the decode step, which surfaces as
+    // "something went wrong" with no hint that the contract moved.
     let schedule: CookieBotSchedule = serde_json::from_str(SERVER_SCHEDULE_VIEW)
       .expect("the backend's schedule payload must deserialize");
 
@@ -1737,7 +2186,7 @@ mod tests {
 
   #[test]
   fn the_run_payload_matches_what_the_backend_sends() {
-    // Verbatim `CookieBotRunView`, as `toRunViews` builds it. `max_minutes`,
+    // Verbatim run payload, exactly as the cloud API serves it. `max_minutes`,
     // `chunks_total`, `chunk_index`, `dispatch_after` and `team_id` were all
     // already on the wire and all silently discarded, so a multi-chunk night
     // could not be reported as one.
@@ -1789,20 +2238,16 @@ mod tests {
     // The narrow re-declaration route. `has_proxy` false is `proxy_required`
     // server-side, so an omitted field silently keeps the stale value and the
     // night runs unproxied.
-    let state = profile_state(&eligible_profile());
-    let body = serde_json::json!({
-      "sync_enabled": state.sync_enabled,
-      "encrypted_sync": state.encrypted_sync,
-      "has_proxy": state.has_proxy,
-      "touch_fingerprint": state.touch_fingerprint,
-      "sticky_exit": state.sticky_exit,
-    });
+    let state = profile_state_from(&eligible_profile(), false, true);
+    let body = profile_state_body(state, &ProfileIdentity::default());
     for key in [
       "sync_enabled",
       "encrypted_sync",
       "has_proxy",
+      "proxy_remote_reachable",
       "touch_fingerprint",
       "sticky_exit",
+      "exit_alive",
     ] {
       assert!(
         body.get(key).is_some_and(serde_json::Value::is_boolean),
@@ -1831,7 +2276,7 @@ mod tests {
     assert!(!input.sync_enabled);
     assert!(!input.has_proxy);
 
-    let stamped = input.with_profile_state(profile_state(&eligible_profile()));
+    let stamped = input.with_profile_state(profile_state_from(&eligible_profile(), false, true));
     assert!(stamped.sync_enabled);
     assert!(stamped.has_proxy);
   }
@@ -1968,9 +2413,9 @@ mod tests {
 
   #[test]
   fn the_preset_list_carries_ids_not_behaviour() {
-    // If this type ever gained a site list, a dwell range or a step
-    // programme, the browsing model would have leaked into the open-source
-    // client. Ids and a rough duration are all that may cross.
+    // If this type ever gained the parameters that describe what a preset
+    // actually does, the server-owned browsing model would have leaked into the
+    // open-source client. Ids and a rough duration are all that may cross.
     let presets: CookieBotPresetList = serde_json::from_str(
       r#"{"presets":[{"id":"balanced","typical_minutes":35,"recommended":true}],
           "default_preset":"balanced"}"#,
@@ -1988,9 +2433,9 @@ mod tests {
 
   #[test]
   fn a_template_crosses_the_wire_as_a_count_and_never_as_urls() {
-    // The pool is server-owned for the same reason a preset's browsing model
-    // is. If this type ever gained a `sites` field the curation would be
-    // published, and a published list is one a retailer can filter.
+    // The site pool is server-owned. If this type ever gained a `sites` field
+    // the curation would be published, and a published list is one a retailer
+    // can filter.
     let presets: CookieBotPresetList = serde_json::from_str(
       r#"{"presets":[],"default_preset":"balanced",
           "templates":[{"id":"low-intent-purchaser","site_count":32,

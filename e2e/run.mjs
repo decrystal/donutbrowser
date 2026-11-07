@@ -2,14 +2,15 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import {
+  copyFileSync,
   createReadStream,
   createWriteStream,
   existsSync,
   readFileSync,
+  rmSync,
   statSync,
 } from "node:fs";
 import {
-  chmod,
   mkdir,
   mkdtemp,
   readdir,
@@ -25,7 +26,10 @@ import os from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
+import { ensureRclone, serveS3Args } from "../scripts/rclone.mjs";
 import { createSafeDiagnostics } from "./lib/diagnostics.mjs";
+import { extensionCrx3, mcpFormsPage } from "./lib/fixtures.mjs";
+import { DRIVER_COMMAND_TIMEOUT_SECONDS } from "./lib/limits.mjs";
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(dirname, "..");
@@ -44,10 +48,13 @@ const driverBinary = path.join(
   "bin",
   `tauri-wd${executableSuffix}`,
 );
+const appManifest = path.join(appManifestDir, "Cargo.toml");
+const appLockfile = path.join(appManifestDir, "Cargo.lock");
+const donutLockfile = path.join(projectRoot, "src-tauri", "Cargo.lock");
 
 const suiteFiles = {
   smoke: ["diagnostics.test.mjs", "smoke.test.mjs", "coverage.test.mjs"],
-  ui: ["ui.test.mjs"],
+  ui: ["ui.test.mjs", "motion.test.mjs"],
   entities: ["entities.test.mjs"],
   network: ["network.test.mjs"],
   integrations: ["integrations.test.mjs"],
@@ -58,6 +65,7 @@ const suiteFiles = {
     "coverage.test.mjs",
     "smoke.test.mjs",
     "ui.test.mjs",
+    "motion.test.mjs",
     "entities.test.mjs",
     "network.test.mjs",
     "integrations.test.mjs",
@@ -100,7 +108,17 @@ function log(message) {
 
 function run(command, args, cwd, env = process.env) {
   log(`${command} ${args.join(" ")}`);
-  const result = spawnSync(command, args, { cwd, env, stdio: "inherit" });
+  // pnpm is a .cmd shim on Windows, and Node starts those only through a
+  // shell. The arguments here are fixed words, so joining them is safe.
+  const result =
+    isWindows && command === "pnpm"
+      ? spawnSync([command, ...args].join(" "), {
+          cwd,
+          env,
+          stdio: "inherit",
+          shell: true,
+        })
+      : spawnSync(command, args, { cwd, env, stdio: "inherit" });
   if (result.error) {
     throw result.error;
   }
@@ -199,6 +217,53 @@ async function stopProcess(record) {
   record.stream.end();
 }
 
+// GTK never gives a hidden window a size, so a hidden Donut window on Linux
+// lays its page out in a 0x0 viewport: no element has a box, nothing can be
+// clicked, and every check of what a person sees fails. Linux runs show the
+// window on a private Xvfb screen instead, where nobody sees it and the page
+// has its real size. Returns the display name.
+async function startPrivateDisplay(runRoot, records) {
+  const logPath = path.join(runRoot, "logs", "xvfb.log");
+  const stream = createWriteStream(logPath, { flags: "a" });
+  // -displayfd takes the first free display and writes its number to fd 3.
+  const child = spawn(
+    "Xvfb",
+    ["-displayfd", "3", "-screen", "0", "1920x1080x24", "-nolisten", "tcp"],
+    { detached: true, stdio: ["ignore", "pipe", "pipe", "pipe"] },
+  );
+  child.stdout.pipe(stream, { end: false });
+  child.stderr.pipe(stream, { end: false });
+  records.push({ name: "xvfb", process: child, stream, logPath });
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`Xvfb named no display; see ${logPath}`)),
+      15_000,
+    );
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(
+        error.code === "ENOENT"
+          ? new Error(
+              "Linux runs need Xvfb (package xvfb); DONUT_E2E_HEADED=1 uses the current display instead",
+            )
+          : error,
+      );
+    });
+    child.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      reject(new Error(`Xvfb exited with ${code ?? signal}; see ${logPath}`));
+    });
+    let written = "";
+    child.stdio[3].on("data", (chunk) => {
+      written += chunk;
+      if (written.includes("\n")) {
+        clearTimeout(timer);
+        resolve(`:${written.trim()}`);
+      }
+    });
+  });
+}
+
 function unquoteEnvValue(value) {
   const trimmed = value.trim();
   const quote = trimmed[0];
@@ -237,16 +302,13 @@ async function loadLocalValues(names) {
   return values;
 }
 
-function lockedDriverVersion() {
-  const lockfile = readFileSync(
-    path.join(appManifestDir, "Cargo.lock"),
-    "utf8",
-  );
-  const match = lockfile.match(
-    /\[\[package\]\]\s*\nname = "tauri-wd"\s*\nversion = "([^"]+)"/,
-  );
+function pinnedDriverVersion() {
+  const manifest = readFileSync(appManifest, "utf8");
+  const match = manifest.match(/^tauri-wd\s*=\s*"=([^"]+)"$/m);
   if (!match) {
-    throw new Error("e2e/app/Cargo.lock does not resolve a tauri-wd version");
+    throw new Error(
+      'e2e/app/Cargo.toml must pin tauri-wd to an exact version, e.g. tauri-wd = "=0.2.0"',
+    );
   }
   return match[1];
 }
@@ -263,7 +325,7 @@ function installedDriverVersion() {
 }
 
 function ensureDriver() {
-  const version = lockedDriverVersion();
+  const version = pinnedDriverVersion();
   if (installedDriverVersion() === version) {
     log(`tauri-wd ${version} already installed at ${driverBinary}`);
     return;
@@ -285,19 +347,55 @@ function ensureDriver() {
   );
 }
 
+// The harness links the Donut crate, so it has to resolve the same versions
+// Donut itself ships. Seeding the harness lockfile from src-tauri/Cargo.lock
+// keeps the two in step whenever a dependency or the app version moves; cargo
+// fills in the harness-only packages on top. It is generated, never hand-edited.
+function syncHarnessLockfile() {
+  if (
+    existsSync(appLockfile) &&
+    statSync(appLockfile).mtimeMs >= statSync(donutLockfile).mtimeMs
+  ) {
+    return;
+  }
+  copyFileSync(donutLockfile, appLockfile);
+  log("seeded e2e/app/Cargo.lock from src-tauri/Cargo.lock");
+}
+
+// Tauri starts a sidecar from next to the running executable only. Copy the
+// sidecars this build made there, so a copy left by an older harness never
+// fails every launch on its version check. The old file is removed first:
+// macOS kills an executable that was overwritten in place.
+function installSidecars() {
+  const target = hostRustTarget();
+  for (const name of ["donut-proxy", "xray"]) {
+    const destination = path.join(
+      path.dirname(appBinary),
+      `${name}${executableSuffix}`,
+    );
+    rmSync(destination, { force: true });
+    copyFileSync(
+      path.join(
+        projectRoot,
+        "src-tauri",
+        "binaries",
+        `${name}-${target}${executableSuffix}`,
+      ),
+      destination,
+    );
+  }
+}
+
 function buildAll() {
   run("pnpm", ["build"], projectRoot);
   run("pnpm", ["copy-proxy-binary"], projectRoot);
   run(process.execPath, ["src-tauri/download-xray.mjs"], projectRoot);
-  run(
-    "cargo",
-    ["build", "--locked", "--manifest-path", "e2e/app/Cargo.toml"],
-    projectRoot,
-  );
+  syncHarnessLockfile();
+  run("cargo", ["build", "--manifest-path", "e2e/app/Cargo.toml"], projectRoot);
   ensureDriver();
 }
 
-function startFixtureServer(geoIpFixture) {
+function startFixtureServer(geoIpFixture, geoIpAsnFixture) {
   const server = http.createServer((request, response) => {
     const url = new URL(request.url, "http://127.0.0.1");
     if (url.pathname === "/health") {
@@ -331,12 +429,54 @@ function startFixtureServer(geoIpFixture) {
       response.end("ads.e2e.invalid\ntracker.e2e.invalid\n");
       return;
     }
+    // A CRX3 container, the shape the Chrome Web Store serves. The extension
+    // importer has to find the ZIP at the offset the header declares rather
+    // than scanning the file, so the fixture is a real container and not a
+    // renamed archive.
+    if (url.pathname === "/extension.crx") {
+      const crx = extensionCrx3();
+      response.writeHead(200, {
+        "content-type": "application/x-chrome-extension",
+        "content-length": String(crx.length),
+        "cache-control": "no-store",
+      });
+      response.end(crx);
+      return;
+    }
+    // Named like an archive, but not one. A link import must refuse this
+    // rather than storing a broken extension.
+    if (url.pathname === "/not-an-extension.zip") {
+      const body = Buffer.from("<!doctype html><html>not an archive</html>");
+      response.writeHead(200, {
+        "content-type": "application/zip",
+        "content-length": String(body.length),
+        "cache-control": "no-store",
+      });
+      response.end(body);
+      return;
+    }
+    if (url.pathname === "/mcp-forms") {
+      response.writeHead(200, {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-store",
+      });
+      response.end(mcpFormsPage());
+      return;
+    }
     if (url.pathname === "/geoip.mmdb" && geoIpFixture) {
       response.writeHead(200, {
         "content-type": "application/octet-stream",
         "content-length": String(statSync(geoIpFixture).size),
       });
       createReadStream(geoIpFixture).pipe(response);
+      return;
+    }
+    if (url.pathname === "/geoip-asn.mmdb" && geoIpAsnFixture) {
+      response.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "content-length": String(statSync(geoIpAsnFixture).size),
+      });
+      createReadStream(geoIpAsnFixture).pipe(response);
       return;
     }
     response.writeHead(200, {
@@ -350,6 +490,10 @@ function startFixtureServer(geoIpFixture) {
           <h1 id="fixture-title">Donut E2E Browser Fixture</h1>
           <p id="path">${url.pathname}</p>
           <button id="fixture-button" onclick="this.dataset.clicked='yes'; this.textContent='Clicked'">Click fixture</button>
+          <a id="fixture-link" href="/linked">Open the linked page</a>
+          <input id="fixture-input" onkeydown="if (event.key === 'Enter') this.dataset.entered = 'yes'">
+          <div id="fixture-spacer" style="height: 3000px"></div>
+          <p id="fixture-end">End of the fixture</p>
           <script>window.__fixtureReady = true;</script>
         </body>
       </html>`);
@@ -363,19 +507,42 @@ function startFixtureServer(geoIpFixture) {
 }
 
 async function ensureGeoIpFixture() {
-  if (process.env.DONUT_E2E_GEOIP_FIXTURE) {
-    const fixture = path.resolve(process.env.DONUT_E2E_GEOIP_FIXTURE);
+  return ensureMmdbFixture("GeoLite2-City.mmdb", "-City.mmdb", {
+    override: process.env.DONUT_E2E_GEOIP_FIXTURE,
+    overrideName: "DONUT_E2E_GEOIP_FIXTURE",
+  });
+}
+
+/**
+ * The autonomous-system database. Separate from the city one because that is
+ * how MaxMind publishes them, and because the organisation a proxy check
+ * reports as the exit's ISP lives only in this file.
+ */
+async function ensureGeoIpAsnFixture() {
+  return ensureMmdbFixture("GeoLite2-ASN.mmdb", "-ASN.mmdb", {
+    override: process.env.DONUT_E2E_GEOIP_ASN_FIXTURE,
+    overrideName: "DONUT_E2E_GEOIP_ASN_FIXTURE",
+  });
+}
+
+async function ensureMmdbFixture(
+  fileName,
+  assetSuffix,
+  { override, overrideName },
+) {
+  if (override) {
+    const fixture = path.resolve(override);
     if (!existsSync(fixture)) {
-      throw new Error(`DONUT_E2E_GEOIP_FIXTURE does not exist: ${fixture}`);
+      throw new Error(`${overrideName} does not exist: ${fixture}`);
     }
     return fixture;
   }
   const toolsDir = path.join(os.tmpdir(), "donut-e2e-tools");
-  const fixture = path.join(toolsDir, "GeoLite2-City.mmdb");
+  const fixture = path.join(toolsDir, fileName);
   await mkdir(toolsDir, { recursive: true });
   if (existsSync(fixture)) return fixture;
 
-  log("Downloading GeoLite City E2E dependency");
+  log(`Downloading ${fileName} E2E dependency`);
   const releases = await fetch(
     "https://api.github.com/repos/P3TERX/GeoLite.mmdb/releases",
     {
@@ -392,28 +559,12 @@ async function ensureGeoIpFixture() {
   });
   const url = releases
     .flatMap((release) => release.assets ?? [])
-    .find((asset) => asset.name.endsWith("-City.mmdb"))?.browser_download_url;
-  if (!url) throw new Error("No GeoLite City MMDB asset was found");
+    .find((asset) => asset.name.endsWith(assetSuffix))?.browser_download_url;
+  if (!url) throw new Error(`No GeoLite ${assetSuffix} asset was found`);
   const temporary = `${fixture}.${process.pid}.tmp`;
   await download(url, temporary);
   await rename(temporary, fixture);
   return fixture;
-}
-
-function minioUrl() {
-  const arch = os.arch() === "arm64" ? "arm64" : "amd64";
-  if (process.platform === "darwin") {
-    return `https://dl.min.io/server/minio/release/darwin-${arch}/minio`;
-  }
-  if (process.platform === "linux") {
-    return `https://dl.min.io/server/minio/release/linux-${arch}/minio`;
-  }
-  if (process.platform === "win32") {
-    return "https://dl.min.io/server/minio/release/windows-amd64/minio.exe";
-  }
-  throw new Error(
-    `Unsupported MinIO platform ${process.platform}-${os.arch()}`,
-  );
 }
 
 async function download(url, destination) {
@@ -443,87 +594,62 @@ async function download(url, destination) {
   });
 }
 
-async function ensureMinio() {
-  if (process.env.DONUT_E2E_MINIO_BIN) {
-    return path.resolve(process.env.DONUT_E2E_MINIO_BIN);
+async function ensureS3Server() {
+  if (process.env.DONUT_E2E_RCLONE_BIN) {
+    return path.resolve(process.env.DONUT_E2E_RCLONE_BIN);
   }
-  const existingHarnessBinary = path.join(
-    projectRoot,
-    ".cache",
-    "sync-test",
-    isWindows ? "minio.exe" : "minio",
+  // The same cache as scripts/sync-test-harness.mjs, so one download serves both.
+  return ensureRclone(
+    path.join(projectRoot, ".cache", "sync-test"),
+    download,
+    log,
   );
-  if (existsSync(existingHarnessBinary)) {
-    return existingHarnessBinary;
-  }
-  const toolsDir = path.join(os.tmpdir(), "donut-e2e-tools");
-  const binary = path.join(
-    toolsDir,
-    `minio-${process.platform}-${os.arch()}${executableSuffix}`,
-  );
-  await mkdir(toolsDir, { recursive: true });
-  if (!existsSync(binary)) {
-    log("Downloading isolated MinIO test dependency");
-    const temporary = `${binary}.${process.pid}.tmp`;
-    await download(minioUrl(), temporary);
-    await chmod(temporary, 0o755);
-    await rm(binary, { force: true });
-    await import("node:fs/promises").then(({ rename }) =>
-      rename(temporary, binary),
-    );
-  }
-  return binary;
 }
 
 async function startSyncInfrastructure(runRoot, options, records) {
-  const minioBinary = await ensureMinio();
-  const minioPort = await freePort();
-  const minioConsolePort = await freePort();
+  const s3Binary = await ensureS3Server();
+  const s3Port = await freePort();
   const syncPort = await freePort();
   const syncToken = "donut-e2e-sync-token-0123456789abcdef";
-  const minio = startProcess(
-    "minio",
-    minioBinary,
-    [
-      "server",
-      path.join(runRoot, "minio-data"),
-      "--address",
-      `127.0.0.1:${minioPort}`,
-      "--console-address",
-      `127.0.0.1:${minioConsolePort}`,
-    ],
+  const s3DataDir = path.join(runRoot, "s3-data");
+  await mkdir(s3DataDir, { recursive: true });
+  const s3 = startProcess(
+    "s3",
+    s3Binary,
+    serveS3Args({
+      dataDir: s3DataDir,
+      address: `127.0.0.1:${s3Port}`,
+      accessKey: "minioadmin",
+      secretKey: "minioadmin",
+    }),
     {
       cwd: projectRoot,
       runRoot,
       verbose: options.verbose,
-      env: {
-        ...process.env,
-        MINIO_ROOT_USER: "minioadmin",
-        MINIO_ROOT_PASSWORD: "minioadmin",
-        MINIO_BROWSER: "off",
-      },
+      env: { ...process.env },
     },
   );
-  records.push(minio);
-  await waitForUrl(
-    `http://127.0.0.1:${minioPort}/minio/health/live`,
-    30_000,
-    minio,
-  );
+  records.push(s3);
+  await waitForPort(s3Port, 30_000, s3);
 
   const syncRoot = path.join(projectRoot, "donut-sync");
-  await rm(path.join(syncRoot, "tsconfig.build.tsbuildinfo"), { force: true });
-  await rm(path.join(syncRoot, "dist"), { recursive: true, force: true });
-  run("pnpm", ["build"], syncRoot);
-  const sync = startProcess("donut-sync", "node", ["dist/main.js"], {
-    cwd: syncRoot,
+  run("cargo", ["build", "--locked"], syncRoot);
+  const syncBinary = path.join(
+    syncRoot,
+    "target",
+    "debug",
+    `donut-sync${executableSuffix}`,
+  );
+  // Started outside the project, so no developer .env reaches it.
+  const sync = startProcess("donut-sync", syncBinary, [], {
+    cwd: runRoot,
     runRoot,
     verbose: options.verbose,
     env: {
       ...process.env,
       PORT: String(syncPort),
       SYNC_TOKEN: syncToken,
-      S3_ENDPOINT: `http://127.0.0.1:${minioPort}`,
+      S3_ENDPOINT: `http://127.0.0.1:${s3Port}`,
       S3_REGION: "us-east-1",
       S3_ACCESS_KEY_ID: "minioadmin",
       S3_SECRET_ACCESS_KEY: "minioadmin",
@@ -534,7 +660,7 @@ async function startSyncInfrastructure(runRoot, options, records) {
   records.push(sync);
   await waitForUrl(`http://127.0.0.1:${syncPort}/health`, 30_000, sync);
   return {
-    minioUrl: `http://127.0.0.1:${minioPort}`,
+    s3Url: `http://127.0.0.1:${s3Port}`,
     syncUrl: `http://127.0.0.1:${syncPort}`,
     syncToken,
   };
@@ -888,6 +1014,21 @@ async function main() {
         "--no-build requested but the E2E app or driver binary is missing",
       );
     }
+    installSidecars();
+
+    const headed = process.env.DONUT_E2E_HEADED === "1";
+    const privateDisplay =
+      process.platform === "linux" && !headed
+        ? await startPrivateDisplay(runRoot, records)
+        : null;
+    // The driver passes its environment to the app, and the app to Wayfern.
+    const appEnv = { ...process.env };
+    if (privateDisplay) {
+      appEnv.DISPLAY = privateDisplay;
+      appEnv.GDK_BACKEND = "x11";
+      delete appEnv.WAYLAND_DISPLAY;
+      log(`Private display ${privateDisplay}`);
+    }
 
     const driverPort = await freePort();
     const driver = startProcess(
@@ -900,14 +1041,16 @@ async function main() {
         "4",
         "--startup-timeout",
         "120",
+        // Sized to the longest command the suites issue (a Wayfern download),
+        // so the driver never cuts a command shorter than the session asked.
         "--command-timeout",
-        "630",
+        String(DRIVER_COMMAND_TIMEOUT_SECONDS),
         "--log",
         options.verbose ? "debug" : "info",
       ],
       {
         cwd: projectRoot,
-        env: process.env,
+        env: appEnv,
         runRoot,
         verbose: options.verbose,
       },
@@ -923,7 +1066,8 @@ async function main() {
       (options.suite === "network" || options.suite === "full") &&
       process.env.DONUT_E2E_SKIP_NETWORK_TEST !== "1";
     const geoIpFixture = needsBrowser ? await ensureGeoIpFixture() : null;
-    fixture = await startFixtureServer(geoIpFixture);
+    const geoIpAsnFixture = needsBrowser ? await ensureGeoIpAsnFixture() : null;
+    fixture = await startFixtureServer(geoIpFixture, geoIpAsnFixture);
     let sync = {};
     if (options.suite === "sync" || options.suite === "full") {
       sync = await startSyncInfrastructure(runRoot, options, records);
@@ -960,18 +1104,36 @@ async function main() {
       "--test",
       "--test-concurrency=1",
       "--test-reporter=spec",
+      // One test out of a suite, for iterating on a failure without paying
+      // for the rest of the file. Never set in CI.
+      ...(process.env.DONUT_E2E_TEST_NAME_PATTERN
+        ? [`--test-name-pattern=${process.env.DONUT_E2E_TEST_NAME_PATTERN}`]
+        : []),
       ...files,
     ];
     const child = spawn(process.execPath, testArgs, {
       cwd: projectRoot,
       env: {
-        ...process.env,
+        ...appEnv,
         DONUT_E2E_RUN_ROOT: runRoot,
         DONUT_E2E_PROJECT_ROOT: projectRoot,
         DONUT_E2E_APP: appBinary,
         DONUT_E2E_DRIVER_URL: `http://127.0.0.1:${driverPort}`,
         DONUT_E2E_FIXTURE_URL: `http://127.0.0.1:${fixture.port}`,
         DONUT_E2E_GEOIP_FIXTURE_READY: geoIpFixture ? "1" : "0",
+        DONUT_E2E_GEOIP_ASN_FIXTURE_READY: geoIpAsnFixture ? "1" : "0",
+        // Every suite keeps the Donut window off the user's screen so a local
+        // run never pops a window or steals focus. On macOS and Windows it
+        // runs headless: the app builds the window hidden and the tauri-wd
+        // plugin keeps it off screen (on macOS transparent, click-through and
+        // never key, with the app as an accessory; hidden on Windows).
+        // AppSession forwards this as the headless capability; only the
+        // driver's TAURI_WEBDRIVER_HEADLESS reaches the app. On Linux the
+        // window is shown on the private display instead (see
+        // startPrivateDisplay), and Wayfern opens there too.
+        // DONUT_E2E_HEADED=1 shows the window on the current display when a
+        // failure needs watching.
+        DONUT_E2E_HEADLESS: headed || privateDisplay ? "0" : "1",
         WAYFERN_TEST_TOKEN: token,
         RESIDENTIAL_PROXY_URL_ONE_SOCKS:
           localValues.RESIDENTIAL_PROXY_URL_ONE_SOCKS ?? "",
@@ -979,7 +1141,7 @@ async function main() {
           localValues.RESIDENTIAL_PROXY_URL_ONE_HTTP ?? "",
         DONUT_E2E_SYNC_URL: sync.syncUrl ?? "",
         DONUT_E2E_SYNC_TOKEN: sync.syncToken ?? "",
-        DONUT_E2E_MINIO_URL: sync.minioUrl ?? "",
+        DONUT_E2E_S3_URL: sync.s3Url ?? "",
         DONUT_E2E_WIREGUARD_CONFIG_BASE64: wireGuard
           ? Buffer.from(wireGuard.config).toString("base64")
           : "",

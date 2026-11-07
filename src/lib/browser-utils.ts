@@ -1,9 +1,22 @@
+import { LuGlobe } from "react-icons/lu";
+import { SiBrave, SiOpera, SiVivaldi } from "react-icons/si";
 /**
  * Browser utility functions
  * Centralized helpers for browser name mapping, icons, etc.
  */
 
-import { FaChrome, FaExclamationTriangle, FaFire } from "react-icons/fa";
+import {
+  FaAndroid,
+  FaApple,
+  FaChrome,
+  FaEdge,
+  FaExclamationTriangle,
+  FaFire,
+  FaFirefox,
+  FaLinux,
+  FaSafari,
+  FaWindows,
+} from "react-icons/fa";
 import { LuLock } from "react-icons/lu";
 import { getCurrentOS } from "@/lib/platform";
 
@@ -36,6 +49,35 @@ export function getBrowserIcon(browserType: string) {
   }
 }
 
+/** Source browsers are identities, not warnings about the destination runtime. */
+export function getSourceBrowserIcon(browserType: string) {
+  switch (browserType.toLowerCase()) {
+    case "chrome":
+    case "chrome-beta":
+    case "chrome-dev":
+    case "chrome-canary":
+    case "chromium":
+    case "wayfern":
+      return FaChrome;
+    case "edge":
+    case "msedge":
+      return FaEdge;
+    case "brave":
+      return SiBrave;
+    case "vivaldi":
+      return SiVivaldi;
+    case "opera":
+    case "opera-gx":
+      return SiOpera;
+    case "firefox":
+      return FaFirefox;
+    case "safari":
+      return FaSafari;
+    default:
+      return LuGlobe;
+  }
+}
+
 export function getProfileIcon(profile: {
   browser: string;
   ephemeral?: boolean;
@@ -50,11 +92,30 @@ export function getProfileIcon(profile: {
   return getBrowserIcon(profile.browser);
 }
 
+/**
+ * The OS a fingerprint without an explicit `os` was generated for: the machine
+ * that created the profile. Mirrors `BrowserProfile::native_os`, without its
+ * fallback to this computer, so callers can tell "unknown" apart.
+ */
+export function getProfileNativeOs(profile: {
+  host_os?: string;
+}): "macos" | "windows" | "linux" | undefined {
+  const os = profile.host_os;
+  return os === "macos" || os === "windows" || os === "linux" ? os : undefined;
+}
+
+/**
+ * Whether a profile cannot run on this computer because a browser bound to
+ * its OS created it elsewhere. Mirrors `BrowserProfile::is_cross_os`: a
+ * Wayfern profile runs on every OS, so it is never cross-OS.
+ */
 export function isCrossOsProfile(profile: {
+  browser: string;
   host_os?: string;
   wayfern_config?: { os?: string };
   fingerprint_chromium_config?: { platform?: string };
 }): boolean {
+  if (profile.browser === "wayfern") return false;
   const profileOs =
     profile.host_os ||
     profile.fingerprint_chromium_config?.platform ||
@@ -71,7 +132,25 @@ export function getOSDisplayName(os: string): string {
       return "Windows";
     case "linux":
       return "Linux";
+    case "android":
+      return "Android";
+    case "ios":
+      return "iOS";
     default:
       return os;
+  }
+}
+
+export function getOSIcon(os: string) {
+  switch (os) {
+    case "macos":
+    case "ios":
+      return FaApple;
+    case "windows":
+      return FaWindows;
+    case "android":
+      return FaAndroid;
+    default:
+      return FaLinux;
   }
 }

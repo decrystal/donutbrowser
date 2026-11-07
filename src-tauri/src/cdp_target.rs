@@ -2,22 +2,21 @@
 //!
 //! Until this module existed, every automation tool answered "where is this
 //! browser?" by reading a LOCAL debugging port out of the LOCAL profile
-//! directory. A profile launched on a leased host has no local port and no
+//! directory. A profile launched on a remote host has no local port and no
 //! local process, so a customer who paid for remote execution could start a
 //! session and then do nothing with it — the one thing the feature exists for.
 //!
 //! There is exactly one resolver here, [`resolve`], and one connection type,
 //! [`CdpConnection`]. Tools ask for a target and get either a page socket on
-//! this machine or a relayed socket to the fleet; nothing above this module
-//! branches on which. That is deliberate: a parallel set of remote-only tools
-//! would drift from the local ones within a release.
+//! this machine or a relayed socket to a remote browser; nothing above this
+//! module branches on which. That is deliberate: a parallel set of remote-only
+//! tools would drift from the local ones within a release.
 //!
-//! The remote arm reaches donutbrowser-infra with the USER's own access token.
-//! The desktop holds no fleet credential and knows no fleet hostname — infra
-//! verifies the session belongs to the caller and relays onward with its own
-//! service credential. That boundary is why this is a relay and not a direct
-//! connection.
+//! The remote arm reaches the cloud API with the USER's own access token, and
+//! never holds any credential or hostname belonging to the machine the browser
+//! runs on. That boundary is why this is a relay and not a direct connection.
 
+use crate::log_redaction::ShortId;
 use crate::profile::types::BrowserProfile;
 use serde_json::Value;
 use std::time::Duration;
@@ -30,16 +29,15 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 /// How long the WebSocket handshake may take.
 ///
-/// A remote attach crosses desktop → infra → wayfern → agent → the VM, so this
-/// is far longer than a loopback connect needs. It matches the relay's own
-/// upstream handshake budget: waiting longer than the server does can only
-/// report a timeout the server already reported.
+/// A remote attach crosses several networks before it reaches the browser, so
+/// this is far longer than a loopback connect needs. Waiting longer than the
+/// server does can only report a timeout the server already reported.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How long one CDP command may wait for its reply.
 ///
 /// Without a cap, a browser that never answers holds the caller until the
-/// socket dies — 90 seconds on the relay, indefinitely on loopback. An
+/// socket dies — a bounded wait remotely, indefinitely on loopback. An
 /// automation client that hangs is worse than one that fails.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -51,10 +49,9 @@ const CONNECT_RETRY_BASE: Duration = Duration::from_millis(400);
 
 /// Ceiling on a relayed CDP message.
 ///
-/// Matches the relay's client-facing cap, which matches the fleet's upstream
-/// frame cap. Lower, and a screenshot the server was willing to carry is
-/// dropped on arrival; higher buys nothing, because the frame never crosses the
-/// relay in the first place.
+/// Matches the frame cap the remote endpoint enforces. Lower, and a screenshot
+/// the server was willing to carry is dropped on arrival; higher buys nothing,
+/// because the frame never crosses the network in the first place.
 const REMOTE_MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Command ids for the two messages the remote arm sends before any tool does.
@@ -72,9 +69,9 @@ pub enum CdpTarget {
   /// A browser on this machine. The URL is a PAGE-level socket, so commands
   /// carry no CDP session id.
   Local { ws_url: String },
-  /// A browser on the fleet, reached through the infra relay. The relay bridges
-  /// a BROWSER-level socket, so the connection attaches to a page and stamps
-  /// every subsequent message with the resulting session id.
+  /// A browser running remotely, reached through the cloud API. The remote
+  /// endpoint exposes a BROWSER-level socket, so the connection attaches to a
+  /// page and stamps every subsequent message with the resulting session id.
   Remote {
     ws_url: String,
     bearer: String,
@@ -83,7 +80,7 @@ pub enum CdpTarget {
 }
 
 impl CdpTarget {
-  /// True when this browser is on the leased fleet rather than this machine.
+  /// True when this browser is on a remote host rather than this machine.
   pub fn is_remote(&self) -> bool {
     matches!(self, Self::Remote { .. })
   }
@@ -92,7 +89,7 @@ impl CdpTarget {
   pub fn describe(&self) -> String {
     match self {
       Self::Local { .. } => "local browser".to_string(),
-      Self::Remote { session_id, .. } => format!("remote session {session_id}"),
+      Self::Remote { session_id, .. } => format!("remote session {}", ShortId(session_id)),
     }
   }
 }
@@ -105,9 +102,9 @@ impl CdpTarget {
 /// broken one.
 #[derive(Debug)]
 pub enum CdpError {
-  /// Nothing is listening, or the relay could not reach the browser.
+  /// Nothing is listening, or the browser could not be reached.
   Unreachable(String),
-  /// The relay refused the credential.
+  /// The credential was refused.
   Unauthorized(String),
   /// The session exists but is not in a state that can be driven.
   NotDrivable(String),
@@ -133,9 +130,9 @@ impl CdpError {
   /// Whether a fresh connection attempt could plausibly succeed.
   ///
   /// A refused credential and a session that is still provisioning are answers,
-  /// not failures. Retrying either spends the caller's time and, on the relay,
-  /// burns one of the four attachments a session is allowed — so the retry can
-  /// make the next honest attempt fail too.
+  /// not failures. Retrying either spends the caller's time and counts against
+  /// the session's attachment budget — so the retry can make the next honest
+  /// attempt fail too.
   fn is_retryable(&self) -> bool {
     matches!(self, Self::Unreachable(_) | Self::Transport(_))
   }
@@ -185,11 +182,11 @@ impl Patience {
 /// one crosses two networks.
 ///
 /// The local check is deliberately split in two. One cheap probe decides the
-/// arm, so a profile running on the fleet is not held behind twenty-five
-/// seconds of local retries; only once remote has been ruled out does the local
-/// probe spend its full budget waiting for a browser that is still starting.
-/// The same split covers a stale `process_id` left by a crash — nothing answers
-/// on the recorded port, so the fleet session is found instead of a dead one.
+/// arm, so a profile running remotely is not held behind twenty-five seconds of
+/// local retries; only once remote has been ruled out does the local probe
+/// spend its full budget waiting for a browser that is still starting. The same
+/// split covers a stale `process_id` left by a crash — nothing answers on the
+/// recorded port, so the remote session is found instead of a dead one.
 pub async fn resolve(profile: &BrowserProfile) -> Result<CdpTarget, ResolveError> {
   if !matches!(
     profile.browser.as_str(),
@@ -216,10 +213,10 @@ pub async fn resolve(profile: &BrowserProfile) -> Result<CdpTarget, ResolveError
       .await
       .map_err(|e| ResolveError::Endpoint(e.to_string()))?;
     let bearer = crate::remote_session::access_token_for_cdp().map_err(ResolveError::Endpoint)?;
-    log::info!(
-      "Driving profile '{}' through remote session {}",
-      profile.name,
-      session.session_id
+    log::debug!(
+      "Driving profile through remote session profile={} session={}",
+      profile.id,
+      ShortId(&session.session_id)
     );
     return Ok(CdpTarget::Remote {
       ws_url: endpoint.ws_url,
@@ -246,10 +243,6 @@ pub async fn resolve(profile: &BrowserProfile) -> Result<CdpTarget, ResolveError
 
 /// The debugging port a locally launched browser registered for this profile.
 async fn local_cdp_port(profile: &BrowserProfile, patience: Patience) -> Option<u16> {
-  let profiles_dir = crate::profile::manager::ProfileManager::instance().get_profiles_dir();
-  let profile_path = crate::ephemeral_dirs::get_effective_profile_path(profile, &profiles_dir);
-  let profile_path_str = profile_path.to_string_lossy().to_string();
-
   // Port info is written once the process is up, so a tool called straight
   // after a launch has to wait for it.
   for attempt in 0..patience.attempts(10) {
@@ -257,13 +250,36 @@ async fn local_cdp_port(profile: &BrowserProfile, patience: Patience) -> Option<
       tokio::time::sleep(Duration::from_secs(1)).await;
     }
     if let Some(port) = crate::wayfern_manager::WayfernManager::instance()
-      .get_cdp_port(&profile_path_str)
+      .cdp_port_for_profile(profile)
       .await
     {
       return Some(port);
     }
   }
   None
+}
+
+/// A BROWSER-level socket on a locally running browser, for a client that
+/// attaches to every tab itself. `None` when the profile's browser is not
+/// running on this machine.
+pub async fn connect_local_browser(profile: &BrowserProfile) -> Option<CdpConnection> {
+  profile.process_id?;
+  let port = local_cdp_port(profile, Patience::Immediate).await?;
+  let version: Value = reqwest::Client::new()
+    .get(format!("http://127.0.0.1:{port}/json/version"))
+    .timeout(Duration::from_secs(3))
+    .send()
+    .await
+    .ok()?
+    .json()
+    .await
+    .ok()?;
+  let request = version
+    .get("webSocketDebuggerUrl")
+    .and_then(Value::as_str)?
+    .into_client_request()
+    .ok()?;
+  dial(request, None).await.ok().map(CdpConnection::new)
 }
 
 /// A page-level socket on a locally running browser.
@@ -289,7 +305,11 @@ async fn local_page_ws_url(profile: &BrowserProfile, patience: Patience) -> Opti
     {
       Ok(response) => match response.json::<Vec<Value>>().await {
         Ok(targets) => {
-          if let Some(ws_url) = pick_local_page_socket(&targets) {
+          // The tab an agent picked comes first; then any drivable page.
+          if let Some(ws_url) =
+            crate::browser_tabs::selected_socket(&profile.id.to_string(), &targets)
+              .or_else(|| pick_local_page_socket(&targets))
+          {
             return Some(ws_url);
           }
           last_err = "no page target found in browser".to_string();
@@ -301,18 +321,36 @@ async fn local_page_ws_url(profile: &BrowserProfile, patience: Patience) -> Opti
   }
 
   if patience == Patience::WaitForLaunch {
-    log::warn!("Local CDP discovery on port {port} gave up: {last_err}");
+    log::warn!("Local CDP discovery gave up cdp_port={port} err=\"{last_err}\"");
   }
   None
 }
 
 /// Pick a drivable page from what `/json` lists on a local browser.
+///
+/// DRIVABLE, not merely first. This used to take the first `type == "page"` and
+/// then reach for its socket, so a first entry without a
+/// `webSocketDebuggerUrl`, a page another client is already attached to, which
+/// Chromium omits the field for, made the whole call answer None and every
+/// browser tool fail, while a perfectly drivable second tab sat right behind it.
+/// The user sees "no page target found in browser" on a browser plainly showing
+/// pages.
+///
+/// `devtools://` is excluded for the same reason [`pick_remote_page_target`]
+/// excludes it: attaching there drives the inspector rather than the site, which
+/// reports success and moves nothing. The two functions answer the same question
+/// off different payload shapes, so they must not disagree about what counts.
 pub fn pick_local_page_socket(targets: &[Value]) -> Option<String> {
   targets
     .iter()
-    .find(|t| t.get("type").and_then(Value::as_str) == Some("page"))
-    .and_then(|t| t.get("webSocketDebuggerUrl"))
-    .and_then(Value::as_str)
+    .filter(|t| t.get("type").and_then(Value::as_str) == Some("page"))
+    .filter(|t| {
+      !t.get("url")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .starts_with("devtools://")
+    })
+    .find_map(|t| t.get("webSocketDebuggerUrl").and_then(Value::as_str))
     .map(str::to_string)
 }
 
@@ -380,8 +418,26 @@ impl CdpConnection {
     method: &str,
     params: Value,
   ) -> Result<(), CdpError> {
-    use futures_util::sink::SinkExt;
     let frame = cdp_frame(self.cdp_session.as_deref(), id, method, params);
+    self.send_frame(frame).await
+  }
+
+  /// Send `method` as command `id` to the flattened session `session`, or to
+  /// the socket's own target when it is `None`.
+  pub async fn send_to(
+    &mut self,
+    session: Option<&str>,
+    id: u64,
+    method: &str,
+    params: Value,
+  ) -> Result<(), CdpError> {
+    self
+      .send_frame(cdp_frame(session, id, method, params))
+      .await
+  }
+
+  async fn send_frame(&mut self, frame: Value) -> Result<(), CdpError> {
+    use futures_util::sink::SinkExt;
     self
       .stream
       .send(Message::Text(frame.to_string().into()))
@@ -417,10 +473,9 @@ impl CdpConnection {
 
   /// Turn a hang-up into the error it means.
   ///
-  /// The relay's close codes are its whole vocabulary: 1008 is "that credential
-  /// is no good", 1013 is "come back when the session is up". Reporting either
-  /// as a generic transport failure throws away the only actionable thing the
-  /// server said.
+  /// The close codes carry the only actionable thing the server says: 1008
+  /// means the credential was refused, 1013 means the session is not up yet.
+  /// Reporting either as a generic transport failure throws that away.
   pub fn closed_error(&self, context: &str) -> CdpError {
     match &self.closed {
       Some(info) if info.reason.is_empty() => {
@@ -479,20 +534,20 @@ impl CdpConnection {
 
   /// Hang up politely so the peer releases its side immediately.
   ///
-  /// On the relay every open socket costs a real stream on the leased host and
-  /// counts against the session's attachment cap, so dropping the TCP
-  /// connection and letting it time out is not good enough.
+  /// A remote socket that is not closed keeps consuming the session's
+  /// attachment budget, so dropping the TCP connection and letting it time out
+  /// is not good enough.
   pub async fn close(mut self) {
     let _ = self.stream.close(None).await;
   }
 
   /// Move a browser-level socket onto a page.
   ///
-  /// The relay bridges `/devtools/browser/<id>`. Every tool here speaks
-  /// `Page.*`, `Runtime.*` and `Input.*`, which a browser socket answers with
-  /// `'Page.navigate' wasn't found`. Attaching flat, and stamping the resulting
-  /// session id onto everything after it, is what makes the tools this app
-  /// already has work remotely without a single per-tool change.
+  /// The remote endpoint exposes `/devtools/browser/<id>`. Every tool here
+  /// speaks `Page.*`, `Runtime.*` and `Input.*`, which a browser socket answers
+  /// with `'Page.navigate' wasn't found`. Attaching flat, and stamping the
+  /// resulting session id onto everything after it, is what makes the tools
+  /// this app already has work remotely without a single per-tool change.
   async fn attach_to_page(&mut self) -> Result<(), CdpError> {
     let targets = self
       .call(
@@ -530,6 +585,7 @@ impl CdpConnection {
 const RUN_PAGE_ENABLE_ID: u64 = 1;
 const RUN_COMMAND_ID: u64 = 2;
 const RUN_PAGE_DISABLE_ID: u64 = 3;
+const RUN_FRAME_TREE_ID: u64 = 4;
 
 /// The attach handshake and the commands after it share one socket, so a
 /// handshake reply carrying a command's id would be handed back as that
@@ -543,32 +599,142 @@ const _: () = {
   assert!(HANDSHAKE_ATTACH_ID != RUN_PAGE_ENABLE_ID);
   assert!(HANDSHAKE_ATTACH_ID != RUN_COMMAND_ID);
   assert!(HANDSHAKE_ATTACH_ID != RUN_PAGE_DISABLE_ID);
+  assert!(HANDSHAKE_GET_TARGETS_ID != RUN_FRAME_TREE_ID);
+  assert!(HANDSHAKE_ATTACH_ID != RUN_FRAME_TREE_ID);
 };
 
 /// Run one command on a fresh connection and hand back its result.
+/// A socket kept open after a one-shot command, for the next one to the same
+/// page. Dialing costs little on this computer, but a remote session pays a
+/// relay dial and a page attach each time.
+struct PooledConnection {
+  connection: CdpConnection,
+  next_id: u64,
+  last_used: tokio::time::Instant,
+}
+
+/// How long an unused socket is kept.
+const POOL_IDLE: Duration = Duration::from_secs(30);
+/// The first command id on a pooled socket, apart from the fixed ids the
+/// one-shot helpers use, so a late reply never matches a new command.
+const POOL_FIRST_ID: u64 = 1_000;
+
+static POOL: std::sync::LazyLock<
+  tokio::sync::Mutex<std::collections::HashMap<String, PooledConnection>>,
+> = std::sync::LazyLock::new(Default::default);
+
+impl CdpTarget {
+  /// The socket a pooled connection to this target serves.
+  fn pool_key(&self) -> String {
+    match self {
+      Self::Local { ws_url } => ws_url.clone(),
+      Self::Remote {
+        ws_url, session_id, ..
+      } => format!("{ws_url}#{session_id}"),
+    }
+  }
+}
+
+/// Whether a failure on a pooled socket means the command never reached the
+/// browser, so a fresh socket may send it again.
+fn not_delivered(error: &CdpError) -> bool {
+  matches!(error, CdpError::Transport(message)
+    if message.starts_with("failed to send CDP command")
+      || message.contains("connection closed"))
+}
+
+/// Whether the socket is still fit for the next command after `result`.
+fn reusable(result: &Result<Value, CdpError>) -> bool {
+  matches!(result, Ok(_) | Err(CdpError::Protocol(_)))
+}
+
+async fn give_back(key: String, pooled: PooledConnection) {
+  let mut pool = POOL.lock().await;
+  pool.retain(|_, kept| kept.last_used.elapsed() < POOL_IDLE);
+  if let Some(extra) = pool.insert(key, pooled) {
+    drop(pool);
+    extra.connection.close().await;
+  }
+}
+
 pub async fn run_command(
   target: &CdpTarget,
   method: &str,
   params: Value,
 ) -> Result<Value, CdpError> {
-  let mut connection = target.connect().await?;
-  let result = connection.call(RUN_COMMAND_ID, method, params).await;
-  connection.close().await;
+  let key = target.pool_key();
+  // Tests run each case on a runtime of its own, and a socket kept from one
+  // is dead in the next, so the pool only serves the app's one runtime.
+  let kept = if cfg!(test) {
+    None
+  } else {
+    POOL
+      .lock()
+      .await
+      .remove(&key)
+      .filter(|kept| kept.last_used.elapsed() < POOL_IDLE)
+  };
+  if let Some(mut pooled) = kept {
+    pooled.next_id += 1;
+    // A bound on the whole call, the send included: a socket that stopped
+    // being driven must fail the command, never hang it.
+    let result = tokio::time::timeout(
+      COMMAND_TIMEOUT + Duration::from_secs(5),
+      pooled
+        .connection
+        .call(pooled.next_id, method, params.clone()),
+    )
+    .await
+    .unwrap_or_else(|_| {
+      Err(CdpError::Transport(
+        "timed out waiting for a CDP response".to_string(),
+      ))
+    });
+    match &result {
+      Err(error) if not_delivered(error) => {
+        log::debug!("Pooled CDP socket was closed, dialing again method={method}");
+      }
+      _ => {
+        if reusable(&result) {
+          pooled.last_used = tokio::time::Instant::now();
+          give_back(key, pooled).await;
+        } else {
+          pooled.connection.close().await;
+        }
+        return result;
+      }
+    }
+  }
+  let mut pooled = PooledConnection {
+    connection: target.connect().await?,
+    next_id: POOL_FIRST_ID,
+    last_used: tokio::time::Instant::now(),
+  };
+  let result = pooled.connection.call(pooled.next_id, method, params).await;
+  if reusable(&result) && !cfg!(test) {
+    pooled.last_used = tokio::time::Instant::now();
+    give_back(key, pooled).await;
+  } else {
+    pooled.connection.close().await;
+  }
   result
 }
 
 /// Run one command, then wait for the page to finish loading.
 ///
-/// Used for anything that might navigate: `Page.navigate` obviously, but also a
-/// click or a script that turns out to follow a link. When nothing navigates,
-/// the wait simply expires and the command's own result is returned — that is
-/// the intended path, not a failure.
+/// Used for anything that might navigate: `Page.navigate` obviously
+/// (`expect_navigation`), but also a click or a script that turns out to
+/// follow a link. When nothing starts to navigate, the wait ends a moment after
+/// the reply (`navigation_watch`) and the command's own result is returned:
+/// that is the intended path, not a failure.
 pub async fn run_command_awaiting_load(
   target: &CdpTarget,
   method: &str,
   params: Value,
   timeout_secs: u64,
+  expect_navigation: bool,
 ) -> Result<Value, CdpError> {
+  use crate::navigation_watch::{main_frame_of, NavigationWatch};
   let mut connection = target.connect().await?;
 
   // Page events have to be on before the command runs, or `loadEventFired`
@@ -576,28 +742,47 @@ pub async fn run_command_awaiting_load(
   connection
     .call(RUN_PAGE_ENABLE_ID, "Page.enable", serde_json::json!({}))
     .await?;
+  let main_frame = connection
+    .call(
+      RUN_FRAME_TREE_ID,
+      "Page.getFrameTree",
+      serde_json::json!({}),
+    )
+    .await
+    .ok()
+    .and_then(|tree| main_frame_of(&tree));
   connection
     .send_command(RUN_COMMAND_ID, method, params)
     .await?;
 
   let mut command_result = None;
   let mut failure = None;
+  let mut watch = NavigationWatch::new(main_frame, expect_navigation);
   let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
 
   loop {
-    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    if remaining.is_zero() {
+    let now = tokio::time::Instant::now();
+    if watch.done(now) || now >= deadline {
       break;
     }
-    let text = match tokio::time::timeout(remaining, connection.next_text()).await {
+    let text = match tokio::time::timeout_at(watch.wake_at(deadline), connection.next_text()).await
+    {
       Ok(Some(Ok(text))) => text,
       Ok(Some(Err(e))) => {
-        failure = Some(e);
+        // A dropped connection cannot unsay a command the browser already
+        // answered: the navigation was accepted, and the command's result is
+        // the best answer available even if the load event never arrived.
+        // Only when nothing was answered yet is the lost socket a failure.
+        if command_result.is_none() {
+          failure = Some(e);
+        }
         break;
       }
-      // The peer hung up, or the wait expired. Either way whatever the command
-      // already answered is the best result available.
-      Ok(None) | Err(_) => break,
+      // The peer hung up. Whatever the command already answered is the best
+      // result available.
+      Ok(None) => break,
+      // Woken for the end of the grace or the deadline; the loop decides.
+      Err(_) => continue,
     };
 
     let response: Value = serde_json::from_str(&text).unwrap_or_default();
@@ -613,12 +798,13 @@ pub async fn run_command_awaiting_load(
           .cloned()
           .unwrap_or_else(|| serde_json::json!({})),
       );
+      watch.on_reply(tokio::time::Instant::now());
     }
 
     // Flattened remote sessions keep `method` at the top level, so this match
     // is identical on both arms.
-    if response.get("method") == Some(&Value::from("Page.loadEventFired")) {
-      break;
+    if let Some(event) = response.get("method").and_then(Value::as_str) {
+      watch.on_event(event, response.get("params"));
     }
   }
 
@@ -638,14 +824,15 @@ pub async fn run_command_awaiting_load(
 ///
 /// This is what "open a URL in that profile" means once the browser is already
 /// up, wherever it is. A remote session navigates its existing page rather than
-/// opening a tab: a tab opened on a leased host that nobody can see or close is
-/// not a feature, it is litter on hardware the user is paying for by the hour.
+/// opening a tab: a tab opened on a remote host that nobody can see or close is
+/// not a feature, it is litter on time the user is paying for by the hour.
 pub async fn navigate(target: &CdpTarget, url: &str, timeout_secs: u64) -> Result<(), CdpError> {
   run_command_awaiting_load(
     target,
     "Page.navigate",
     serde_json::json!({ "url": url }),
     timeout_secs,
+    true,
   )
   .await
   .map(|_| ())
@@ -679,8 +866,8 @@ impl CdpTarget {
         return Err(error);
       }
       let delay = CONNECT_RETRY_BASE * 2u32.pow(attempt - 1);
-      log::warn!(
-        "CDP connect to {} failed ({error}); retrying in {}ms",
+      log::debug!(
+        "CDP connect failed target=\"{}\" attempt={attempt} retry_in_ms={} err=\"{error}\"",
         self.describe(),
         delay.as_millis()
       );
@@ -704,7 +891,10 @@ impl CdpTarget {
       } => {
         let mut connection = dial_relay(ws_url, bearer).await?;
         if let Err(e) = connection.attach_to_page().await {
-          log::warn!("Could not attach to a page in remote session {session_id}: {e}");
+          log::warn!(
+            "Remote session page attach failed session={} err=\"{e}\"",
+            ShortId(session_id)
+          );
           return Err(e);
         }
         Ok(connection)
@@ -727,9 +917,9 @@ pub type RelaySocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// target from it and stamp a session id onto messages it did not address.
 ///
 /// This is what makes a remote session usable from outside the app at all. The
-/// relay only accepts the user's cloud credential, which no API consumer holds
-/// and none should — so the socket is opened here, with the credential this
-/// process already has, and proxied to the caller.
+/// endpoint only accepts the user's cloud credential, which no API consumer
+/// holds and none should — so the socket is opened here, with the credential
+/// this process already has, and proxied to the caller.
 pub async fn open_relay_socket(session_id: &str) -> Result<RelaySocket, CdpError> {
   let endpoint = crate::remote_session::cdp_endpoint(session_id)
     .await
@@ -743,7 +933,7 @@ pub async fn open_relay_socket(session_id: &str) -> Result<RelaySocket, CdpError
     Err(e) => return Err(e),
   };
 
-  log::info!("The CDP relay refused the stored access token; refreshing and retrying once");
+  log::debug!("CDP relay refused the access token, refreshing it once");
   crate::cloud_auth::CLOUD_AUTH
     .refresh_access_token()
     .await
@@ -779,7 +969,7 @@ fn endpoint_lookup_error(err: crate::remote_session::RemoteSessionError) -> CdpE
   }
 }
 
-/// Frame limits for a relay socket. Matches the relay's own client-facing cap.
+/// Frame limits for a relay socket. Matches the cap the remote endpoint sets.
 pub fn relay_socket_config() -> WebSocketConfig {
   WebSocketConfig::default()
     .max_message_size(Some(REMOTE_MAX_MESSAGE_BYTES))
@@ -804,7 +994,7 @@ async fn dial_relay(ws_url: &str, bearer: &str) -> Result<CdpConnection, CdpErro
     Err(e) => return Err(e),
   };
 
-  log::info!("The CDP relay refused the stored access token; refreshing and retrying once");
+  log::debug!("CDP relay refused the access token, refreshing it once");
   crate::cloud_auth::CLOUD_AUTH
     .refresh_access_token()
     .await
@@ -933,11 +1123,60 @@ mod tests {
   }
 
   #[test]
+  fn a_page_that_cannot_be_driven_does_not_hide_the_one_that_can() {
+    // Chromium omits `webSocketDebuggerUrl` for a page another client is
+    // already attached to. Committing to the FIRST page and then reaching for
+    // its socket answered None for the whole browser, so every browser tool
+    // failed with "no page target found" while a drivable tab sat behind it.
+    let attached_first = vec![
+      serde_json::json!({ "type": "page", "url": "https://example.com/" }),
+      serde_json::json!({
+        "type": "page",
+        "url": "https://example.com/two",
+        "webSocketDebuggerUrl": "ws://127.0.0.1:1/devtools/page/B"
+      }),
+    ];
+    assert_eq!(
+      pick_local_page_socket(&attached_first).as_deref(),
+      Some("ws://127.0.0.1:1/devtools/page/B")
+    );
+
+    // And the inspector is not a site. Attaching here drives DevTools itself -
+    // the failure `pick_remote_page_target` already documents, which reports
+    // success and moves nothing. The two pickers answer the same question off
+    // different payloads and must not disagree.
+    let devtools_first = vec![
+      serde_json::json!({
+        "type": "page",
+        "url": "devtools://devtools/bundled/devtools_app.html",
+        "webSocketDebuggerUrl": "ws://127.0.0.1:1/devtools/page/DEVTOOLS"
+      }),
+      serde_json::json!({
+        "type": "page",
+        "url": "https://example.com/",
+        "webSocketDebuggerUrl": "ws://127.0.0.1:1/devtools/page/REAL"
+      }),
+    ];
+    assert_eq!(
+      pick_local_page_socket(&devtools_first).as_deref(),
+      Some("ws://127.0.0.1:1/devtools/page/REAL")
+    );
+
+    // A listing with pages but nothing drivable still answers None rather than
+    // handing back a non-page socket.
+    let nothing_drivable = vec![
+      serde_json::json!({ "type": "page", "url": "https://example.com/" }),
+      serde_json::json!({ "type": "worker", "webSocketDebuggerUrl": "ws://x/w" }),
+    ];
+    assert!(pick_local_page_socket(&nothing_drivable).is_none());
+  }
+
+  #[test]
   fn a_remote_frame_addresses_the_page_and_a_local_one_does_not() {
-    // A page-level command sent on the relay's BROWSER socket comes back as
+    // A page-level command sent on a BROWSER-level socket comes back as
     // "'Page.navigate' wasn't found". One missing sessionId on one message is
     // enough to make a single tool fail while every other tool works — a
-    // partial failure that reads as a flaky VM.
+    // partial failure that reads as a flaky remote browser.
     let remote = cdp_frame(
       Some("SESSION-42"),
       7,
@@ -956,9 +1195,9 @@ mod tests {
 
   #[test]
   fn a_relay_close_says_what_the_caller_should_do_about_it() {
-    // These codes are the relay's entire vocabulary. Collapsing them into one
-    // transport failure is how "your session is still provisioning" and "you
-    // are signed out" both become "something went wrong".
+    // These codes carry the whole answer. Collapsing them into one transport
+    // failure is how "your session is still provisioning" and "you are signed
+    // out" both become "something went wrong".
     assert!(matches!(
       classify_close(1008, "x".into()),
       CdpError::Unauthorized(_)
@@ -1035,9 +1274,9 @@ mod tests {
 
   #[test]
   fn a_session_that_is_over_is_not_reported_as_a_broken_gateway() {
-    // Observed against the real backend: attaching to a session the user had
-    // just stopped answered 502, so a CDP client read "this is finished" as
-    // "the gateway is down" and retried it.
+    // A session the user has already stopped, or one that is not theirs, must
+    // read as a 404: there is no browser at this address. Collapsing it into
+    // "unreachable" makes an automation client retry a finished session.
     use crate::remote_session::RemoteSessionError;
     assert!(matches!(
       endpoint_lookup_error(RemoteSessionError::Other(
@@ -1087,7 +1326,7 @@ mod tests {
 
   #[test]
   fn a_hasty_probe_tries_once_and_a_patient_one_waits() {
-    // The split is what stops a profile running on the fleet from being held
+    // The split is what stops a profile running remotely from being held
     // behind twenty-five seconds of local retries before anyone looks remote.
     assert_eq!(Patience::Immediate.attempts(10), 1);
     assert_eq!(Patience::WaitForLaunch.attempts(10), 10);
@@ -1117,12 +1356,21 @@ mod tests {
     Cooperative,
     /// Hang up the way a session that is not yet up does.
     RefuseAsNotDrivable,
+    /// Answer the navigation, then drop the socket before the load event,
+    /// the way the remote endpoint does when its browser dies mid-navigation.
+    DropAfterNavigateReply,
+    /// Drop the socket without answering the navigation.
+    DropBeforeNavigateReply,
+    /// Answer the navigation with a CDP error object.
+    AnswerNavigateWithError,
+    /// Answer commands but never emit the load event, so the wait expires.
+    NeverLoadEvent,
   }
 
   /// The CDP session id the fake relay hands out for a flat attach.
   const FAKE_CDP_SESSION: &str = "CDP-SESSION-1";
 
-  /// A stand-in for the infra relay bridged onto a browser-level socket.
+  /// A stand-in for the remote endpoint bridged onto a browser-level socket.
   ///
   /// Answers `Target.getTargets` and `Target.attachToTarget` exactly as a real
   /// browser endpoint does, then echoes each command back so the test can read
@@ -1188,18 +1436,32 @@ mod tests {
         };
         log.received.push(request.clone());
 
+        let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+
+        // A reply dropped mid-flight must not look like the command answered.
+        if behaviour == RelayBehaviour::DropBeforeNavigateReply && method == "Page.navigate" {
+          break;
+        }
+
         let id = request.get("id").cloned().unwrap_or(Value::Null);
-        let reply = match request.get("method").and_then(Value::as_str) {
-          Some("Target.getTargets") => serde_json::json!({
+        let reply = match method {
+          "Target.getTargets" => serde_json::json!({
             "id": id,
             "result": { "targetInfos": [
               { "targetId": "page-1", "type": "page", "url": "https://example.com/" }
             ]}
           }),
-          Some("Target.attachToTarget") => serde_json::json!({
+          "Target.attachToTarget" => serde_json::json!({
             "id": id,
             "result": { "sessionId": FAKE_CDP_SESSION }
           }),
+          "Page.navigate" if behaviour == RelayBehaviour::AnswerNavigateWithError => {
+            serde_json::json!({
+              "id": id,
+              "sessionId": request.get("sessionId").cloned().unwrap_or(Value::Null),
+              "error": { "code": -32000, "message": "fake navigation error" }
+            })
+          }
           // Everything else is handed straight back, so the test can assert on
           // the exact frame the client put on the wire.
           _ => serde_json::json!({
@@ -1216,10 +1478,17 @@ mod tests {
           break;
         }
 
+        // The browser died mid-navigation: drop the socket without a close
+        // frame, the way the remote endpoint does when the browser behind it
+        // goes away. The command's reply is already in the client's hands.
+        if behaviour == RelayBehaviour::DropAfterNavigateReply && method == "Page.navigate" {
+          break;
+        }
+
         // A real browser follows a navigation with the load event, flattened
         // onto the same socket. Emitting it here is what proves the wait
         // actually terminates on the event rather than on its timeout.
-        if request.get("method").and_then(Value::as_str) == Some("Page.navigate") {
+        if behaviour != RelayBehaviour::NeverLoadEvent && method == "Page.navigate" {
           let loaded = serde_json::json!({
             "method": "Page.loadEventFired",
             "sessionId": request.get("sessionId").cloned().unwrap_or(Value::Null),
@@ -1242,10 +1511,10 @@ mod tests {
 
   #[tokio::test]
   async fn a_relayed_page_command_is_attached_and_stamped_with_its_session() {
-    // This is the whole feature. The relay bridges /devtools/browser/<id>, so
-    // without the flat attach and the sessionId stamp every existing tool
-    // answers "'Page.navigate' wasn't found" and a paid remote session cannot
-    // be used for anything.
+    // This is the whole feature. The remote endpoint exposes
+    // /devtools/browser/<id>, so without the flat attach and the sessionId
+    // stamp every existing tool answers "'Page.navigate' wasn't found" and a
+    // paid remote session cannot be used for anything.
     let (ws_url, server) = fake_relay(RelayBehaviour::Cooperative).await;
     let target = CdpTarget::Remote {
       ws_url,
@@ -1335,7 +1604,7 @@ mod tests {
 
   #[tokio::test]
   async fn a_session_that_is_not_up_yet_is_reported_as_such_not_as_a_broken_one() {
-    // 1013 is the relay saying "come back when it is live". Surfacing it as a
+    // 1013 means "come back when it is live". Surfacing it as a
     // transport failure would send an automation client into a retry loop
     // against a session that is doing exactly what it should.
     let (ws_url, _server) = fake_relay(RelayBehaviour::RefuseAsNotDrivable).await;
@@ -1379,5 +1648,77 @@ mod tests {
       .collect();
     assert_eq!(methods, vec!["Runtime.evaluate"]);
     assert!(log.received[0].get("sessionId").is_none());
+  }
+
+  #[tokio::test]
+  async fn a_navigation_result_survives_a_connection_dropped_before_the_load_event() {
+    // The race this fix targets: a fast navigation can kill the connection
+    // between the command reply and the load event. The browser already
+    // accepted the navigation, so the reply is the answer — losing the socket
+    // afterwards must not turn the answered command into a failure.
+    let (ws_url, server) = fake_relay(RelayBehaviour::DropAfterNavigateReply).await;
+    let target = CdpTarget::Local { ws_url };
+
+    navigate(&target, "https://example.com", 30)
+      .await
+      .expect("an answered navigation must survive a dropped connection");
+
+    let _log = server.await.expect("the fake relay must finish");
+  }
+
+  #[tokio::test]
+  async fn a_connection_dropped_before_the_reply_is_still_reported_as_a_failure() {
+    // The flip side of the race: if the socket dies before the command
+    // answered, there is nothing to prefer — the navigation may never have
+    // happened, so the call must still fail.
+    let (ws_url, server) = fake_relay(RelayBehaviour::DropBeforeNavigateReply).await;
+    let target = CdpTarget::Local { ws_url };
+
+    let error = navigate(&target, "https://example.com", 30)
+      .await
+      .expect_err("a navigation that never answered must not look like a success");
+    assert!(
+      matches!(error, CdpError::Transport(_)),
+      "expected Transport, got {error:?}"
+    );
+
+    let _log = server.await.expect("the fake relay must finish");
+  }
+
+  #[tokio::test]
+  async fn a_navigation_error_from_the_browser_is_still_reported() {
+    // A CDP error object is the browser saying no — that answer must not be
+    // swallowed by the load wait.
+    let (ws_url, server) = fake_relay(RelayBehaviour::AnswerNavigateWithError).await;
+    let target = CdpTarget::Local { ws_url };
+
+    let error = navigate(&target, "https://example.com", 30)
+      .await
+      .expect_err("a CDP error reply must surface as a failure");
+    assert!(
+      matches!(error, CdpError::Protocol(_)),
+      "expected Protocol, got {error:?}"
+    );
+
+    let _log = server.await.expect("the fake relay must finish");
+  }
+
+  #[tokio::test]
+  async fn a_navigation_without_a_load_event_returns_the_command_result() {
+    // When nothing navigates there is no load event; the wait expires and the
+    // command's own result is the answer, not a failure.
+    let (ws_url, server) = fake_relay(RelayBehaviour::NeverLoadEvent).await;
+    let target = CdpTarget::Local { ws_url };
+
+    let started = std::time::Instant::now();
+    navigate(&target, "https://example.com", 1)
+      .await
+      .expect("an answered command with no load event must still resolve");
+    assert!(
+      started.elapsed() >= Duration::from_secs(1),
+      "the wait must run to its deadline when no load event arrives"
+    );
+
+    let _log = server.await.expect("the fake relay must finish");
   }
 }

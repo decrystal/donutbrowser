@@ -2,14 +2,17 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { save } from "@tauri-apps/plugin-dialog";
-import { writeTextFile } from "@tauri-apps/plugin-fs";
+import { open as openDialog, save } from "@tauri-apps/plugin-dialog";
+import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
+import { hideOthers } from "aria-hidden";
 import Color from "color";
+import { motion } from "motion/react";
+import { Dialog as DialogPrimitive } from "radix-ui";
+import { DismissableLayer, FocusGuards, FocusScope } from "radix-ui/internal";
 import * as React from "react";
 import { useTranslation } from "react-i18next";
-import { FaApple, FaLinux, FaWindows } from "react-icons/fa";
 import {
-  LuChevronRight,
+  LuActivity,
   LuClipboard,
   LuClipboardCheck,
   LuCookie,
@@ -19,13 +22,18 @@ import {
   LuFingerprint,
   LuGlobe,
   LuGroup,
+  LuHouse,
   LuKey,
+  LuKeyRound,
+  LuLayoutTemplate,
   LuLink,
   LuLock,
   LuLockOpen,
   LuPlus,
   LuPuzzle,
+  LuRefreshCcwDot,
   LuRefreshCw,
+  LuScrollText,
   LuSettings,
   LuShield,
   LuShieldCheck,
@@ -35,9 +43,36 @@ import {
   LuUsers,
   LuX,
 } from "react-icons/lu";
+import { DnsServerField } from "@/components/dns-server-field";
+import { LogViewer } from "@/components/log-viewer";
+import { NetworkRequestsPanel } from "@/components/network-requests-panel";
+import { ProfileHandoffStatus } from "@/components/profile-handoff-status";
+import { DebugEndpointBlock } from "@/components/profile-info/debug-endpoint";
+import {
+  DraftSaveBar,
+  SavedNote,
+  SectionHeader,
+  useSavedFlash,
+} from "@/components/profile-info/draft-save-bar";
+import {
+  lockProfileNow,
+  ProfileMoreMenu,
+  RunInCloudButton,
+  RunningBanner,
+  RunToggleButton,
+  useCanRunRemote,
+  useProfileUnlocked,
+} from "@/components/profile-info/header-actions";
+import { SiteStoragePanel } from "@/components/profile-info/site-storage";
+import { ProfileLaunchActivity } from "@/components/profile-launch-activity";
+import { ProfileMetadataCard } from "@/components/profile-metadata-card";
+import { ExportProfileSection } from "@/components/profile-transfer";
+import { RestorePoints } from "@/components/restore-points";
 import { SharedFingerprintConfigForm } from "@/components/shared-fingerprint-config-form";
+import { ProfileTotpSection } from "@/components/totp-code";
 import { AnimatedSwitch } from "@/components/ui/animated-switch";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   ColorPicker,
   ColorPickerEyeDropper,
@@ -60,6 +95,8 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { SoftFields } from "@/components/ui/field-variant";
+import { FOCUS_RING } from "@/components/ui/focus-ring";
 import { Input } from "@/components/ui/input";
 import {
   Popover,
@@ -74,11 +111,22 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Textarea } from "@/components/ui/textarea";
+import { LaunchArgumentsEditor } from "@/components/wayfern-config-form";
+import { WindowDragArea } from "@/components/window-drag-area";
+import { useInputModality } from "@/hooks/use-input-modality";
+import { useMotionAllowed } from "@/hooks/use-motion-allowed";
+import { confirmLeave, useUnsavedChanges } from "@/hooks/use-unsaved-changes";
 import { translateBackendError } from "@/lib/backend-errors";
-import { getProfileIcon } from "@/lib/browser-utils";
+import { getProfileIcon, getProfileNativeOs } from "@/lib/browser-utils";
 import { DNS_BLOCKLIST_LEVELS } from "@/lib/dns-blocklist-levels";
-import { formatRelativeTime } from "@/lib/flag-utils";
+import { MOTION_DURATION, MOTION_EASE_OUT, MOTION_SPRING } from "@/lib/motion";
+import { rotateProxyIps } from "@/lib/proxy-rotation";
+import { formatDuration, formatTimeAgo } from "@/lib/relative-time";
+import type { RemoteHandoffState } from "@/lib/remote-sessions";
+import { startPagesFromText } from "@/lib/start-pages";
 import { showErrorToast, showSuccessToast } from "@/lib/toast-utils";
+import { playUiSound } from "@/lib/ui-sounds";
 import { cn } from "@/lib/utils";
 import type {
   BrowserProfile,
@@ -91,6 +139,9 @@ import type {
 interface ProfileInfoDialogProps {
   isOpen: boolean;
   onClose: () => void;
+  presentation?: "modal" | "inspector";
+  openMethod?: "pointer" | "keyboard";
+  handoffState?: RemoteHandoffState | null;
   profile: BrowserProfile | null;
   storedProxies: StoredProxy[];
   vpnConfigs: VpnConfig[];
@@ -105,6 +156,7 @@ interface ProfileInfoDialogProps {
   onOpenDnsBlocklist?: (profile: BrowserProfile) => void;
   onOpenLaunchHook?: (profile: BrowserProfile) => void;
   onCloneProfile?: (profile: BrowserProfile) => void;
+  onSaveAsTemplate?: (profile: BrowserProfile) => void;
   onDeleteProfile?: (profile: BrowserProfile) => void;
   onLaunchWithSync?: (profile: BrowserProfile) => void;
   onSetPassword?: (profile: BrowserProfile) => void;
@@ -115,19 +167,11 @@ interface ProfileInfoDialogProps {
   isDisabled?: boolean;
   isCrossOs?: boolean;
   syncStatuses: Record<string, { status: string; error?: string }>;
-}
-
-function _OSIcon({ os }: { os: string }) {
-  switch (os) {
-    case "macos":
-      return <FaApple className="size-3.5" />;
-    case "windows":
-      return <FaWindows className="size-3.5" />;
-    case "linux":
-      return <FaLinux className="size-3.5" />;
-    default:
-      return null;
-  }
+  /** Launches a stopped profile or stops a running one, as the row does. */
+  onToggleRun?: () => void | Promise<unknown>;
+  canToggleRun?: boolean;
+  isLaunching?: boolean;
+  isStopping?: boolean;
 }
 
 function ClearOnCloseToggle({
@@ -140,6 +184,7 @@ function ClearOnCloseToggle({
   const { t } = useTranslation();
   const [enabled, setEnabled] = React.useState(profile.clear_on_close === true);
   const [saving, setSaving] = React.useState(false);
+  const { saved, flash } = useSavedFlash();
 
   React.useEffect(() => {
     setEnabled(profile.clear_on_close === true);
@@ -153,6 +198,7 @@ function ClearOnCloseToggle({
         profileId: profile.id,
         clearOnClose: next,
       });
+      flash();
     } catch (error) {
       setEnabled(!next);
       showErrorToast(translateBackendError(t, error));
@@ -162,10 +208,13 @@ function ClearOnCloseToggle({
   };
 
   return (
-    <div className="flex items-center gap-3 rounded-md border border-border bg-muted/40 px-3 py-2">
+    <div className="flex items-center gap-3 rounded-lg bg-foreground/4 px-3 py-2">
       <LuEraser className="size-4 shrink-0 text-muted-foreground" />
       <div className="min-w-0 flex-1">
-        <p className="text-sm font-medium">{t("clearOnClose.label")}</p>
+        <p className="flex items-center gap-2 text-sm font-medium">
+          {t("clearOnClose.label")}
+          <SavedNote saved={saved} className="font-normal" />
+        </p>
         <p className="text-[11px] text-muted-foreground">
           {t("clearOnClose.description")}
         </p>
@@ -180,11 +229,36 @@ function ClearOnCloseToggle({
   );
 }
 
-function InfoCard({ label, value }: { label: string; value: string }) {
+function InfoCard({
+  label,
+  value,
+  onClick,
+  disabled,
+}: {
+  label: string;
+  value: string;
+  onClick?: () => void;
+  disabled?: boolean;
+}) {
+  if (onClick)
+    return (
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={onClick}
+        className={cn(
+          "min-w-0 rounded-lg bg-foreground/4 px-3 py-2.5 text-left transition-colors hover:bg-foreground/7 disabled:opacity-50",
+          FOCUS_RING,
+        )}
+      >
+        <span className="block text-xs text-muted-foreground">{label}</span>
+        <span className="mt-0.5 block break-words text-sm">{value}</span>
+      </button>
+    );
   return (
-    <div className="rounded-md border bg-muted/50 px-3 py-2.5">
+    <div className="rounded-lg bg-foreground/4 px-3 py-2.5">
       <p className="text-xs text-muted-foreground">{label}</p>
-      <p className="mt-0.5 truncate text-sm">{value}</p>
+      <p className="mt-0.5 break-words text-sm">{value}</p>
     </div>
   );
 }
@@ -249,6 +323,54 @@ function LocalDataTransferCard({
   );
 }
 
+interface ProfileActivity {
+  launches: number;
+  run_seconds: number;
+  running_since?: number;
+}
+
+/** Launches and run time on this device; the open session counts too. */
+function ActivityCards({ profileId }: { profileId: string }) {
+  const { t, i18n } = useTranslation();
+  const [activity, setActivity] = React.useState<ProfileActivity | null>(null);
+
+  React.useEffect(() => {
+    let mounted = true;
+    invoke<ProfileActivity>("get_profile_activity", { profileId })
+      .then((next) => {
+        if (mounted) setActivity(next);
+      })
+      .catch(() => {
+        if (mounted) setActivity(null);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [profileId]);
+
+  const now = Math.floor(Date.now() / 1000);
+  const seconds = activity
+    ? activity.run_seconds +
+      (activity.running_since ? now - activity.running_since : 0)
+    : null;
+  return (
+    <>
+      <InfoCard
+        label={t("profileInfo.fields.totalSessions")}
+        value={
+          activity
+            ? new Intl.NumberFormat(i18n.language).format(activity.launches)
+            : "—"
+        }
+      />
+      <InfoCard
+        label={t("profileInfo.fields.runTime")}
+        value={seconds === null ? "—" : formatDuration(seconds, i18n.language)}
+      />
+    </>
+  );
+}
+
 // Shown only for legacy profiles that predate the feature and have no stored
 // color yet (new profiles get a backend-derived one at creation/launch).
 const DEFAULT_SWATCH_COLOR = "#94a3b8";
@@ -256,6 +378,7 @@ const DEFAULT_SWATCH_COLOR = "#94a3b8";
 function WindowColorSwatch({ profile }: { profile: BrowserProfile }) {
   const { t } = useTranslation();
   const [color, setColor] = React.useState(profile.window_color);
+  const { saved, flash } = useSavedFlash();
 
   React.useEffect(() => {
     setColor(profile.window_color);
@@ -268,56 +391,299 @@ function WindowColorSwatch({ profile }: { profile: BrowserProfile }) {
           profileId: profile.id,
           windowColor: hex,
         });
-      } catch {
+        flash();
+      } catch (error) {
         setColor(profile.window_color);
+        showErrorToast(translateBackendError(t, error));
       }
     },
-    [profile.id, profile.window_color],
+    [profile.id, profile.window_color, flash, t],
   );
 
   return (
-    <Popover
-      onOpenChange={(open) => {
-        if (!open && color && color !== profile.window_color)
-          void persist(color);
-      }}
-    >
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          aria-label={t("profileInfo.fields.windowColor")}
-          title={t("profileInfo.fields.windowColor")}
-          className="size-9 shrink-0 cursor-pointer rounded-lg border shadow-sm ring-offset-background transition-transform hover:scale-105 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
-          style={{ backgroundColor: color ?? DEFAULT_SWATCH_COLOR }}
-        />
-      </PopoverTrigger>
-      <PopoverContent align="end" sideOffset={6} className="w-[264px] p-3">
-        <ColorPicker
-          className="rounded-md border bg-background p-3 shadow-sm"
-          value={color ?? DEFAULT_SWATCH_COLOR}
-          onColorChange={([r, g, b]) => {
-            setColor(Color({ r, g, b }).hex().toLowerCase());
-          }}
-        >
-          <ColorPickerSelection className="h-32 rounded" />
-          <div className="mt-3 flex items-center gap-3">
-            <ColorPickerEyeDropper />
-            <ColorPickerHue className="flex-1" />
-          </div>
-          <div className="mt-3 flex items-center gap-2">
-            <ColorPickerOutput />
-            <ColorPickerFormat />
-          </div>
-        </ColorPicker>
-      </PopoverContent>
-    </Popover>
+    <div className="flex shrink-0 flex-col items-center gap-1">
+      <Popover
+        onOpenChange={(open) => {
+          if (!open && color && color !== profile.window_color)
+            void persist(color);
+        }}
+      >
+        <PopoverTrigger asChild>
+          <button
+            type="button"
+            aria-label={t("profileInfo.fields.windowColor")}
+            title={t("profileInfo.fields.windowColor")}
+            className={cn(
+              "size-9 shrink-0 cursor-pointer rounded-lg border shadow-sm",
+              FOCUS_RING,
+            )}
+            style={{ backgroundColor: color ?? DEFAULT_SWATCH_COLOR }}
+          />
+        </PopoverTrigger>
+        <PopoverContent align="end" sideOffset={6} className="w-[264px] p-3">
+          <ColorPicker
+            className="rounded-md border bg-background p-3 shadow-sm"
+            value={color ?? DEFAULT_SWATCH_COLOR}
+            onColorChange={([r, g, b]) => {
+              setColor(Color({ r, g, b }).hex().toLowerCase());
+            }}
+          >
+            <ColorPickerSelection className="h-32 rounded" />
+            <div className="mt-3 flex items-center gap-3">
+              <ColorPickerEyeDropper />
+              <ColorPickerHue className="flex-1" />
+            </div>
+            <div className="mt-3 flex items-center gap-2">
+              <ColorPickerOutput />
+              <ColorPickerFormat />
+            </div>
+          </ColorPicker>
+        </PopoverContent>
+      </Popover>
+      {saved ? (
+        <SavedNote saved />
+      ) : (
+        <span className="max-w-20 text-center text-[11px] text-muted-foreground">
+          {t("profileInfo.fields.windowColor")}
+        </span>
+      )}
+    </div>
   );
 }
 
-export function ProfileInfoDialog({
+function profileInfoFocusSurfaces(surface: HTMLElement): HTMLElement[] {
+  const surfaces = [surface];
+  const seen = new Set<HTMLElement>(surfaces);
+  for (let index = 0; index < surfaces.length; index++) {
+    for (const trigger of surfaces[index].querySelectorAll(
+      '[aria-expanded="true"][aria-controls]',
+    )) {
+      for (const id of trigger.getAttribute("aria-controls")?.split(/\s+/) ??
+        []) {
+        const popup = surface.ownerDocument.getElementById(id);
+        if (popup && !seen.has(popup)) {
+          seen.add(popup);
+          surfaces.push(popup);
+        }
+      }
+    }
+  }
+  return surfaces;
+}
+
+export function ProfileInfoDialog(props: ProfileInfoDialogProps) {
+  const { t } = useTranslation();
+  const motionAllowed = useMotionAllowed();
+  const inputModality = useInputModality();
+  const {
+    isOpen,
+    onClose,
+    profile,
+    presentation = "modal",
+    openMethod = inputModality,
+  } = props;
+  const [section, setSection] = React.useState<ProfileSection>("overview");
+  // Every way out of the panel, and every section switch, asks first when a
+  // section keeps a draft that is not saved.
+  const requestClose = React.useCallback(async () => {
+    if (await confirmLeave()) onClose();
+  }, [onClose]);
+  const requestSection = React.useCallback(
+    async (next: ProfileSection) => {
+      if (next === section) return;
+      if (await confirmLeave()) setSection(next);
+    },
+    [section],
+  );
+  const surfaceRef = React.useRef<HTMLDivElement>(null);
+  const returnFocusRef = React.useRef<HTMLElement | null>(null);
+  const titleId = React.useId();
+  const isModal = presentation === "modal";
+  const previousProfileId = React.useRef(profile?.id);
+  FocusGuards.useFocusGuards();
+
+  React.useLayoutEffect(() => {
+    if (!isOpen) return;
+    const activeElement = document.activeElement;
+    if (
+      activeElement instanceof HTMLElement &&
+      !surfaceRef.current?.contains(activeElement)
+    ) {
+      returnFocusRef.current = activeElement;
+    }
+  }, [isOpen]);
+
+  React.useEffect(() => {
+    if (!isOpen || !isModal || !surfaceRef.current) return;
+    // An open picker may already hide the inspector itself. Keep its owned
+    // portal accessible while that picker continues to manage its own layer.
+    return hideOthers(profileInfoFocusSurfaces(surfaceRef.current));
+  }, [isOpen, isModal]);
+
+  React.useLayoutEffect(() => {
+    const changedProfile = previousProfileId.current !== profile?.id;
+    previousProfileId.current = profile?.id;
+    if (isOpen && changedProfile && openMethod === "keyboard") {
+      surfaceRef.current
+        ?.querySelector<HTMLElement>('[aria-current="location"]')
+        ?.focus({ preventScroll: true });
+    }
+  }, [isOpen, openMethod, profile?.id]);
+
+  React.useLayoutEffect(() => {
+    const surface = surfaceRef.current;
+    if (
+      isOpen &&
+      isModal &&
+      surface &&
+      !profileInfoFocusSurfaces(surface).some((node) =>
+        node.contains(document.activeElement),
+      )
+    ) {
+      surface
+        .querySelector<HTMLElement>('[aria-current="location"]')
+        ?.focus({ preventScroll: true });
+    }
+  }, [isOpen, isModal]);
+
+  const restoreFocus = (event: Event) => {
+    event.preventDefault();
+    const activeElement = document.activeElement;
+    const returnTarget =
+      returnFocusRef.current?.isConnected &&
+      returnFocusRef.current !== document.body
+        ? returnFocusRef.current
+        : Array.from(
+            document.querySelectorAll<HTMLElement>(
+              '[data-slot="profile-inspect-trigger"]',
+            ),
+          ).find((trigger) => trigger.dataset.profileId === profile?.id);
+    // A profile action may have opened another dialog. Its focus wins.
+    if (
+      returnTarget &&
+      (activeElement === document.body ||
+        (activeElement instanceof Node &&
+          surfaceRef.current?.contains(activeElement)))
+    ) {
+      returnTarget.focus({ preventScroll: true });
+    }
+  };
+
+  if (!profile || !isOpen) return null;
+
+  // Dialog.Content changes component type when modal changes. Composing the
+  // same Radix primitives keeps the form DOM and drafts through window resizes.
+  return (
+    <DialogPrimitive.Root
+      open={isOpen}
+      modal={isModal}
+      onOpenChange={(open) => {
+        if (!open) void requestClose();
+      }}
+    >
+      {isModal && (
+        <div
+          data-slot="dialog-overlay"
+          className="pointer-events-auto fixed inset-0 z-9999 bg-background/50"
+        >
+          <div
+            data-tauri-drag-region
+            data-window-drag-area="true"
+            aria-hidden="true"
+            className="absolute inset-x-0 top-0 h-11"
+          />
+          <WindowDragArea />
+        </div>
+      )}
+      <FocusScope.Root
+        asChild
+        trapped={isModal}
+        loop={isModal}
+        onMountAutoFocus={(event) => {
+          event.preventDefault();
+          if (isModal || openMethod === "keyboard") {
+            surfaceRef.current
+              ?.querySelector<HTMLElement>('[aria-current="location"]')
+              ?.focus({ preventScroll: true });
+          }
+        }}
+        onUnmountAutoFocus={restoreFocus}
+      >
+        <DismissableLayer.Root
+          asChild
+          disableOutsidePointerEvents={isModal}
+          deferPointerDownOutside
+          onDismiss={() => void requestClose()}
+          onFocusOutside={(event) => event.preventDefault()}
+          onPointerDownOutside={(event) => {
+            const original = event.detail.originalEvent;
+            if (
+              original.button === 2 ||
+              (original.button === 0 && original.ctrlKey)
+            ) {
+              event.preventDefault();
+            }
+          }}
+          onInteractOutside={(event) => {
+            if (!isModal) event.preventDefault();
+            const target = event.target;
+            if (target instanceof Element) {
+              if (target.closest('[data-window-drag-area="true"]')) {
+                event.preventDefault();
+              }
+              const trigger = target.closest<HTMLElement>(
+                '[data-slot="profile-inspect-trigger"]',
+              );
+              if (trigger) returnFocusRef.current = trigger;
+            }
+          }}
+        >
+          <motion.div
+            ref={surfaceRef}
+            role="dialog"
+            aria-modal={isModal || undefined}
+            aria-labelledby={titleId}
+            data-slot={isModal ? "dialog-content" : "profile-inspector"}
+            data-profile-id={profile.id}
+            // The table's inspector slot slides in from x 24 on the same
+            // spring, so only the modal enters by itself: it grows from its
+            // center.
+            initial={
+              motionAllowed && openMethod !== "keyboard" && isModal
+                ? { scale: 0.97 }
+                : false
+            }
+            animate={{ scale: 1 }}
+            transition={MOTION_SPRING.page}
+            className={cn(
+              "@container/profile-info flex min-h-0 min-w-0 shrink-0 flex-col overflow-hidden rounded-lg bg-card text-card-foreground",
+              isModal
+                ? "fixed top-1/2 left-1/2 z-10000 h-[min(clamp(30rem,80vh,48rem),calc(100vh-3rem))] w-[calc(100%-2rem)] max-w-[60rem] -translate-1/2"
+                : "h-full w-[29rem]",
+            )}
+          >
+            <DialogPrimitive.Title id={titleId} className="sr-only">
+              {t("profileInfo.title")}: {profile.name}
+            </DialogPrimitive.Title>
+            <ProfileInfoContents
+              key={profile.id}
+              {...props}
+              onRequestClose={requestClose}
+              section={section}
+              onSectionChange={(next) => void requestSection(next)}
+            />
+          </motion.div>
+        </DismissableLayer.Root>
+      </FocusScope.Root>
+    </DialogPrimitive.Root>
+  );
+}
+
+function ProfileInfoContents({
   isOpen,
   onClose,
   profile,
+  handoffState,
   storedProxies,
   vpnConfigs,
   onOpenTrafficDialog,
@@ -331,6 +697,7 @@ export function ProfileInfoDialog({
   onOpenDnsBlocklist,
   onOpenLaunchHook,
   onCloneProfile,
+  onSaveAsTemplate,
   onDeleteProfile,
   onLaunchWithSync,
   onSetPassword,
@@ -341,7 +708,18 @@ export function ProfileInfoDialog({
   isDisabled = false,
   isCrossOs = false,
   syncStatuses,
-}: ProfileInfoDialogProps) {
+  onToggleRun,
+  canToggleRun = true,
+  isLaunching = false,
+  isStopping = false,
+  onRequestClose,
+  section,
+  onSectionChange,
+}: ProfileInfoDialogProps & {
+  onRequestClose: () => Promise<void>;
+  section: ProfileSection;
+  onSectionChange: (section: ProfileSection) => void;
+}) {
   const { t } = useTranslation();
   const [copied, setCopied] = React.useState(false);
   const [groupName, setGroupName] = React.useState<string | null>(null);
@@ -350,24 +728,29 @@ export function ProfileInfoDialog({
   >(null);
 
   React.useEffect(() => {
+    let current = true;
+    setGroupName(null);
     if (!isOpen || !profile?.group_id) {
-      setGroupName(null);
       return;
     }
     void (async () => {
       try {
         const groups = await invoke<ProfileGroup[]>("get_groups");
         const group = groups.find((g) => g.id === profile.group_id);
-        setGroupName(group?.name ?? null);
+        if (current) setGroupName(group?.name ?? null);
       } catch {
-        setGroupName(null);
+        if (current) setGroupName(null);
       }
     })();
+    return () => {
+      current = false;
+    };
   }, [isOpen, profile?.group_id]);
 
   React.useEffect(() => {
+    let current = true;
+    setExtensionGroupName(null);
     if (!isOpen || !profile?.extension_group_id) {
-      setExtensionGroupName(null);
       return;
     }
     void (async () => {
@@ -376,11 +759,14 @@ export function ProfileInfoDialog({
           "get_extension_group_for_profile",
           { profileId: profile.id },
         );
-        setExtensionGroupName(group?.name ?? null);
+        if (current) setExtensionGroupName(group?.name ?? null);
       } catch {
-        setExtensionGroupName(null);
+        if (current) setExtensionGroupName(null);
       }
     })();
+    return () => {
+      current = false;
+    };
   }, [isOpen, profile?.extension_group_id, profile?.id]);
 
   React.useEffect(() => {
@@ -415,22 +801,25 @@ export function ProfileInfoDialog({
   const handleCopyId = async () => {
     try {
       await navigator.clipboard.writeText(profile.id);
+      playUiSound("copy");
       setCopied(true);
       setTimeout(() => {
         setCopied(false);
       }, 2000);
     } catch {
-      // ignore
+      // The clipboard refused; the id stays on screen to select by hand.
     }
   };
 
+  // An action that opens another surface closes the panel, so a draft gets
+  // its Save, Discard or Stay first.
   const handleAction = (action: () => void) => {
-    onClose();
-    action();
+    void (async () => {
+      if (!(await confirmLeave())) return;
+      onClose();
+      action();
+    })();
   };
-
-  const hasTags = profile.tags && profile.tags.length > 0;
-  const hasNote = !!profile.note;
 
   // Items in the settings tab `actions` list MUST only open another dialog
   // (or trigger a navigation/action that closes this one). Do NOT put inline
@@ -475,6 +864,7 @@ export function ProfileInfoDialog({
       hidden: profile.ephemeral === true,
     },
     {
+      id: "group",
       icon: <LuGroup className="size-4" />,
       label: t("profiles.actions.assignToGroup"),
       onClick: () => {
@@ -497,6 +887,7 @@ export function ProfileInfoDialog({
       hidden: !isFingerprintBrowser || !onConfigureWayfern,
     },
     {
+      id: "synchronizer",
       icon: <LuUsers className="size-4" />,
       label: t("profiles.synchronizer.launchWithSync"),
       onClick: () => {
@@ -541,6 +932,15 @@ export function ProfileInfoDialog({
       disabled: isDisabled,
       runningBadge: isRunning,
       hidden: profile.ephemeral === true,
+    },
+    {
+      id: "saveTemplate",
+      icon: <LuLayoutTemplate className="size-4" />,
+      label: t("templates.saveCurrent"),
+      onClick: () => {
+        handleAction(() => onSaveAsTemplate?.(profile));
+      },
+      hidden: !onSaveAsTemplate,
     },
     {
       id: "extension",
@@ -625,47 +1025,51 @@ export function ProfileInfoDialog({
   const visibleActions = actions.filter((a) => !a.hidden);
 
   return (
-    <Dialog
-      open={isOpen}
-      onOpenChange={(open) => {
-        if (!open) onClose();
-      }}
-    >
-      <DialogContent
-        hideClose
-        className="flex h-[min(clamp(30rem,80vh,48rem),calc(100vh-3rem))] max-w-[min(60rem,calc(100%-4rem))] flex-col gap-0 overflow-hidden p-0"
-      >
-        {/* The dialog renders its own custom header, so the accessible title is
-            visually hidden but present for screen readers (Radix requires it). */}
-        <DialogTitle className="sr-only">{t("profileInfo.title")}</DialogTitle>
-        <ProfileInfoLayout
-          profile={profile}
-          ProfileIcon={ProfileIcon}
-          isRunning={isRunning}
-          isDisabled={isDisabled}
-          networkLabel={networkLabel}
-          groupName={groupName}
-          extensionGroupName={extensionGroupName}
-          syncMode={syncMode}
+    <ProfileInfoLayout
+      profile={profile}
+      ProfileIcon={ProfileIcon}
+      isRunning={isRunning}
+      isDisabled={isDisabled}
+      networkLabel={networkLabel}
+      groupName={groupName}
+      extensionGroupName={extensionGroupName}
+      syncMode={syncMode}
+      syncStatus={syncStatus}
+      handoffStatus={
+        <ProfileHandoffStatus
+          profileId={profile.id}
+          state={handoffState ?? null}
           syncStatus={syncStatus}
-          storedProxies={storedProxies}
-          vpnConfigs={vpnConfigs}
-          hasTags={hasTags}
-          hasNote={hasNote}
-          copied={copied}
-          handleCopyId={handleCopyId}
-          onClose={onClose}
-          onCloneProfile={onCloneProfile}
-          onKillProfile={undefined}
-          visibleActions={visibleActions}
-          t={t}
+          onOpenSync={
+            onOpenProfileSyncDialog
+              ? () => handleAction(() => onOpenProfileSyncDialog(profile))
+              : undefined
+          }
         />
-      </DialogContent>
-    </Dialog>
+      }
+      storedProxies={storedProxies}
+      vpnConfigs={vpnConfigs}
+      copied={copied}
+      handleCopyId={handleCopyId}
+      onClose={() => void onRequestClose()}
+      onCloneProfile={onCloneProfile}
+      handoffState={handoffState ?? null}
+      crossOsUnlocked={crossOsUnlocked}
+      onToggleRun={onToggleRun}
+      canToggleRun={canToggleRun}
+      isLaunching={isLaunching}
+      isStopping={isStopping}
+      visibleActions={visibleActions}
+      section={section}
+      onSectionChange={onSectionChange}
+      t={t}
+    />
   );
 }
 
 interface ProfileInfoLayoutProps {
+  section: ProfileSection;
+  onSectionChange: (section: ProfileSection) => void;
   profile: BrowserProfile;
   ProfileIcon: React.ComponentType<{ className?: string }>;
   isRunning: boolean;
@@ -675,15 +1079,19 @@ interface ProfileInfoLayoutProps {
   extensionGroupName: string | null;
   syncMode: string;
   syncStatus: { status: string; error?: string } | undefined;
-  hasTags: boolean | undefined;
-  hasNote: boolean;
+  handoffStatus: React.ReactNode;
   copied: boolean;
   storedProxies: StoredProxy[];
   vpnConfigs: VpnConfig[];
   handleCopyId: () => Promise<void>;
   onClose: () => void;
   onCloneProfile?: (profile: BrowserProfile) => void;
-  onKillProfile?: (profile: BrowserProfile) => void;
+  handoffState: RemoteHandoffState | null;
+  crossOsUnlocked: boolean;
+  onToggleRun?: () => void | Promise<unknown>;
+  canToggleRun: boolean;
+  isLaunching: boolean;
+  isStopping: boolean;
   visibleActions: {
     id?: string;
     icon: React.ReactNode;
@@ -701,14 +1109,20 @@ type ProfileSection =
   | "overview"
   | "fingerprint"
   | "network"
+  | "startPages"
   | "cookies"
   | "extensions"
   | "sync"
   | "automation"
+  | "requests"
+  | "logs"
+  | "transfer"
   | "security"
-  | "delete";
+  | "twoFactor";
 
 function ProfileInfoLayout({
+  section: requestedSection,
+  onSectionChange,
   profile,
   ProfileIcon,
   isRunning,
@@ -718,18 +1132,31 @@ function ProfileInfoLayout({
   extensionGroupName,
   syncMode,
   syncStatus,
+  handoffStatus,
   storedProxies,
   vpnConfigs,
-  hasTags,
-  hasNote,
   copied,
   handleCopyId,
   onClose,
   onCloneProfile,
+  handoffState,
+  crossOsUnlocked,
+  onToggleRun,
+  canToggleRun,
+  isLaunching,
+  isStopping,
   visibleActions,
   t,
 }: ProfileInfoLayoutProps) {
-  const [section, setSection] = React.useState<ProfileSection>("overview");
+  const { i18n } = useTranslation();
+  const contentId = React.useId();
+  const motionAllowed = useMotionAllowed();
+  const [unlocked, recheckUnlocked] = useProfileUnlocked(profile, isRunning);
+  const canLock = unlocked && !isRunning && !isLaunching && !isStopping;
+  const lockNow = async () => {
+    if (await lockProfileNow(profile, t as never)) recheckUnlocked();
+  };
+  const canRunRemote = useCanRunRemote(profile, isRunning, handoffState);
 
   // Map sidebar items to existing actions by their stable, language-independent
   // `id`, so clicking a section triggers the existing dialog handler. Matching
@@ -753,11 +1180,9 @@ function ProfileInfoLayout({
   const cookiesCopyAction = findAction("cookiesCopy");
   const cookiesAction = cookiesManageAction ?? cookiesCopyAction;
   const extensionAction = findAction("extension");
+  const saveTemplateAction = findAction("saveTemplate");
   const syncAction = findAction("sync");
-  const _launchHookAction = findAction("hook");
-  const _networkAction = findAction("network");
-  // Password actions are no longer routed via the legacy action handlers —
-  // SecuritySectionInline writes directly to the backend instead.
+  const synchronizerAction = findAction("synchronizer");
 
   // Cookie count is fetched at the layout level so the sidebar badge can
   // surface it without waiting for the user to open the Cookies section.
@@ -819,6 +1244,14 @@ function ProfileInfoLayout({
       badge: profile.proxy_id || profile.vpn_id ? networkLabel : undefined,
     },
     {
+      id: "startPages",
+      icon: <LuHouse className="size-3.5" />,
+      label: t("profileInfo.sections.startPages"),
+      badge: profile.start_urls?.length
+        ? String(profile.start_urls.length)
+        : undefined,
+    },
+    {
       id: "cookies",
       icon: <LuCookie className="size-3.5" />,
       label: t("profileInfo.sections.cookies"),
@@ -848,50 +1281,125 @@ function ProfileInfoLayout({
       badge: profile.launch_hook ? t("profileInfo.badges.active") : undefined,
     },
     {
+      id: "requests",
+      icon: <LuActivity className="size-3.5" />,
+      label: t("profileInfo.sections.requests"),
+      hidden: !isWayfernProfile,
+    },
+    {
+      id: "logs",
+      icon: <LuScrollText className="size-3.5" />,
+      label: t("profileInfo.sections.logs"),
+    },
+    {
+      id: "transfer",
+      icon: <LuDownload className="size-3.5" />,
+      label: t("profileInfo.sections.transfer"),
+      // Nothing to carry: an ephemeral profile keeps no data between launches
+      // and a temporary one is deleted when its browser stops.
+      hidden: isEphemeral || profile.temporary === true,
+    },
+    {
       id: "security",
       icon: <LuKey className="size-3.5" />,
       label: t("profileInfo.sections.security"),
     },
+    {
+      id: "twoFactor",
+      icon: <LuKeyRound className="size-3.5" />,
+      label: t("profileInfo.sections.twoFactor"),
+    },
   ];
+  const section = sidebarItems.some(
+    (item) => item.id === requestedSection && !item.hidden,
+  )
+    ? requestedSection
+    : "overview";
+
+  // A section switch slides in from the side of the section it came from.
+  const sectionOrder = sidebarItems
+    .filter((it) => !it.hidden)
+    .map((it) => it.id);
+  const lastSection = React.useRef(section);
+  const slideFrom = React.useRef(0);
+  if (lastSection.current !== section) {
+    slideFrom.current =
+      sectionOrder.indexOf(section) >= sectionOrder.indexOf(lastSection.current)
+        ? 1
+        : -1;
+    lastSection.current = section;
+  }
+
+  const runningHere = isRunning && handoffState !== "running";
 
   return (
-    <>
+    <SoftFields>
       {/* Top bar */}
-      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-3">
+      <div className="flex min-h-11 shrink-0 items-center gap-1.5 px-3 py-2">
         <LuUsers className="size-3.5 shrink-0 text-muted-foreground" />
         <div className="flex min-w-0 flex-1 items-center gap-1.5 text-xs">
           <span className="font-semibold">
             {t("profileInfo.breadcrumbRoot")}
           </span>
           <span className="text-muted-foreground">/</span>
-          <span className="truncate text-muted-foreground">{profile.name}</span>
+          <span className="truncate text-muted-foreground" title={profile.name}>
+            {profile.name}
+          </span>
         </div>
-        {onCloneProfile && (
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-7 gap-1.5 px-2 text-xs"
-            disabled={isDisabled}
-            onClick={() => onCloneProfile(profile)}
-          >
-            <LuCopy className="size-3" />
-            {t("profileInfo.duplicate")}
-          </Button>
+        {canRunRemote && <RunInCloudButton profile={profile} />}
+        {onToggleRun && (
+          <RunToggleButton
+            profile={profile}
+            isRunning={isRunning}
+            isLaunching={isLaunching}
+            isStopping={isStopping}
+            canToggle={canToggleRun}
+            onToggle={onToggleRun}
+          />
         )}
+        <ProfileMoreMenu
+          profile={profile}
+          onDuplicate={
+            onCloneProfile ? () => onCloneProfile(profile) : undefined
+          }
+          duplicateDisabled={isDisabled}
+          onSaveTemplate={saveTemplateAction?.onClick}
+          saveTemplateLabel={saveTemplateAction?.label}
+          onLock={canLock ? () => void lockNow() : undefined}
+          onDelete={deleteAction?.onClick}
+          deleteDisabled={deleteAction?.disabled}
+        />
         <button
           type="button"
-          aria-label={t("common.buttons.close")}
+          data-slot="profile-info-close"
+          aria-label={t("profileInfo.aria.close", { name: profile.name })}
           onClick={onClose}
-          className="grid size-7 place-items-center rounded-md text-muted-foreground transition-colors duration-100 hover:bg-accent hover:text-accent-foreground"
+          className={cn(
+            "grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors duration-100 hover:bg-foreground/6 hover:text-foreground",
+            FOCUS_RING,
+          )}
         >
           <LuX className="size-3.5" />
         </button>
       </div>
 
+      {runningHere && (
+        <RunningBanner
+          profile={profile}
+          canStop={canToggleRun}
+          isStopping={isStopping}
+          onStop={onToggleRun}
+        />
+      )}
+
       {/* Body */}
-      <div className="flex min-h-0 flex-1">
+      <div className="flex min-h-0 flex-1 flex-col @[40rem]/profile-info:flex-row">
         {/* Sidebar */}
-        <nav className="flex w-44 shrink-0 flex-col gap-0.5 overflow-y-auto border-r border-border p-2">
+        <nav
+          aria-label={t("profileMotion.inspectorSections")}
+          data-slot="profile-info-sections"
+          className="flex max-h-[40%] shrink-0 flex-wrap gap-1 overflow-y-auto px-3 py-2 @[40rem]/profile-info:max-h-none @[40rem]/profile-info:w-44 @[40rem]/profile-info:flex-col @[40rem]/profile-info:flex-nowrap @[40rem]/profile-info:px-2"
+        >
           {sidebarItems
             .filter((it) => !it.hidden)
             .map((it) => {
@@ -900,329 +1408,386 @@ function ProfileInfoLayout({
                 <button
                   key={it.id}
                   type="button"
-                  onClick={() => setSection(it.id)}
+                  data-slot="profile-info-section"
+                  data-section={it.id}
+                  aria-current={active ? "location" : undefined}
+                  aria-controls={contentId}
+                  onClick={() => onSectionChange(it.id)}
                   className={cn(
-                    "flex h-7 items-center gap-2 rounded-md px-2 text-left text-xs transition-colors duration-100",
+                    "relative isolate flex min-h-8 max-w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors duration-100",
+                    FOCUS_RING,
                     active
-                      ? "bg-accent text-accent-foreground"
-                      : "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
+                      ? "text-foreground"
+                      : "text-muted-foreground hover:bg-foreground/5 hover:text-foreground",
                   )}
                 >
+                  {active && (
+                    <motion.span
+                      aria-hidden="true"
+                      layoutId={
+                        motionAllowed
+                          ? "profile-info-active-section"
+                          : undefined
+                      }
+                      transition={MOTION_SPRING.position}
+                      className="absolute inset-0 -z-10 rounded-md bg-foreground/8"
+                    />
+                  )}
                   <span className="shrink-0">{it.icon}</span>
-                  <span className="flex-1 truncate">{it.label}</span>
+                  <span className="min-w-0 flex-1 break-words">{it.label}</span>
                   {it.badge && (
-                    <span className="max-w-[60px] truncate text-[9px] tracking-wide text-muted-foreground uppercase">
+                    <span
+                      title={it.badge}
+                      className={cn(
+                        "hidden max-w-[64px] truncate text-[11px] @[40rem]/profile-info:inline",
+                        active ? "opacity-80" : "text-muted-foreground",
+                      )}
+                    >
                       {it.badge}
                     </span>
                   )}
                 </button>
               );
             })}
-          {deleteAction && (
-            <>
-              <div className="my-1 h-px bg-border" />
-              <button
-                type="button"
-                onClick={deleteAction.onClick}
-                disabled={deleteAction.disabled}
-                className="flex h-7 items-center gap-2 rounded-md px-2 text-xs text-destructive-text transition-colors duration-100 hover:bg-destructive/10 disabled:pointer-events-none disabled:opacity-50"
-              >
-                <LuTrash2 className="size-3.5 shrink-0" />
-                <span className="flex-1 text-left">
-                  {t("profileInfo.sections.delete")}
-                </span>
-              </button>
-            </>
-          )}
         </nav>
 
         {/* Main */}
-        <div className="scroll-fade min-w-0 flex-1 overflow-y-auto p-4">
-          {section === "overview" && (
-            <div className="flex flex-col gap-3">
-              {/* Hero */}
-              <div className="flex items-center gap-3">
-                <div className="shrink-0 rounded-lg bg-muted p-2.5">
-                  <ProfileIcon className="size-7 text-foreground" />
-                </div>
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-1.5">
-                    <h3 className="truncate text-base font-semibold">
-                      {profile.name}
-                    </h3>
+        <div
+          id={contentId}
+          data-slot="profile-info-content"
+          data-profile-id={profile.id}
+          data-section={section}
+          className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto overscroll-contain p-4"
+        >
+          <motion.div
+            key={section}
+            data-slot="profile-info-section-body"
+            initial={
+              motionAllowed && slideFrom.current !== 0
+                ? { x: 8 * slideFrom.current }
+                : false
+            }
+            animate={{ x: 0 }}
+            transition={{
+              duration: MOTION_DURATION.base,
+              ease: MOTION_EASE_OUT,
+            }}
+            className="flex min-h-full flex-none flex-col"
+          >
+            {section === "overview" && (
+              <div className="flex flex-col gap-3">
+                {/* Hero */}
+                <div className="flex items-center gap-3">
+                  <ProfileIcon className="size-7 shrink-0 text-foreground" />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-1.5">
+                      <h3 className="break-words text-base font-semibold">
+                        {profile.name}
+                      </h3>
+                    </div>
+                    <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px]">
+                      <span className="font-mono text-muted-foreground">
+                        {profile.version}
+                      </span>
+                    </div>
                   </div>
-                  <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px]">
-                    <span className="font-mono text-muted-foreground">
-                      {profile.version}
-                    </span>
-                  </div>
+                  <WindowColorSwatch profile={profile} />
                 </div>
-                <WindowColorSwatch profile={profile} />
-              </div>
 
-              {/* ID */}
-              <div className="flex items-center gap-2 rounded-md border border-border bg-muted/40 px-3 py-2">
-                <span className="shrink-0 text-[10px] tracking-wide text-muted-foreground uppercase">
-                  ID
-                </span>
-                <span className="flex-1 truncate font-mono text-xs">
-                  {profile.id}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => void handleCopyId()}
-                  className="shrink-0 text-muted-foreground transition-colors hover:text-foreground"
-                  aria-label={t("common.buttons.copy")}
-                >
-                  {copied ? (
-                    <LuClipboardCheck className="size-3.5" />
-                  ) : (
-                    <LuClipboard className="size-3.5" />
-                  )}
-                </button>
-              </div>
+                {handoffStatus}
+                <ProfileLaunchActivity
+                  profileId={profile.id}
+                  running={isRunning}
+                />
+                {!isEphemeral && (
+                  <SiteStoragePanel profile={profile} isRunning={isRunning} />
+                )}
 
-              {/* 2x2 cards */}
-              <div className="grid grid-cols-2 gap-2">
-                <InfoCard
-                  label={t("profileInfo.fields.group")}
-                  value={groupName ?? t("profileInfo.values.none")}
-                />
-                <InfoCard
-                  label={t("profileInfo.fields.proxyVpn")}
-                  value={networkLabel}
-                />
-                <InfoCard
-                  label={t("profileInfo.fields.tags")}
-                  value={
-                    hasTags
-                      ? (profile.tags ?? []).join(", ")
-                      : t("profileInfo.values.none")
-                  }
-                />
-                <InfoCard
-                  label={t("profileInfo.fields.note")}
-                  value={
-                    hasNote
-                      ? (profile.note ?? "")
-                      : t("profileInfo.values.none")
-                  }
-                />
-              </div>
+                {/* ID */}
+                <div className="flex items-center gap-2 rounded-lg bg-foreground/4 px-3 py-2">
+                  <span className="shrink-0 text-xs font-medium text-muted-foreground">
+                    {t("profiles.table.profileId")}
+                  </span>
+                  <span
+                    className="min-w-0 flex-1 truncate font-mono text-xs"
+                    title={profile.id}
+                  >
+                    {profile.id}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => void handleCopyId()}
+                    className={cn(
+                      "shrink-0 rounded-sm text-muted-foreground transition-colors hover:text-foreground",
+                      FOCUS_RING,
+                    )}
+                    aria-label={
+                      copied
+                        ? t("common.buttons.copied")
+                        : t("profileInfo.aria.copyId", { name: profile.name })
+                    }
+                  >
+                    {copied ? (
+                      <LuClipboardCheck className="size-3.5" />
+                    ) : (
+                      <LuClipboard className="size-3.5" />
+                    )}
+                  </button>
+                </div>
 
-              {/* Activity */}
-              <div className="mt-1 flex flex-col gap-1.5">
-                <span className="text-[10px] tracking-wide text-muted-foreground uppercase">
-                  {t("profileInfo.sections.activity")}
-                </span>
+                {/* 2x2 cards */}
                 <div className="grid grid-cols-2 gap-2">
                   <InfoCard
-                    label={t("profileInfo.fields.created")}
-                    value={
-                      profile.created_at
-                        ? new Date(profile.created_at * 1000).toLocaleString(
-                            undefined,
-                            { dateStyle: "medium", timeStyle: "short" },
-                          )
-                        : t("profileInfo.values.unknown")
-                    }
+                    label={t("profileInfo.fields.group")}
+                    value={groupName ?? t("profileInfo.values.none")}
+                    onClick={findAction("group")?.onClick}
+                    disabled={findAction("group")?.disabled}
                   />
                   <InfoCard
-                    label={t("profileInfo.fields.lastLaunched")}
-                    value={
-                      isRunning
-                        ? t("profileInfo.values.activeNow")
-                        : profile.last_launch
-                          ? formatRelativeTime(profile.last_launch)
-                          : t("profileInfo.values.never")
-                    }
+                    label={t("profileInfo.fields.proxyVpn")}
+                    value={networkLabel}
+                    onClick={() => onSectionChange("network")}
                   />
-                  <LocalDataTransferCard profileId={profile.id} t={t} />
+                  <ProfileMetadataCard
+                    key={`${profile.id}:tags`}
+                    profile={profile}
+                    field="tags"
+                    disabled={isDisabled}
+                  />
+                  <ProfileMetadataCard
+                    key={`${profile.id}:note`}
+                    profile={profile}
+                    field="note"
+                    disabled={isDisabled}
+                  />
                 </div>
+
+                {/* Activity */}
+                <div className="mt-1 flex flex-col gap-1.5">
+                  <span className="text-xs font-medium text-muted-foreground">
+                    {t("profileInfo.sections.activity")}
+                  </span>
+                  <div className="grid grid-cols-2 gap-2">
+                    <InfoCard
+                      label={t("profileInfo.fields.created")}
+                      value={
+                        profile.created_at
+                          ? new Date(profile.created_at * 1000).toLocaleString(
+                              undefined,
+                              { dateStyle: "medium", timeStyle: "short" },
+                            )
+                          : t("profileInfo.values.unknown")
+                      }
+                    />
+                    <InfoCard
+                      label={t("profileInfo.fields.lastLaunched")}
+                      value={
+                        isRunning
+                          ? t("profileInfo.values.activeNow")
+                          : profile.last_launch
+                            ? formatTimeAgo(
+                                profile.last_launch,
+                                Math.floor(Date.now() / 1000),
+                                i18n.language,
+                              )
+                            : t("profileInfo.values.never")
+                      }
+                    />
+                    {/* Read again when the browser starts or stops. */}
+                    <ActivityCards
+                      key={`${profile.id}:${isRunning}`}
+                      profileId={profile.id}
+                    />
+                    <LocalDataTransferCard profileId={profile.id} t={t} />
+                  </div>
+                </div>
+
+                {!profile.ephemeral && !profile.password_protected && (
+                  <ClearOnCloseToggle
+                    profile={profile}
+                    isDisabled={isDisabled}
+                  />
+                )}
+
+                {profile.created_by_email && (
+                  <div className="rounded-lg bg-foreground/4 px-3 py-2">
+                    <p className="text-xs font-medium text-muted-foreground">
+                      {t("sync.team.title")}
+                    </p>
+                    <p className="mt-0.5 text-sm">
+                      {t("sync.team.createdBy", {
+                        email: profile.created_by_email,
+                      })}
+                    </p>
+                  </div>
+                )}
               </div>
+            )}
 
-              {!profile.ephemeral && !profile.password_protected && (
-                <ClearOnCloseToggle profile={profile} isDisabled={isDisabled} />
-              )}
-
-              {profile.created_by_email && (
-                <div className="rounded-md border border-border bg-muted/40 px-3 py-2">
-                  <p className="text-[10px] tracking-wide text-muted-foreground uppercase">
-                    {t("sync.team.title")}
-                  </p>
-                  <p className="mt-0.5 text-sm">
-                    {t("sync.team.createdBy", {
-                      email: profile.created_by_email,
-                    })}
-                  </p>
-                </div>
-              )}
-            </div>
-          )}
-
-          {section === "fingerprint" && (
-            <FingerprintSectionInline
-              profile={profile}
-              isDisabled={isDisabled}
-              crossOsUnlocked={Boolean(
-                // Re-derive: parent passes crossOsUnlocked but the layout
-                // doesn't get it; we get it implicitly via fingerprintAction's
-                // proBadge state. Default to false if action missing.
-                fingerprintAction && !fingerprintAction.proBadge,
-              )}
-              onSaved={onClose}
-              t={t}
-            />
-          )}
-
-          {section === "network" && (
-            <NetworkSectionInline
-              profile={profile}
-              storedProxies={storedProxies}
-              vpnConfigs={vpnConfigs}
-              isDisabled={isDisabled}
-              t={t}
-            />
-          )}
-
-          {section === "cookies" &&
-            (isEphemeral ? (
-              <EphemeralSectionNotice
-                title={t("profileInfo.sections.cookies")}
-                description={t("profileInfo.ephemeral.cookiesUnavailable")}
+            {section === "fingerprint" && (
+              <FingerprintSectionInline
+                profile={profile}
+                isDisabled={isDisabled}
+                crossOsUnlocked={crossOsUnlocked}
                 t={t}
               />
-            ) : (
-              <CookiesSectionInline
+            )}
+
+            {section === "network" && (
+              <NetworkSectionInline
+                profile={profile}
+                storedProxies={storedProxies}
+                vpnConfigs={vpnConfigs}
+                isDisabled={isDisabled}
+                t={t}
+              />
+            )}
+
+            {section === "startPages" && (
+              <StartPagesEditor
+                profile={profile}
+                isDisabled={isDisabled}
+                t={t}
+              />
+            )}
+
+            {section === "cookies" &&
+              (isEphemeral ? (
+                <EphemeralSectionNotice
+                  title={t("profileInfo.sections.cookies")}
+                  description={t("profileInfo.ephemeral.cookiesUnavailable")}
+                  t={t}
+                />
+              ) : (
+                <CookiesSectionInline
+                  profile={profile}
+                  isRunning={isRunning}
+                  isDisabled={isDisabled}
+                  onCopyCookies={cookiesCopyAction?.onClick}
+                  onImportCookies={cookiesManageAction?.onClick}
+                  t={t}
+                />
+              ))}
+
+            {section === "extensions" &&
+              (isEphemeral ? (
+                <EphemeralSectionNotice
+                  title={t("profileInfo.sections.extensions")}
+                  description={t("profileInfo.ephemeral.extensionsUnavailable")}
+                  t={t}
+                />
+              ) : (
+                <ExtensionsSectionInline
+                  profile={profile}
+                  isDisabled={isDisabled}
+                  t={t}
+                />
+              ))}
+
+            {section === "sync" &&
+              (isEphemeral ? (
+                <EphemeralSectionNotice
+                  title={t("profileInfo.sections.sync")}
+                  description={t("profileInfo.ephemeral.syncUnavailable")}
+                  t={t}
+                />
+              ) : (
+                <SyncSectionInline
+                  profile={profile}
+                  syncMode={syncMode}
+                  syncStatus={syncStatus}
+                  isDisabled={isDisabled}
+                  t={t}
+                />
+              ))}
+
+            {section === "automation" && (
+              <div className="flex flex-col gap-5">
+                {isWayfernProfile && (
+                  <DebugEndpointBlock
+                    profile={profile}
+                    isRunning={runningHere}
+                  />
+                )}
+                <LaunchHookEditor profile={profile} t={t} />
+                {synchronizerAction && (
+                  <Button
+                    data-slot="profile-start-synchronizer"
+                    variant="soft"
+                    size="sm"
+                    className="h-auto min-h-8 self-start whitespace-normal"
+                    onClick={synchronizerAction.onClick}
+                    disabled={synchronizerAction.disabled}
+                  >
+                    {synchronizerAction.icon}
+                    {synchronizerAction.label}
+                  </Button>
+                )}
+              </div>
+            )}
+
+            {section === "requests" && (
+              <div className="flex flex-col gap-3">
+                <SectionHeader
+                  icon={<LuActivity className="size-4" />}
+                  title={t("profileInfo.sections.requests")}
+                />
+                <p className="text-xs text-muted-foreground">
+                  {t("profileInfo.sectionDesc.requests")}
+                </p>
+                <NetworkRequestsPanel
+                  profileId={profile.id}
+                  running={runningHere}
+                />
+              </div>
+            )}
+
+            {section === "logs" && (
+              <div className="flex flex-col gap-3">
+                <SectionHeader
+                  icon={<LuScrollText className="size-4" />}
+                  title={t("profileInfo.sections.logs")}
+                />
+                <p className="text-xs text-muted-foreground">
+                  {t("profileInfo.sectionDesc.logs")}
+                </p>
+                <LogViewer profileId={profile.id} />
+              </div>
+            )}
+
+            {section === "transfer" && (
+              <div className="flex flex-col gap-3">
+                <SectionHeader
+                  icon={<LuDownload className="size-4" />}
+                  title={t("profileInfo.sections.transfer")}
+                />
+                <ExportProfileSection profile={profile} isRunning={isRunning} />
+              </div>
+            )}
+
+            {section === "security" && (
+              <SecuritySectionInline
                 profile={profile}
                 isRunning={isRunning}
-                isDisabled={isDisabled}
-                onCopyCookies={cookiesCopyAction?.onClick}
-                onImportCookies={cookiesManageAction?.onClick}
+                canLock={canLock}
+                onLock={() => void lockNow()}
                 t={t}
               />
-            ))}
+            )}
 
-          {section === "extensions" &&
-            (isEphemeral ? (
-              <EphemeralSectionNotice
-                title={t("profileInfo.sections.extensions")}
-                description={t("profileInfo.ephemeral.extensionsUnavailable")}
-                t={t}
-              />
-            ) : (
-              <ExtensionsSectionInline
-                profile={profile}
-                isDisabled={isDisabled}
-                t={t}
-              />
-            ))}
-
-          {section === "sync" &&
-            (isEphemeral ? (
-              <EphemeralSectionNotice
-                title={t("profileInfo.sections.sync")}
-                description={t("profileInfo.ephemeral.syncUnavailable")}
-                t={t}
-              />
-            ) : (
-              <SyncSectionInline
-                profile={profile}
-                syncMode={syncMode}
-                syncStatus={syncStatus}
-                isDisabled={isDisabled}
-                t={t}
-              />
-            ))}
-
-          {section === "automation" && (
-            <LaunchHookEditor profile={profile} t={t} />
-          )}
-
-          {section === "security" && (
-            <SecuritySectionInline
-              profile={profile}
-              isRunning={isRunning}
-              t={t}
-            />
-          )}
+            {section === "twoFactor" && (
+              <div className="flex flex-col gap-3">
+                <SectionHeader
+                  icon={<LuKeyRound className="size-4" />}
+                  title={t("profileInfo.sections.twoFactor")}
+                />
+                <ProfileTotpSection profileId={profile.id} />
+              </div>
+            )}
+          </motion.div>
         </div>
       </div>
-    </>
-  );
-}
-
-function _SectionPlaceholder({
-  icon,
-  title,
-  description,
-  actionLabel,
-  onAction,
-  disabled,
-  hint,
-}: {
-  icon: React.ReactNode;
-  title: string;
-  description: string;
-  actionLabel: string;
-  onAction: () => void;
-  disabled?: boolean;
-  hint?: string;
-}) {
-  return (
-    <div className="flex flex-col gap-3">
-      <div className="flex items-center gap-2 text-sm font-semibold">
-        {icon}
-        {title}
-      </div>
-      <p className="text-xs text-muted-foreground">{description}</p>
-      {hint && (
-        <div className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs">
-          {hint}
-        </div>
-      )}
-      <Button
-        size="sm"
-        onClick={onAction}
-        disabled={disabled}
-        className="h-7 self-start text-xs"
-      >
-        {actionLabel}
-      </Button>
-    </div>
-  );
-}
-
-function _SectionAction({
-  icon,
-  label,
-  onClick,
-  disabled,
-  destructive,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  onClick: () => void;
-  disabled?: boolean;
-  destructive?: boolean;
-}) {
-  return (
-    <button
-      type="button"
-      disabled={disabled}
-      onClick={onClick}
-      className={cn(
-        "flex h-9 items-center gap-2 rounded-md px-3 text-left text-xs transition-colors",
-        destructive
-          ? "text-destructive-text hover:bg-destructive/10"
-          : "hover:bg-accent hover:text-accent-foreground",
-        "disabled:pointer-events-none disabled:opacity-50",
-      )}
-    >
-      {icon}
-      <span className="flex-1">{label}</span>
-      <LuChevronRight className="size-3.5 text-muted-foreground" />
-    </button>
+    </SoftFields>
   );
 }
 
@@ -1245,15 +1810,21 @@ function LaunchHookEditor({
   t: (key: string, options?: Record<string, unknown>) => string;
 }) {
   const { t: tFn } = useTranslation();
-  const [value, setValue] = React.useState(profile.launch_hook ?? "");
+  const [savedValue, setSavedValue] = React.useState(profile.launch_hook ?? "");
+  const [value, setValue] = React.useState(savedValue);
   const [isSaving, setIsSaving] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
-  const initial = profile.launch_hook ?? "";
-  const dirty = value !== initial;
+  const { saved, flash, clear } = useSavedFlash();
   const trimmed = value.trim();
+  const dirty = trimmed !== savedValue;
   const showInvalidHint = trimmed.length > 0 && !isValidHttpUrl(trimmed);
 
-  const onSave = async () => {
+  React.useEffect(() => {
+    setSavedValue(profile.launch_hook ?? "");
+  }, [profile.launch_hook]);
+
+  const save = async (): Promise<boolean> => {
+    if (showInvalidHint) return false;
     setIsSaving(true);
     setError(null);
     try {
@@ -1261,27 +1832,48 @@ function LaunchHookEditor({
         profileId: profile.id,
         launchHook: trimmed ? trimmed : null,
       });
+      setSavedValue(trimmed);
+      setValue(trimmed);
+      flash();
+      return true;
     } catch (e) {
       setError(translateBackendError(tFn, e));
+      return false;
     } finally {
       setIsSaving(false);
     }
   };
 
+  const discard = () => {
+    setValue(savedValue);
+    setError(null);
+  };
+
+  useUnsavedChanges(`profile-info:${profile.id}:launch-hook`, {
+    dirty,
+    save,
+    discard,
+    label: t("profileInfo.sections.launchHook"),
+  });
+
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex items-center gap-2 text-sm font-semibold">
-        <LuLink className="size-4" />
-        {t("profileInfo.sections.launchHook")}
-      </div>
+      <SectionHeader
+        icon={<LuLink className="size-4" />}
+        title={t("profileInfo.sections.launchHook")}
+      />
       <p className="text-xs text-muted-foreground">
         {t("profileInfo.sectionDesc.launchHook")}
       </p>
       <Input
         type="url"
+        data-slot="profile-launch-hook-input"
+        aria-label={t("profileInfo.sections.launchHook")}
         value={value}
         onChange={(e) => {
           setValue(e.target.value);
+          setError(null);
+          clear();
         }}
         placeholder={t("profiles.launchHook.placeholder")}
         className="font-mono text-xs"
@@ -1291,32 +1883,110 @@ function LaunchHookEditor({
           {t("profileInfo.launchHook.invalidUrlHint")}
         </p>
       )}
-      {error && <p className="text-xs text-destructive-text">{error}</p>}
-      <div className="flex items-center gap-2">
-        <Button
-          size="sm"
-          className="h-7 text-xs"
-          disabled={!dirty || isSaving || showInvalidHint}
-          onClick={() => {
-            void onSave();
-          }}
-        >
-          {isSaving ? t("common.buttons.saving") : t("common.buttons.save")}
-        </Button>
-        {dirty && (
-          <Button
-            size="sm"
-            variant="ghost"
-            className="h-7 text-xs"
-            onClick={() => {
-              setValue(initial);
-              setError(null);
-            }}
-          >
-            {t("common.buttons.cancel")}
-          </Button>
-        )}
-      </div>
+      <DraftSaveBar
+        dirty={dirty}
+        saving={isSaving}
+        saved={saved}
+        error={error}
+        canSave={!showInvalidHint}
+        onSave={() => void save()}
+        onDiscard={discard}
+      />
+    </div>
+  );
+}
+
+function StartPagesEditor({
+  profile,
+  isDisabled,
+  t,
+}: {
+  profile: BrowserProfile;
+  isDisabled: boolean;
+  t: (key: string, options?: Record<string, unknown>) => string;
+}) {
+  const { t: tFn } = useTranslation();
+  const stored = (profile.start_urls ?? []).join("\n");
+  const [savedValue, setSavedValue] = React.useState(stored);
+  const [value, setValue] = React.useState(stored);
+  const [isSaving, setIsSaving] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+  const { saved, flash, clear } = useSavedFlash();
+  const dirty = value.trim() !== savedValue;
+
+  React.useEffect(() => {
+    setSavedValue(stored);
+  }, [stored]);
+
+  const save = async (): Promise<boolean> => {
+    setIsSaving(true);
+    setError(null);
+    try {
+      const updated = await invoke<BrowserProfile>(
+        "update_profile_start_urls",
+        {
+          profileId: profile.id,
+          startUrls: startPagesFromText(value),
+        },
+      );
+      const next = (updated.start_urls ?? []).join("\n");
+      setSavedValue(next);
+      setValue(next);
+      flash();
+      return true;
+    } catch (e) {
+      setError(translateBackendError(tFn, e));
+      return false;
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const discard = () => {
+    setValue(savedValue);
+    setError(null);
+  };
+
+  useUnsavedChanges(`profile-info:${profile.id}:start-pages`, {
+    dirty,
+    save,
+    discard,
+    label: t("profileInfo.sections.startPages"),
+  });
+
+  return (
+    <div className="flex flex-col gap-3">
+      <SectionHeader
+        icon={<LuHouse className="size-4" />}
+        title={t("profileInfo.sections.startPages")}
+      />
+      <p className="text-xs text-muted-foreground">
+        {t("startPages.description")}
+      </p>
+      <Textarea
+        data-slot="profile-start-pages-input"
+        aria-label={t("profileInfo.sections.startPages")}
+        value={value}
+        onChange={(e) => {
+          setValue(e.target.value);
+          setError(null);
+          clear();
+        }}
+        placeholder={t("startPages.placeholder")}
+        rows={5}
+        spellCheck={false}
+        disabled={isDisabled || isSaving}
+        className="font-mono text-xs"
+      />
+      <DraftSaveBar
+        dirty={dirty}
+        saving={isSaving}
+        saved={saved}
+        error={error}
+        disabled={isDisabled}
+        onSave={() => void save()}
+        onDiscard={discard}
+      />
     </div>
   );
 }
@@ -1336,6 +2006,7 @@ function SyncSectionInline({
 }) {
   const [isSaving, setIsSaving] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  const { saved, flash } = useSavedFlash();
 
   const onChangeMode = async (mode: string) => {
     setIsSaving(true);
@@ -1345,6 +2016,7 @@ function SyncSectionInline({
         profileId: profile.id,
         syncMode: mode,
       });
+      flash();
     } catch (e) {
       setError(translateBackendError(t as never, e));
     } finally {
@@ -1354,15 +2026,16 @@ function SyncSectionInline({
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex items-center gap-2 text-sm font-semibold">
-        <LuRefreshCw className="size-4" />
-        {t("profileInfo.sections.sync")}
-      </div>
+      <SectionHeader
+        icon={<LuRefreshCw className="size-4" />}
+        title={t("profileInfo.sections.sync")}
+        saved={saved}
+      />
       <p className="text-xs text-muted-foreground">
         {t("profileInfo.sectionDesc.sync")}
       </p>
-      <div className="flex items-center gap-2">
-        <span className="shrink-0 text-[10px] tracking-wide text-muted-foreground uppercase">
+      <div className="flex flex-col gap-1.5">
+        <span className="text-xs font-medium text-muted-foreground">
           {t("profileInfo.fields.syncMode")}
         </span>
         <Select
@@ -1372,7 +2045,10 @@ function SyncSectionInline({
             void onChangeMode(v);
           }}
         >
-          <SelectTrigger className="h-7 flex-1 text-xs">
+          <SelectTrigger
+            aria-label={t("profileInfo.fields.syncMode")}
+            className="h-8 w-full text-xs"
+          >
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -1385,8 +2061,8 @@ function SyncSectionInline({
         </Select>
       </div>
       {syncStatus && (
-        <div className="rounded-md border border-border bg-muted/40 px-3 py-2">
-          <p className="text-[10px] tracking-wide text-muted-foreground uppercase">
+        <div className="rounded-lg bg-foreground/4 px-3 py-2">
+          <p className="text-xs font-medium text-muted-foreground">
             {t("profileInfo.fields.syncStatus")}
           </p>
           <p className="mt-0.5 text-sm">
@@ -1398,6 +2074,9 @@ function SyncSectionInline({
             </p>
           )}
         </div>
+      )}
+      {syncMode !== "Disabled" && (
+        <RestorePoints profileId={profile.id} isDisabled={isDisabled} />
       )}
       {error && <p className="text-xs text-destructive-text">{error}</p>}
     </div>
@@ -1427,11 +2106,60 @@ function NetworkSectionInline({
   const [vpnId, setVpnId] = React.useState<string | null>(
     profile.vpn_id ?? null,
   );
+  const rotatableProxy = storedProxies.find(
+    (p) => p.id === proxyId && p.rotation_url,
+  );
+  const dnsServerId = React.useId();
+  const [savedDnsServer, setSavedDnsServer] = React.useState(
+    profile.dns_server ?? "",
+  );
+  const [dnsServer, setDnsServer] = React.useState(profile.dns_server ?? "");
+  const [dnsServerValid, setDnsServerValid] = React.useState(true);
+  const dnsServerChanged = dnsServer.trim() !== savedDnsServer;
 
   React.useEffect(() => {
     setProxyId(profile.proxy_id ?? null);
     setVpnId(profile.vpn_id ?? null);
   }, [profile.proxy_id, profile.vpn_id]);
+
+  React.useEffect(() => {
+    setSavedDnsServer(profile.dns_server ?? "");
+    setDnsServer(profile.dns_server ?? "");
+  }, [profile.dns_server]);
+
+  const { saved, flash } = useSavedFlash();
+
+  const onDnsServerSave = async (): Promise<boolean> => {
+    if (!dnsServerChanged) return true;
+    if (!dnsServerValid) return false;
+    setIsSaving(true);
+    setError(null);
+    try {
+      const updated = await invoke<BrowserProfile>(
+        "update_profile_dns_server",
+        {
+          profileId: profile.id,
+          dnsServer: dnsServer.trim() || null,
+        },
+      );
+      setSavedDnsServer(updated.dns_server ?? "");
+      setDnsServer(updated.dns_server ?? "");
+      flash();
+      return true;
+    } catch (e) {
+      setError(translateBackendError(t as never, e));
+      return false;
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  useUnsavedChanges(`profile-info:${profile.id}:dns-server`, {
+    dirty: dnsServerChanged,
+    save: onDnsServerSave,
+    discard: () => setDnsServer(savedDnsServer),
+    label: t("profileInfo.fields.dns"),
+  });
 
   const onProxyChange = async (value: string) => {
     const nextId = value === "__none__" ? null : value;
@@ -1446,6 +2174,7 @@ function NetworkSectionInline({
       // backend, but we mirror it locally for an immediate visual.
       setProxyId(nextId);
       if (nextId !== null) setVpnId(null);
+      flash();
     } catch (e) {
       setError(translateBackendError(t as never, e));
     } finally {
@@ -1464,6 +2193,7 @@ function NetworkSectionInline({
       });
       setVpnId(nextId);
       if (nextId !== null) setProxyId(null);
+      flash();
     } catch (e) {
       setError(translateBackendError(t as never, e));
     } finally {
@@ -1473,16 +2203,17 @@ function NetworkSectionInline({
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex items-center gap-2 text-sm font-semibold">
-        <LuGlobe className="size-4" />
-        {t("profileInfo.sections.network")}
-      </div>
+      <SectionHeader
+        icon={<LuGlobe className="size-4" />}
+        title={t("profileInfo.sections.network")}
+        saved={saved}
+      />
       <p className="text-xs text-muted-foreground">
         {t("profileInfo.sectionDesc.network")}
       </p>
 
       <div className="flex items-center gap-2">
-        <span className="w-12 shrink-0 text-[10px] tracking-wide text-muted-foreground uppercase">
+        <span className="w-12 shrink-0 text-xs font-medium text-muted-foreground">
           {t("profileInfo.fields.proxy")}
         </span>
         <Select
@@ -1492,7 +2223,10 @@ function NetworkSectionInline({
             void onProxyChange(v);
           }}
         >
-          <SelectTrigger className="h-7 flex-1 text-xs">
+          <SelectTrigger
+            aria-label={t("profileInfo.fields.proxy")}
+            className="h-8 min-w-0 flex-1 text-xs"
+          >
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -1506,10 +2240,25 @@ function NetworkSectionInline({
             ))}
           </SelectContent>
         </Select>
+        {rotatableProxy && (
+          <Button
+            type="button"
+            variant="soft"
+            size="sm"
+            className="h-8 shrink-0 gap-1.5 px-2.5 text-xs"
+            data-slot="profile-proxy-rotate"
+            title={t("proxies.rotation.actionTooltip")}
+            disabled={isSaving}
+            onClick={() => void rotateProxyIps([rotatableProxy], t as never)}
+          >
+            <LuRefreshCcwDot className="size-3.5" />
+            {t("proxies.rotation.action")}
+          </Button>
+        )}
       </div>
 
       <div className="flex items-center gap-2">
-        <span className="w-12 shrink-0 text-[10px] tracking-wide text-muted-foreground uppercase">
+        <span className="w-12 shrink-0 text-xs font-medium text-muted-foreground">
           {t("profileInfo.fields.vpn")}
         </span>
         <Select
@@ -1519,7 +2268,10 @@ function NetworkSectionInline({
             void onVpnChange(v);
           }}
         >
-          <SelectTrigger className="h-7 flex-1 text-xs">
+          <SelectTrigger
+            aria-label={t("profileInfo.fields.vpn")}
+            className="h-8 min-w-0 flex-1 text-xs"
+          >
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -1534,6 +2286,41 @@ function NetworkSectionInline({
           </SelectContent>
         </Select>
       </div>
+
+      <form
+        className="flex items-start gap-2"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void onDnsServerSave();
+        }}
+      >
+        <label
+          htmlFor={dnsServerId}
+          className="w-12 shrink-0 pt-2.5 text-xs font-medium text-muted-foreground"
+        >
+          {t("profileInfo.fields.dns")}
+        </label>
+        <div className="min-w-0 flex-1">
+          <DnsServerField
+            id={dnsServerId}
+            value={dnsServer}
+            onChange={setDnsServer}
+            onValidityChange={setDnsServerValid}
+            disabled={isDisabled || isSaving}
+            action={
+              dnsServerChanged && (
+                <Button
+                  type="submit"
+                  className="shrink-0"
+                  disabled={isDisabled || isSaving || !dnsServerValid}
+                >
+                  {t("common.buttons.save")}
+                </Button>
+              )
+            }
+          />
+        </div>
+      </form>
 
       {error && <p className="text-xs text-destructive-text">{error}</p>}
     </div>
@@ -1552,7 +2339,7 @@ function EphemeralSectionNotice({
   t: (key: string, options?: Record<string, unknown>) => string;
 }) {
   return (
-    <div className="flex flex-col items-center gap-3 rounded-lg border p-6 text-center">
+    <div className="flex flex-col items-center gap-3 rounded-lg bg-foreground/4 p-6 text-center">
       <LuTimer className="size-4 shrink-0 text-muted-foreground" />
       <h3 className="text-sm font-medium text-foreground">{title}</h3>
       <p className="max-w-[48ch] text-sm text-pretty text-muted-foreground">
@@ -1581,6 +2368,7 @@ function ExtensionsSectionInline({
   );
   const [isSaving, setIsSaving] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  const { saved, flash } = useSavedFlash();
 
   React.useEffect(() => {
     setGroupId(profile.extension_group_id ?? null);
@@ -1622,6 +2410,7 @@ function ExtensionsSectionInline({
         extensionGroupId: next,
       });
       setGroupId(next);
+      flash();
     } catch (e) {
       setError(translateBackendError(t as never, e));
     } finally {
@@ -1631,15 +2420,16 @@ function ExtensionsSectionInline({
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex items-center gap-2 text-sm font-semibold">
-        <LuPuzzle className="size-4" />
-        {t("profileInfo.sections.extensions")}
-      </div>
+      <SectionHeader
+        icon={<LuPuzzle className="size-4" />}
+        title={t("profileInfo.sections.extensions")}
+        saved={saved}
+      />
       <p className="text-xs text-muted-foreground">
         {t("profileInfo.sectionDesc.extensions")}
       </p>
-      <div className="flex items-center gap-2">
-        <span className="w-16 shrink-0 text-[10px] tracking-wide text-muted-foreground uppercase">
+      <div className="flex flex-col gap-1.5">
+        <span className="text-xs font-medium text-muted-foreground">
           {t("profileInfo.fields.extensionGroup")}
         </span>
         <Select
@@ -1649,7 +2439,10 @@ function ExtensionsSectionInline({
             void onChange(v);
           }}
         >
-          <SelectTrigger className="h-7 flex-1 text-xs">
+          <SelectTrigger
+            aria-label={t("profileInfo.fields.extensionGroup")}
+            className="h-8 w-full text-xs"
+          >
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -1760,16 +2553,15 @@ function CookiesSectionInline({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-3">
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex items-center gap-2 text-sm font-semibold">
-          <LuCookie className="size-4" />
-          {t("profileInfo.sections.cookies")}
-        </div>
-        <div className="flex items-center gap-2">
+      <SectionHeader
+        icon={<LuCookie className="size-4" />}
+        title={t("profileInfo.sections.cookies")}
+      >
+        <div className="flex flex-wrap items-center gap-2">
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button
-                variant="outline"
+                variant="soft"
                 size="sm"
                 className="h-7 gap-1.5"
                 disabled={
@@ -1803,7 +2595,7 @@ function CookiesSectionInline({
           </DropdownMenu>
           {onImportCookies && (
             <Button
-              variant="outline"
+              variant="soft"
               size="sm"
               className="h-7 gap-1.5"
               disabled={isDisabled || isRunning}
@@ -1815,7 +2607,7 @@ function CookiesSectionInline({
           )}
           {onCopyCookies && (
             <Button
-              variant="outline"
+              variant="soft"
               size="sm"
               className="h-7 gap-1.5"
               disabled={isDisabled}
@@ -1826,20 +2618,20 @@ function CookiesSectionInline({
             </Button>
           )}
         </div>
-      </div>
+      </SectionHeader>
       <p className="text-xs text-muted-foreground">
         {t("profileInfo.sectionDesc.cookies")}
       </p>
       {isRunning ? (
-        <div className="rounded-md border border-border bg-muted/40 px-3 py-2">
+        <div className="rounded-lg bg-foreground/4 px-3 py-2">
           <p className="text-xs text-muted-foreground">
             {t("profileInfo.cookies.runningNotice")}
           </p>
         </div>
       ) : (
         <>
-          <div className="rounded-md border border-border bg-muted/40 px-3 py-2">
-            <p className="text-[10px] tracking-wide text-muted-foreground uppercase">
+          <div className="rounded-lg bg-foreground/4 px-3 py-2">
+            <p className="text-xs font-medium text-muted-foreground">
               {t("profileInfo.fields.cookieCount")}
             </p>
             <p className="mt-0.5 text-sm">
@@ -1850,9 +2642,16 @@ function CookiesSectionInline({
                   : "—"}
             </p>
           </div>
+          {profile.ephemeral !== true && !profile.password_protected && (
+            <StorageStateBlock
+              profile={profile}
+              isDisabled={isDisabled}
+              t={t}
+            />
+          )}
           {domains.length > 0 && (
-            <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-md border border-border bg-muted/40">
-              <p className="shrink-0 border-b border-border px-3 py-2 text-[10px] tracking-wide text-muted-foreground uppercase">
+            <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg bg-foreground/4">
+              <p className="shrink-0 border-b border-foreground/6 px-3 py-2 text-xs font-medium text-muted-foreground">
                 {t("profileInfo.cookies.domainsHeader", {
                   count: domains.length,
                 })}
@@ -1879,8 +2678,170 @@ function CookiesSectionInline({
   );
 }
 
-// Inline password set / change / remove form. Replaces three separate
-// nested modal dialogs with one in-page form that branches on the current
+/**
+ * The profile's Local Storage with its cookies, as one Playwright
+ * `storageState` file: export it to an automation tool, or import one.
+ */
+function StorageStateBlock({
+  profile,
+  isDisabled,
+  t,
+}: {
+  profile: BrowserProfile;
+  isDisabled: boolean;
+  t: (key: string, options?: Record<string, unknown>) => string;
+}) {
+  const [stats, setStats] = React.useState<{
+    origins: number;
+    items: number;
+  } | null>(null);
+  const [busy, setBusy] = React.useState(false);
+  const [withIndexedDb, setWithIndexedDb] = React.useState(false);
+
+  const loadStats = React.useCallback(async () => {
+    try {
+      setStats(
+        await invoke<{ origins: number; items: number }>(
+          "get_profile_local_storage_stats",
+          { profileId: profile.id },
+        ),
+      );
+    } catch {
+      setStats(null);
+    }
+  }, [profile.id]);
+
+  React.useEffect(() => {
+    void loadStats();
+  }, [loadStats]);
+
+  const handleExport = async () => {
+    setBusy(true);
+    try {
+      const content = await invoke<string>("export_profile_storage_state", {
+        profileId: profile.id,
+        includeCookies: true,
+        includeIndexedDb: withIndexedDb,
+      });
+      const filePath = await save({
+        defaultPath: `${profile.name}_storage_state.json`,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (!filePath) return;
+      await writeTextFile(filePath, content);
+      showSuccessToast(t("profileInfo.localStorage.exported"));
+    } catch (e) {
+      showErrorToast(translateBackendError(t as never, e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleImport = async () => {
+    setBusy(true);
+    try {
+      const selected = await openDialog({
+        multiple: false,
+        filters: [{ name: "JSON", extensions: ["json"] }],
+      });
+      if (!selected || typeof selected !== "string") return;
+      const content = await readTextFile(selected);
+      const result = await invoke<{
+        origins: number;
+        items: number;
+        cookies_imported: number;
+        indexed_db_records: number;
+      }>("import_profile_storage_state", { profileId: profile.id, content });
+      showSuccessToast(
+        t(
+          result.indexed_db_records > 0
+            ? "profileInfo.localStorage.importedWithIndexedDb"
+            : "profileInfo.localStorage.imported",
+          {
+            items: result.items,
+            origins: result.origins,
+            cookies: result.cookies_imported,
+            records: result.indexed_db_records,
+          },
+        ),
+      );
+      void loadStats();
+    } catch (e) {
+      showErrorToast(translateBackendError(t as never, e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div
+      data-slot="profile-storage-state"
+      className="flex items-center justify-between gap-3 rounded-lg bg-foreground/4 px-3 py-2"
+    >
+      <div className="min-w-0">
+        <p className="text-xs font-medium text-muted-foreground">
+          {t("profileInfo.localStorage.title")}
+        </p>
+        <p className="mt-0.5 text-sm" data-slot="profile-local-storage-stats">
+          {stats
+            ? t("profileInfo.localStorage.stats", {
+                origins: stats.origins,
+                items: stats.items,
+              })
+            : "—"}
+        </p>
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          {t("profileInfo.localStorage.hint")}
+        </p>
+        <label
+          htmlFor={`storage-indexed-db-${profile.id}`}
+          className="mt-1.5 flex cursor-pointer items-start gap-2 text-xs"
+        >
+          <Checkbox
+            id={`storage-indexed-db-${profile.id}`}
+            checked={withIndexedDb}
+            disabled={isDisabled || busy}
+            onCheckedChange={(checked) => setWithIndexedDb(checked === true)}
+            data-slot="storage-state-indexed-db"
+          />
+          <span>
+            <span className="block">
+              {t("profileInfo.localStorage.includeIndexedDb")}
+            </span>
+            <span className="block text-muted-foreground">
+              {t("profileInfo.localStorage.indexedDbHint")}
+            </span>
+          </span>
+        </label>
+      </div>
+      <div className="flex shrink-0 items-center gap-2">
+        <Button
+          variant="soft"
+          size="sm"
+          className="h-7 gap-1.5"
+          data-slot="storage-state-export"
+          disabled={isDisabled || busy}
+          onClick={() => void handleExport()}
+        >
+          <LuDownload className="size-3.5" />
+          {t("common.buttons.export")}
+        </Button>
+        <Button
+          variant="soft"
+          size="sm"
+          className="h-7 gap-1.5"
+          data-slot="storage-state-import"
+          disabled={isDisabled || busy}
+          onClick={() => void handleImport()}
+        >
+          <LuUpload className="size-3.5" />
+          {t("common.buttons.import")}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function sharedFingerprintConfig(profile: BrowserProfile): WayfernConfig {
   if (
     profile.browser === "fingerprint_chromium" &&
@@ -1898,46 +2859,77 @@ function sharedFingerprintConfig(profile: BrowserProfile): WayfernConfig {
   return profile.wayfern_config ?? {};
 }
 
-// `password_protected` state of the profile.
 // Inline fingerprint editor. Reuses SharedFingerprintConfigForm so the same
 // field set as the standalone dialog is available without opening a nested modal.
 function FingerprintSectionInline({
   profile,
   isDisabled,
   crossOsUnlocked,
-  onSaved,
   t,
 }: {
   profile: BrowserProfile;
   isDisabled: boolean;
   crossOsUnlocked: boolean;
-  onSaved: () => void;
   t: (key: string, options?: Record<string, unknown>) => string;
 }) {
-  const [wayfernConfig, setWayfernConfig] = React.useState<WayfernConfig>(() =>
-    sharedFingerprintConfig(profile),
+  const initial = JSON.stringify(sharedFingerprintConfig(profile));
+  const [wayfernConfig, setWayfernConfig] = React.useState<WayfernConfig>(
+    () => sharedFingerprintConfig(profile),
   );
   const [isSaving, setIsSaving] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
-  const [success, setSuccess] = React.useState<string | null>(null);
+  const { saved, flash, clear } = useSavedFlash();
+  const isWayfern = profile.browser === "wayfern";
+  const dirty = JSON.stringify(wayfernConfig) !== initial;
 
+  // Keyed on the stored value, not the object: a profile list refresh hands a
+  // new object with the same config and must not wipe the draft.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `initial` is the stored config
   React.useEffect(() => {
     setWayfernConfig(sharedFingerprintConfig(profile));
     setError(null);
-    setSuccess(null);
-  }, [profile]);
+  }, [initial]);
 
-  const isWayfern = profile.browser === "wayfern";
+  const save = async (): Promise<boolean> => {
+    setIsSaving(true);
+    setError(null);
+    try {
+      await invoke("update_wayfern_config", {
+        profileId: profile.id,
+        config: wayfernConfig,
+      });
+      flash();
+      return true;
+    } catch (e) {
+      setError(translateBackendError(t as never, e));
+      return false;
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const discard = () => {
+    setWayfernConfig(sharedFingerprintConfig(profile));
+    setError(null);
+  };
+
+  useUnsavedChanges(`profile-info:${profile.id}:fingerprint`, {
+    dirty,
+    save,
+    discard,
+    label: t("profileInfo.sections.fingerprint"),
+  });
+
   const isFingerprintBrowser =
     isWayfern || profile.browser === "fingerprint_chromium";
 
   if (!isFingerprintBrowser) {
     return (
       <div className="flex flex-col gap-3">
-        <div className="flex items-center gap-2 text-sm font-semibold">
-          <LuFingerprint className="size-4" />
-          {t("profileInfo.sections.fingerprint")}
-        </div>
+        <SectionHeader
+          icon={<LuFingerprint className="size-4" />}
+          title={t("profileInfo.sections.fingerprint")}
+        />
         <p className="text-xs text-muted-foreground">
           {t("profileInfo.fingerprint.notSupported")}
         </p>
@@ -1945,110 +2937,93 @@ function FingerprintSectionInline({
     );
   }
 
-  if (isWayfern && !crossOsUnlocked) {
-    return (
-      <div className="flex flex-col items-center gap-3 rounded-lg border p-6 text-center">
-        <LuLock className="size-4 shrink-0 text-muted-foreground" />
-        <h3 className="text-sm font-medium text-foreground">
-          {t("profileInfo.fingerprint.lockedTitle")}
-        </h3>
-        <p className="max-w-[48ch] text-sm text-pretty text-muted-foreground">
-          {t("profileInfo.fingerprint.lockedDescription")}
-        </p>
-      </div>
-    );
-  }
-
   const onWayfernChange = (key: keyof WayfernConfig, value: unknown) => {
     setWayfernConfig((prev) => ({ ...prev, [key]: value }));
-    setSuccess(null);
-  };
-
-  const onSave = async () => {
-    setIsSaving(true);
     setError(null);
-    setSuccess(null);
-    try {
-      await invoke("update_wayfern_config", {
-        profileId: profile.id,
-        config: wayfernConfig,
-      });
-      setSuccess(t("common.buttons.saved"));
-      onSaved();
-    } catch (e) {
-      setError(translateBackendError(t as never, e));
-    } finally {
-      setIsSaving(false);
-    }
+    clear();
   };
 
-  const initial = JSON.stringify(sharedFingerprintConfig(profile));
-  const current = JSON.stringify(wayfernConfig);
-  const dirty = current !== initial;
+  const hasCustomValues = Boolean(
+    profile.wayfern_config?.identity_overrides?.trim(),
+  );
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex items-center gap-2 text-sm font-semibold">
-        <LuFingerprint className="size-4" />
-        {t("profileInfo.sections.fingerprint")}
-      </div>
+      <SectionHeader
+        icon={<LuFingerprint className="size-4" />}
+        title={t("profileInfo.sections.fingerprint")}
+      />
       <p className="text-xs text-muted-foreground">
         {t("profileInfo.sectionDesc.fingerprint")}
       </p>
 
-      <SharedFingerprintConfigForm
-        config={wayfernConfig}
-        onConfigChange={onWayfernChange}
-        forceAdvanced={true}
-        readOnly={isDisabled}
-        crossOsUnlocked={isWayfern && crossOsUnlocked}
-        limitedMode={!isWayfern}
-        profileVersion={profile.version}
-        profileBrowser={profile.browser}
-      />
-
-      {error && <p className="text-xs text-destructive-text">{error}</p>}
-      {success && !error && (
-        <p className="text-xs text-success-text">{success}</p>
+      {isWayfern && !crossOsUnlocked ? (
+        <>
+          <div className="flex flex-col items-center gap-3 rounded-lg bg-foreground/4 p-6 text-center">
+            <LuLock className="size-4 shrink-0 text-muted-foreground" />
+            <h3 className="text-sm font-medium text-foreground">
+              {t("profileInfo.fingerprint.lockedTitle")}
+            </h3>
+            <p className="max-w-[48ch] text-sm text-pretty text-muted-foreground">
+              {t("profileInfo.fingerprint.lockedDescription")}
+            </p>
+            {hasCustomValues && (
+              <p
+                data-slot="profile-fingerprint-overrides-kept"
+                className="max-w-[48ch] text-xs text-pretty text-muted-foreground"
+              >
+                {t("profileInfo.fingerprint.customValuesKept")}
+              </p>
+            )}
+          </div>
+          <LaunchArgumentsEditor
+            config={wayfernConfig}
+            onConfigChange={onWayfernChange}
+            readOnly={isDisabled}
+          />
+        </>
+      ) : (
+        <SharedFingerprintConfigForm
+          config={wayfernConfig}
+          onConfigChange={onWayfernChange}
+          forceAdvanced={true}
+          readOnly={isDisabled}
+          crossOsUnlocked={isWayfern && crossOsUnlocked}
+          limitedMode={!isWayfern}
+          profileVersion={profile.version}
+          profileBrowser={profile.browser}
+          profileId={profile.id}
+          nativeOS={getProfileNativeOs(profile)}
+        />
       )}
 
-      <div className="mt-3 flex items-center gap-2 border-t border-border pt-3">
-        <Button
-          size="sm"
-          className="h-7 text-xs"
-          disabled={!dirty || isSaving || isDisabled}
-          onClick={() => {
-            void onSave();
-          }}
-        >
-          {isSaving ? t("common.buttons.saving") : t("common.buttons.save")}
-        </Button>
-        {dirty && (
-          <Button
-            size="sm"
-            variant="ghost"
-            className="h-7 text-xs"
-            onClick={() => {
-              setWayfernConfig(sharedFingerprintConfig(profile));
-              setError(null);
-              setSuccess(null);
-            }}
-          >
-            {t("common.buttons.cancel")}
-          </Button>
-        )}
-      </div>
+      <DraftSaveBar
+        dirty={dirty}
+        saving={isSaving}
+        saved={saved}
+        error={error}
+        disabled={isDisabled}
+        onSave={() => void save()}
+        onDiscard={discard}
+      />
     </div>
   );
 }
 
+// Inline password set / change / remove form. Replaces three separate
+// nested modal dialogs with one in-page form that branches on the current
+// `password_protected` state of the profile.
 function SecuritySectionInline({
   profile,
   isRunning,
+  canLock,
+  onLock,
   t,
 }: {
   profile: BrowserProfile;
   isRunning: boolean;
+  canLock: boolean;
+  onLock: () => void;
   t: (key: string, options?: Record<string, unknown>) => string;
 }) {
   // Mode is implied by current state: unprotected → "set"; protected →
@@ -2162,15 +3137,42 @@ function SecuritySectionInline({
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex items-center gap-2 text-sm font-semibold">
-        <LuKey className="size-4" />
-        {t("profileInfo.sections.security")}
-      </div>
+      <SectionHeader
+        icon={<LuKey className="size-4" />}
+        title={t("profileInfo.sections.security")}
+      />
       <p className="text-xs text-muted-foreground">
         {profile.password_protected
           ? t("profileInfo.security.protected")
           : t("profileInfo.security.unprotected")}
       </p>
+
+      {canLock && (
+        <div
+          data-slot="profile-unlocked"
+          className="flex items-center gap-3 rounded-lg bg-foreground/4 px-3 py-2"
+        >
+          <LuLockOpen className="size-4 shrink-0 text-muted-foreground" />
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-medium">
+              {t("profileInfo.security.unlockedTitle")}
+            </p>
+            <p className="text-[11px] text-muted-foreground">
+              {t("profileInfo.security.unlockedDescription")}
+            </p>
+          </div>
+          <Button
+            variant="soft"
+            size="sm"
+            data-slot="profile-lock-now"
+            className="h-7 shrink-0 gap-1.5 text-xs"
+            onClick={onLock}
+          >
+            <LuLock className="size-3.5" />
+            {t("profileTable.menu.lockNow")}
+          </Button>
+        </div>
+      )}
 
       {profile.password_protected && (
         <div className="flex gap-1.5">
@@ -2181,8 +3183,8 @@ function SecuritySectionInline({
               setIsVerifyOpen(true);
             }}
             className={cn(
-              "h-7 flex-1 rounded-md border px-2 text-xs transition-colors",
-              "border-border text-muted-foreground hover:bg-accent hover:text-accent-foreground",
+              "h-8 flex-1 rounded-lg bg-foreground/5 px-2 text-xs text-muted-foreground transition-colors hover:bg-foreground/8 hover:text-foreground",
+              FOCUS_RING,
             )}
           >
             {t("profilePassword.modes.validate")}
@@ -2193,11 +3195,13 @@ function SecuritySectionInline({
               setMode("change");
               reset();
             }}
+            aria-pressed={mode === "change"}
             className={cn(
-              "h-7 flex-1 rounded-md border px-2 text-xs transition-colors",
+              "h-8 flex-1 rounded-lg px-2 text-xs transition-colors",
+              FOCUS_RING,
               mode === "change"
-                ? "border-transparent bg-accent text-accent-foreground"
-                : "border-border text-muted-foreground hover:bg-accent hover:text-accent-foreground",
+                ? "bg-foreground/10 text-foreground"
+                : "bg-foreground/5 text-muted-foreground hover:bg-foreground/8 hover:text-foreground",
             )}
           >
             {t("profilePassword.modes.change")}
@@ -2208,11 +3212,13 @@ function SecuritySectionInline({
               setMode("remove");
               reset();
             }}
+            aria-pressed={mode === "remove"}
             className={cn(
-              "h-7 flex-1 rounded-md border px-2 text-xs transition-colors",
+              "h-8 flex-1 rounded-lg px-2 text-xs transition-colors",
+              FOCUS_RING,
               mode === "remove"
-                ? "border-transparent bg-destructive/10 text-destructive-text"
-                : "border-border text-muted-foreground hover:bg-accent hover:text-accent-foreground",
+                ? "bg-destructive/10 text-destructive-text"
+                : "bg-foreground/5 text-muted-foreground hover:bg-foreground/8 hover:text-foreground",
             )}
           >
             {t("profilePassword.modes.remove")}
@@ -2229,6 +3235,7 @@ function SecuritySectionInline({
               setOldPassword(e.target.value);
               setError(null);
             }}
+            aria-label={t("profilePassword.fields.currentPassword")}
             placeholder={t("profilePassword.fields.currentPassword")}
             disabled={isRunning || isSubmitting}
             className="h-8 text-xs"
@@ -2243,6 +3250,7 @@ function SecuritySectionInline({
                 setPassword(e.target.value);
                 setError(null);
               }}
+              aria-label={t("profilePassword.fields.newPassword")}
               placeholder={t("profilePassword.fields.newPassword")}
               disabled={isRunning || isSubmitting}
               className="h-8 text-xs"
@@ -2254,6 +3262,7 @@ function SecuritySectionInline({
                 setConfirm(e.target.value);
                 setError(null);
               }}
+              aria-label={t("profilePassword.fields.confirmPassword")}
               placeholder={t("profilePassword.fields.confirmPassword")}
               disabled={isRunning || isSubmitting}
               className="h-8 text-xs"
@@ -2381,7 +3390,7 @@ export function ProfileLaunchHookDialog({
       });
       onClose();
     } catch (err) {
-      console.error("Failed to update launch hook:", err);
+      showErrorToast(translateBackendError(t, err));
     } finally {
       setIsSaving(false);
     }
@@ -2398,6 +3407,7 @@ export function ProfileLaunchHookDialog({
         </p>
         <Input
           value={value}
+          aria-label={t("profileInfo.launchHook.label")}
           onChange={(e) => {
             setValue(e.target.value);
           }}
@@ -2451,7 +3461,7 @@ export function ProfileDnsBlocklistDialog({
       });
       onClose();
     } catch (err) {
-      console.error("Failed to update DNS blocklist:", err);
+      showErrorToast(translateBackendError(t, err));
     } finally {
       setIsSaving(false);
     }
@@ -2487,12 +3497,15 @@ export function ProfileDnsBlocklistDialog({
             <button
               key={option.value}
               type="button"
+              aria-pressed={level === option.value}
               onClick={() => setLevel(option.value)}
-              className={`w-full text-left px-3 py-2 rounded-md text-sm transition-colors ${
+              className={cn(
+                "w-full rounded-md border px-3 py-2 text-left text-sm transition-colors",
+                FOCUS_RING,
                 level === option.value
-                  ? "border border-primary/30 bg-primary/10 text-primary-text"
-                  : "border border-transparent hover:bg-accent hover:text-accent-foreground"
-              }`}
+                  ? "border-primary/30 bg-primary/10 text-primary-text"
+                  : "border-transparent hover:bg-foreground/5",
+              )}
             >
               {option.label}
             </button>
@@ -2534,16 +3547,19 @@ export function ProfileBypassRulesDialog({
     }
   }, [isOpen, initialRules]);
 
+  // Shown at once, and put back when the save fails.
   const updateBypassRules = async (rules: string[]) => {
     if (!profileId) return;
+    const previous = bypassRules;
+    setBypassRules(rules);
     try {
       await invoke("update_profile_proxy_bypass_rules", {
         profileId,
         rules,
       });
-      setBypassRules(rules);
-    } catch {
-      // ignore
+    } catch (err) {
+      setBypassRules(previous);
+      showErrorToast(translateBackendError(t, err));
     }
   };
 
@@ -2578,6 +3594,7 @@ export function ProfileBypassRulesDialog({
             <div className="flex gap-2">
               <Input
                 value={newRule}
+                aria-label={t("profileInfo.network.rulePlaceholder")}
                 onChange={(e) => {
                   setNewRule(e.target.value);
                 }}
@@ -2605,15 +3622,21 @@ export function ProfileBypassRulesDialog({
                 {bypassRules.map((rule) => (
                   <div
                     key={rule}
-                    className="flex items-center justify-between gap-2 rounded-md bg-muted px-3 py-1.5 text-sm"
+                    className="flex items-center justify-between gap-2 rounded-md bg-foreground/5 px-3 py-1.5 text-sm"
                   >
                     <span className="truncate font-mono text-xs">{rule}</span>
                     <button
                       type="button"
+                      aria-label={t("profileInfo.network.removeRule", {
+                        rule,
+                      })}
                       onClick={() => {
                         handleRemoveRule(rule);
                       }}
-                      className="shrink-0 text-muted-foreground transition-colors hover:text-destructive-text"
+                      className={cn(
+                        "shrink-0 rounded-sm text-muted-foreground transition-colors hover:text-destructive-text",
+                        FOCUS_RING,
+                      )}
                     >
                       <LuX className="size-3.5" />
                     </button>

@@ -7,13 +7,12 @@ on:
 permissions:
   contents: read
   pull-requests: write
-  models: read
 
-env:
-  # GitHub Models (free, billed to the repo's plan). gpt-4.1 is the most capable
-  # model actually reachable on the free tier: the gpt-5 family returns
-  # unavailable_model and o3/o3-mini return 403.
-  MODEL: openai/gpt-4.1
+# `edited` and `synchronize` can arrive back to back. Queue rather than cancel,
+# so a run is never stopped between commenting and closing.
+concurrency:
+  group: pr-ai-policy-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
 
 jobs:
   check-ai-policy:
@@ -22,7 +21,7 @@ jobs:
     # template, and closing them would silently stop dependency updates and
     # break dependabot-automerge.yml.
     if: >-
-      github.repository == 'zhom/donutbrowser' &&
+      github.repository == 'donutbrowser/donutbrowser' &&
       github.event.pull_request.state == 'open' &&
       github.event.pull_request.user.type != 'Bot'
     runs-on: ubuntu-latest
@@ -34,6 +33,8 @@ jobs:
       # is only ever read as text.
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Gather pull request text
         env:
@@ -96,59 +97,32 @@ jobs:
           {"compliant": true, "violations": []}
           PROMPT
 
-      - name: Call GitHub Models
+      - name: Ask the model
         env:
-          GH_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AI_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           TRAILER_HIT: ${{ steps.trailers.outputs.hit }}
         run: |
-          PAYLOAD=$(jq -n \
-            --arg model "$MODEL" \
-            --arg trailer_hit "$TRAILER_HIT" \
-            --rawfile system_prompt /tmp/system.txt \
-            --rawfile body /tmp/pr-body.txt \
-            --rawfile commits /tmp/commits.txt \
-            --rawfile hits /tmp/trailer-hits.txt \
-            '{
-              model: $model,
-              messages: [
-                { role: "system", content: $system_prompt },
-                { role: "user",
-                  content: ("scan_found_ai_trailer: " + $trailer_hit
-                    + "\n\nMatched trailer lines:\n" + $hits
-                    + "\n\nPull request body:\n" + $body
-                    + "\n\nCommit messages:\n" + $commits) }
-              ],
-              response_format: { type: "json_object" }
-            }')
+          {
+            printf 'scan_found_ai_trailer: %s\n\nMatched trailer lines:\n' "$TRAILER_HIT"
+            cat /tmp/trailer-hits.txt
+            printf '\n\nPull request body:\n'
+            cat /tmp/pr-body.txt
+            printf '\n\nCommit messages:\n'
+            cat /tmp/commits.txt
+          } > /tmp/user.txt
 
-          # Never use curl -f here: a transport or quota error (402 once the repo's
-          # GitHub Models allowance is spent) must not abort the job. The model
-          # half of this check is fail-open, and the deterministic trailer scan
-          # below still runs regardless.
-          STATUS=$(curl -sSL -o /tmp/response.json -w '%{http_code}' \
-            https://models.github.ai/inference/chat/completions \
-            -H "Authorization: Bearer $GH_MODELS_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2026-03-10" \
-            -H "Content-Type: application/json" \
-            -d "$PAYLOAD" || echo "000")
-
-          if [ "$STATUS" != "200" ]; then
-            echo "::error::GitHub Models returned HTTP $STATUS; treating as compliant"
-            printf '%s\n' "inference call failed with HTTP $STATUS" >> /tmp/ai-degraded
+          # The model half of this check is fail-open: an outage or an answer
+          # that is not JSON must never close a pull request. The deterministic
+          # trailer scan still stands on its own below.
+          if ! bash .github/scripts/ai-infer.sh /tmp/system.txt /tmp/user.txt /tmp/raw.txt; then
+            printf '%s\n' "the model call failed" >> /tmp/ai-degraded
             echo '{"compliant": true, "violations": []}' > /tmp/result.json
             exit 0
           fi
 
-          jq -r '.choices[0].message.content // empty' /tmp/response.json > /tmp/raw.txt || : > /tmp/raw.txt
-
-          # Strip accidental markdown fences and parse. On parse failure, fall
-          # back to compliant so a flaky model never closes a legitimate PR.
-          # The deterministic trailer scan still stands on its own below.
-          sed -E 's/^```(json)?$//; s/```$//' /tmp/raw.txt > /tmp/result.json
-          if ! jq -e . /tmp/result.json >/dev/null 2>&1; then
-            echo "::error::Model returned non-JSON; treating as compliant"
-            printf '%s\n' "model returned output that was not JSON" >> /tmp/ai-degraded
+          if ! python3 .github/scripts/extract-json.py /tmp/raw.txt /tmp/result.json; then
+            echo "::error::The model returned no JSON object; treating as compliant"
+            printf '%s\n' "the model returned output that was not JSON" >> /tmp/ai-degraded
             echo '{"compliant": true, "violations": []}' > /tmp/result.json
           fi
           echo "Policy response validated"
@@ -161,8 +135,8 @@ jobs:
           python3 - <<'EOF'
           import json, os
           r = json.load(open('/tmp/result.json'))
-          violations = r.get('violations') or []
-          compliant = bool(r.get('compliant', True))
+          violations = [v for v in (r.get('violations') or []) if isinstance(v, dict)]
+          compliant = r.get('compliant', True) is not False
 
           # The trailer scan overrides the model in one direction only: it can
           # add a violation, never clear one.
@@ -182,10 +156,11 @@ jobs:
               parts.append('This pull request was closed automatically by the AI policy check.')
               parts.append('')
               parts.append('What went wrong:')
-              for v in violations:
-                  parts.append(f"- {v.get('detail', v.get('rule', 'policy violation'))}")
+              for v in violations[:10]:
+                  detail = ' '.join(str(v.get('detail') or v.get('rule') or 'policy violation').split())
+                  parts.append(f"- {detail[:300]}")
               parts.append('')
-              parts.append('The policy ([CONTRIBUTING.md](https://github.com/zhom/donutbrowser/blob/main/CONTRIBUTING.md#ai-policy)):')
+              parts.append('The policy ([CONTRIBUTING.md](https://github.com/donutbrowser/donutbrowser/blob/main/CONTRIBUTING.md#ai-policy)):')
               parts.append('')
               parts.append('- Every pull request states, explicitly, whether AI was used. Tick exactly one box in the AI usage section. Neither, both, or a deleted section closes the PR.')
               parts.append('- No commit may be co-authored by an AI. Strip `Co-Authored-By:` and "Generated with ..." trailers before pushing. `git commit --amend` or a rebase is enough.')

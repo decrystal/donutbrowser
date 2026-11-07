@@ -8,6 +8,7 @@ import { toast } from "sonner";
 import { AppUpdateToast } from "@/components/app-update-toast";
 import { translateBackendError } from "@/lib/backend-errors";
 import { showToast } from "@/lib/toast-utils";
+import { playUiSound } from "@/lib/ui-sounds";
 import type { AppUpdateInfo, AppUpdateProgress } from "@/types";
 
 export function useAppUpdateNotifications() {
@@ -45,23 +46,15 @@ export function useAppUpdateNotifications() {
     }
   }, [isClient, dismissedVersion]);
 
+  /** Checks now, even for a dismissed version. Throws when the check fails. */
   const checkForAppUpdatesManual = useCallback(async () => {
-    if (!isClient) return;
-
-    try {
-      console.log("Triggering manual app update check...");
-      const update = await invoke<AppUpdateInfo | null>(
-        "check_for_app_updates_manual",
-      );
-      console.log("Manual check result:", update);
-
-      // Always show manual check results, even if previously dismissed
-      autoDownloadedVersion.current = null;
-      setUpdateInfo(update);
-    } catch (error) {
-      console.error("Failed to manually check for app updates:", error);
-    }
-  }, [isClient]);
+    const update = await invoke<AppUpdateInfo | null>(
+      "check_for_app_updates_manual",
+    );
+    autoDownloadedVersion.current = null;
+    setUpdateInfo(update);
+    return update;
+  }, []);
 
   const handleAppUpdate = useCallback(
     async (appUpdateInfo: AppUpdateInfo) => {
@@ -152,6 +145,7 @@ export function useAppUpdateNotifications() {
 
     const unlistenReady = listen<string>("app-update-ready", (event) => {
       console.log("App update ready:", event.payload);
+      playUiSound("attention");
       setUpdateReady(true);
       setIsUpdating(false);
       setUpdateProgress(null);
@@ -174,8 +168,7 @@ export function useAppUpdateNotifications() {
   useEffect(() => {
     if (
       !isClient ||
-      !updateInfo ||
-      updateInfo.manual_update_required ||
+      !updateInfo?.auto_install ||
       isUpdating ||
       updateReady ||
       autoDownloadedVersion.current === updateInfo.new_version
@@ -187,23 +180,21 @@ export function useAppUpdateNotifications() {
     void handleAppUpdate(updateInfo);
   }, [isClient, updateInfo, isUpdating, updateReady, handleAppUpdate]);
 
-  // Show toast only when update is ready to install or requires manual action
+  // A toast when the update is ready, or when it waits for the person: a
+  // manual update, or automatic updates turned off.
   useEffect(() => {
-    if (!isClient) return;
-
-    const showManualToast = updateInfo?.manual_update_required && !isUpdating;
-    if (!updateReady && !showManualToast) {
-      return;
-    }
-    if (!updateInfo) return;
+    if (!isClient || !updateInfo) return;
+    if (!updateReady && updateInfo.auto_install) return;
 
     toast.custom(
       () => (
         <AppUpdateToast
           updateInfo={updateInfo}
+          onInstall={() => void handleAppUpdate(updateInfo)}
           onRestart={handleRestart}
           onDismiss={dismissAppUpdate}
           updateReady={updateReady}
+          isUpdating={isUpdating}
         />
       ),
       {
@@ -219,6 +210,7 @@ export function useAppUpdateNotifications() {
     );
   }, [
     updateInfo,
+    handleAppUpdate,
     handleRestart,
     dismissAppUpdate,
     updateReady,
@@ -242,5 +234,9 @@ export function useAppUpdateNotifications() {
     checkForAppUpdates,
     checkForAppUpdatesManual,
     dismissAppUpdate,
+    installAppUpdate: handleAppUpdate,
+    restartToUpdate: handleRestart,
   };
 }
+
+export type AppUpdateState = ReturnType<typeof useAppUpdateNotifications>;

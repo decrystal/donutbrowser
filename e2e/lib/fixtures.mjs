@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import {
   chmod,
   copyFile,
@@ -15,6 +15,10 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { crc32 } from "node:zlib";
+import {
+  WAYFERN_DOWNLOAD_CLIENT_TIMEOUT_MS,
+  WAYFERN_DOWNLOAD_TIMEOUT_MS,
+} from "./limits.mjs";
 
 export const TEST_BROWSER_VERSION = "150.0.7871.100";
 
@@ -23,19 +27,75 @@ export function defaultWayfernPath(projectRoot) {
     return path.resolve(process.env.DONUT_E2E_WAYFERN_PATH);
   }
   const fixtureRoot = path.join(projectRoot, ".cache", "e2e-wayfern-fixture");
-  return process.platform === "darwin"
-    ? path.join(fixtureRoot, "Wayfern.app")
-    : path.join(
-        fixtureRoot,
-        process.platform === "win32" ? "Wayfern.exe" : "wayfern",
-      );
+  // Linux and Windows builds are a directory, as the portable archives unpack.
+  return path.join(
+    fixtureRoot,
+    process.platform === "darwin" ? "Wayfern.app" : "wayfern",
+  );
+}
+
+/** Executable names the app looks for in a Linux or Windows build. */
+const WAYFERN_EXECUTABLES = ["wayfern", "chromium", "chrome"].map((name) =>
+  process.platform === "win32" ? `${name}.exe` : name,
+);
+
+function isDirectory(file) {
+  return existsSync(file) && statSync(file).isDirectory();
+}
+
+/**
+ * Where the cache fixture records which PUBLISHED version it was installed for.
+ *
+ * The bundle's own `CFBundleShortVersionString` cannot answer that question: a
+ * published version and the version stamped inside the bundle it serves do not
+ * always agree, and the app keys everything (download registry, profile
+ * `version`, release types) off the PUBLISHED string. Comparing the bundle's
+ * own version against the published one would therefore call an up-to-date
+ * fixture stale and re-download 1 GB on every single run.
+ */
+function fixtureStampPath(projectRoot) {
+  return path.join(
+    path.dirname(defaultWayfernPath(projectRoot)),
+    "published-version.txt",
+  );
+}
+
+/**
+ * The published version the cache fixture stands for, or `null` when there is
+ * no fixture.
+ *
+ * Falls back to the bundle's own version when no stamp is present, which is
+ * what a hand-installed fixture looks like: it is only right when the two
+ * agree, and when they do not the fixture is replaced, which is the safe way
+ * to be wrong.
+ */
+export function cachedFixtureVersion(projectRoot) {
+  const bundle = defaultWayfernPath(projectRoot);
+  if (!existsSync(bundle)) return null;
+  const stamp = fixtureStampPath(projectRoot);
+  if (existsSync(stamp)) {
+    const recorded = readFileSync(stamp, "utf8").trim();
+    if (recorded) return recorded;
+  }
+  return inspectWayfern(bundle).version;
 }
 
 export function wayfernExecutable(bundlePath) {
   if (process.platform === "darwin") {
     return path.join(bundlePath, "Contents", "MacOS", "Wayfern");
   }
-  return bundlePath;
+  if (!isDirectory(bundlePath)) return bundlePath;
+  // The executable sits at the top of the build or in its one subdirectory.
+  const subdirectories = readdirSync(bundlePath)
+    .map((name) => path.join(bundlePath, name))
+    .filter(isDirectory);
+  for (const dir of [bundlePath, ...subdirectories]) {
+    for (const name of WAYFERN_EXECUTABLES) {
+      const candidate = path.join(dir, name);
+      if (existsSync(candidate) && !isDirectory(candidate)) return candidate;
+    }
+  }
+  return path.join(bundlePath, WAYFERN_EXECUTABLES[0]);
 }
 
 export function inspectWayfern(bundlePath) {
@@ -80,10 +140,57 @@ async function cloneAppBundle(source, destination) {
   }
 }
 
+/** Where the app itself resolves the current Wayfern build (api_client.rs). */
+const WAYFERN_RELEASE_URL = "https://donutbrowser.com/wayfern.json";
+
+/**
+ * The newest published Wayfern version, read from the same manifest the app
+ * reads.
+ *
+ * Deliberately NOT asked of a running app session. Seeding a browser into a
+ * session's data root only works before that session starts: a running app
+ * runs `cleanup_unused_binaries`, which deletes any binary directory no
+ * profile references, and a just-seeded fixture is exactly that. Resolving the
+ * version over plain HTTP keeps the seed ahead of app startup.
+ */
+async function publishedWayfernVersion() {
+  const response = await fetch(WAYFERN_RELEASE_URL, {
+    signal: AbortSignal.timeout(30_000),
+  });
+  assert.ok(
+    response.ok,
+    `Could not read ${WAYFERN_RELEASE_URL}: HTTP ${response.status}`,
+  );
+  const manifest = await response.json();
+  assert.ok(
+    typeof manifest.version === "string" && manifest.version,
+    `No Wayfern version published at ${WAYFERN_RELEASE_URL}`,
+  );
+  return manifest.version;
+}
+
+async function downloadWayfern(app, version) {
+  await app.session.setTimeouts({ script: WAYFERN_DOWNLOAD_TIMEOUT_MS });
+  try {
+    await app.invoke(
+      "download_browser",
+      { browserStr: "wayfern", version },
+      WAYFERN_DOWNLOAD_CLIENT_TIMEOUT_MS,
+    );
+  } finally {
+    await app.session.setTimeouts();
+  }
+}
+
+/**
+ * Put the build this session just downloaded into the cache fixture, in place
+ * of whatever build the cache held before. The swap goes through a staging
+ * copy and renames, so a suite that dies mid-copy leaves the old fixture or
+ * the new one on disk, never a half-written bundle.
+ */
 async function cacheDownloadedWayfern(app, projectRoot, version) {
   if (process.env.DONUT_E2E_WAYFERN_PATH) return;
   const destination = defaultWayfernPath(projectRoot);
-  if (existsSync(destination)) return;
 
   const installDir = path.join(
     app.dataRoot,
@@ -95,24 +202,37 @@ async function cacheDownloadedWayfern(app, projectRoot, version) {
   const source =
     process.platform === "darwin"
       ? path.join(installDir, "Wayfern.app")
-      : path.join(
-          installDir,
-          process.platform === "win32" ? "wayfern.exe" : "wayfern",
-        );
+      : installDir;
   const staging = `${destination}.tmp-${process.pid}`;
+  const retired = `${destination}.stale-${process.pid}`;
   await rm(staging, { recursive: true, force: true });
+  await rm(retired, { recursive: true, force: true });
   try {
     if (process.platform === "darwin") {
       await cloneAppBundle(source, staging);
     } else {
       await mkdir(path.dirname(staging), { recursive: true });
-      await copyFile(source, staging);
-      if (process.platform !== "win32") await chmod(staging, 0o755);
+      await cp(source, staging, { recursive: true, preserveTimestamps: true });
     }
+    if (existsSync(destination)) await rename(destination, retired);
     await rename(staging, destination);
+    // Stamped only after the bundle is in place, so an interrupted swap can
+    // never leave a stamp claiming a version the fixture does not hold.
+    await writeFile(fixtureStampPath(projectRoot), `${version}\n`);
   } catch (error) {
     await rm(staging, { recursive: true, force: true });
+    if (!existsSync(destination) && existsSync(retired)) {
+      await rename(retired, destination);
+    }
     if (!existsSync(destination)) throw error;
+    // The session itself runs the build it downloaded; only the cache is
+    // behind, and the next run resolves the published version again and
+    // replaces it then.
+    console.warn(
+      `[donut-e2e] Could not refresh the Wayfern fixture cache: ${error}`,
+    );
+  } finally {
+    await rm(retired, { recursive: true, force: true });
   }
 }
 
@@ -130,6 +250,11 @@ export async function seedWayfern(dataRoot, wayfern) {
       wayfern.bundlePath,
       path.join(installDir, "Wayfern.app"),
     );
+  } else if (isDirectory(wayfern.bundlePath)) {
+    await cp(wayfern.bundlePath, installDir, {
+      recursive: true,
+      preserveTimestamps: true,
+    });
   } else {
     const name = process.platform === "win32" ? "wayfern.exe" : "wayfern";
     const destination = path.join(installDir, name);
@@ -160,36 +285,49 @@ export async function seedWayfern(dataRoot, wayfern) {
   return installDir;
 }
 
+/**
+ * Make the newest published Wayfern available to `app` and report the version
+ * it will run.
+ *
+ * `DONUT_E2E_WAYFERN_PATH` pins an explicit bundle and is used as given: that
+ * is how a locally built browser gets under test. Without it the suite runs
+ * the build the product would offer today, always. The ignored cache fixture
+ * only ever saves the download: it is used when it holds exactly that build
+ * and replaced when it holds any other, so a cache filled months ago can never
+ * quietly keep an old browser under test.
+ */
 export async function prepareWayfern(app, projectRoot) {
   const localBundle = defaultWayfernPath(projectRoot);
-  if (existsSync(localBundle)) {
+  if (process.env.DONUT_E2E_WAYFERN_PATH) {
     const wayfern = inspectWayfern(localBundle);
     await seedWayfern(app.dataRoot, wayfern);
-    return { version: wayfern.version, source: "local fixture" };
+    return { version: wayfern.version, source: "pinned fixture" };
+  }
+
+  const version = await publishedWayfernVersion();
+  const cachedVersion = cachedFixtureVersion(projectRoot);
+  if (cachedVersion === version) {
+    // Seeded under the PUBLISHED version, not the bundle's own, because that
+    // is the string the app itself would have registered had it downloaded
+    // this build, and what every later `version` assertion compares against.
+    // Seeded BEFORE the app starts, or its unused-binary cleanup deletes it.
+    await seedWayfern(app.dataRoot, {
+      ...inspectWayfern(localBundle),
+      version,
+    });
+    return { version, source: "cached fixture" };
+  }
+  if (cachedVersion) {
+    console.log(
+      `[donut-e2e] Cached Wayfern fixture ${cachedVersion} is not the published ${version}; replacing it`,
+    );
+    // The session's version list was to name the stale fixture; it names the
+    // version the app downloads now. Seeded when the app starts.
+    if (!app.session && app.seedVersionCache) app.seedVersionCache = version;
   }
 
   if (!app.session) await app.start();
-  const current = await app.invoke("fetch_browser_versions_with_count", {
-    browserStr: "wayfern",
-  });
-  assert.ok(
-    current.versions.length > 0,
-    "No Wayfern build is published for this platform",
-  );
-  const version = current.versions[0];
-  await app.session.setTimeouts({ script: 600_000 });
-  try {
-    await app.invoke(
-      "download_browser",
-      {
-        browserStr: "wayfern",
-        version,
-      },
-      620_000,
-    );
-  } finally {
-    await app.session.setTimeouts();
-  }
+  await downloadWayfern(app, version);
   await cacheDownloadedWayfern(app, projectRoot, version);
   return { version, source: "published download" };
 }
@@ -525,4 +663,184 @@ export function writeChromiumHistory(dbPath, urls) {
     insert.run(url, url, visit++);
   }
   db.close();
+}
+
+/** The name and version the CRX fixture's own manifest declares. */
+export const CRX_EXTENSION_NAME = "Donut E2E Web Extension";
+export const CRX_EXTENSION_VERSION = "3.2.1";
+
+/**
+ * Wrap `zip` in a CRX3 container, the shape the Chrome Web Store actually
+ * serves: `Cr24`, a little-endian format version of 3, a little-endian header
+ * length, that many bytes of signature header, and only then the ZIP.
+ *
+ * The header bytes are filler — nothing in Donut verifies the signature, and a
+ * real one would need a packing key. What a test built on this proves is that
+ * the importer reads the ZIP at the offset the header declares instead of
+ * scanning the file for a `PK` marker, which is the bug the format invites.
+ */
+export function buildCrx3(zip, headerBytes = 137) {
+  const prefix = Buffer.alloc(12);
+  prefix.write("Cr24", 0, "ascii");
+  prefix.writeUInt32LE(3, 4);
+  prefix.writeUInt32LE(headerBytes, 8);
+  return Buffer.concat([prefix, Buffer.alloc(headerBytes, 0x42), zip]);
+}
+
+/** A CRX3 whose payload is a real Manifest V3 archive. */
+export function extensionCrx3({
+  name = CRX_EXTENSION_NAME,
+  version = CRX_EXTENSION_VERSION,
+} = {}) {
+  return buildCrx3(
+    buildStoredZip([
+      {
+        name: "manifest.json",
+        data: `${JSON.stringify(
+          {
+            manifest_version: 3,
+            name,
+            version,
+            description: "Isolated test extension served over a link",
+          },
+          null,
+          2,
+        )}\n`,
+      },
+    ]),
+  );
+}
+
+/**
+ * The form page the MCP locator and typing checks run against. Each part
+ * stands for a kind of field agents reported trouble with: a search input and
+ * a search textarea named by id, a controlled input that keeps only what real
+ * input events gave it, an autocomplete whose input is transparent and one
+ * pixel wide, two fields whose names differ by a suffix, radios drawn by their
+ * labels, a grid of day cells, a field the page empties after every key, and
+ * a textarea far down the page beside a fixed banner that covers the bottom of
+ * the window.
+ */
+export function mcpFormsPage() {
+  const days = Array.from(
+    { length: 31 },
+    (_, i) =>
+      `<div role="option" aria-label="Choose October ${i + 1}, 2026" data-day="${i + 1}">${i + 1}</div>`,
+  ).join("");
+  return `<!doctype html>
+<html>
+  <head>
+    <title>Donut E2E MCP Forms</title>
+    <style>
+      body { font: 14px sans-serif; margin: 0; padding: 16px 16px 160px; }
+      .row { margin: 10px 0; }
+      .control { position: relative; width: 320px; min-height: 36px; border: 1px solid #888; border-radius: 4px; display: flex; align-items: center; padding: 0 8px; cursor: text; }
+      .control .placeholder { position: absolute; left: 8px; color: #777; pointer-events: none; }
+      .control input { width: 1px; opacity: 0; border: 0; padding: 0; outline: 0; font: inherit; background: none; }
+      .choice { position: relative; display: inline-block; padding-left: 24px; margin-right: 16px; }
+      .choice input { position: absolute; z-index: -1; opacity: 0; left: 0; top: 2px; width: 16px; height: 16px; margin: 0; }
+      .choice label::before { content: ""; position: absolute; left: 0; top: 2px; width: 14px; height: 14px; border: 1px solid #333; border-radius: 50%; }
+      .choice input:checked + label::before { background: #333; }
+      .days { display: grid; grid-template-columns: repeat(7, 36px); gap: 2px; }
+      .days div { height: 28px; display: flex; align-items: center; justify-content: center; border: 1px solid #ccc; cursor: pointer; }
+      .spacer { height: 900px; }
+      #fixedban { position: fixed; left: 0; right: 0; bottom: 0; height: 110px; z-index: 10; background: #333; color: #fff; }
+    </style>
+  </head>
+  <body>
+    <h1>MCP forms</h1>
+    <div class="row"><input id="searchInput" name="search" placeholder="Search Wikipedia"></div>
+    <div class="row"><textarea id="sb_form_q" name="q" rows="1" placeholder="Ask me anything"></textarea></div>
+    <div class="row"><label for="react-name">Full name</label> <input id="react-name" name="fullName"></div>
+    <div class="row">
+      <label for="first-name">First Name</label> <input id="first-name" name="firstName">
+      <label for="first-name-optional">First Name (optional)</label> <input id="first-name-optional" name="firstNameOptional">
+    </div>
+    <div class="row">
+      <div id="subjects" class="control"><span class="placeholder">Subjects</span><input id="subjectsInput" aria-label="Subjects" autocomplete="off"></div>
+      <ul id="subjects-menu"></ul>
+    </div>
+    <div class="row">
+      <div class="choice"><input type="radio" name="gender" id="gender-radio-1" value="Male"><label for="gender-radio-1">Male</label></div>
+      <div class="choice"><input type="radio" name="gender" id="gender-radio-2" value="Female"><label for="gender-radio-2">Female</label></div>
+    </div>
+    <div class="row"><div id="days" class="days" role="listbox" aria-label="October 2026">${days}</div></div>
+    <div class="row"><input id="locked" name="locked" aria-label="Locked"></div>
+    <div class="spacer"></div>
+    <div class="row"><label for="currentAddress">Current Address</label><br><textarea id="currentAddress" name="currentAddress" rows="5" cols="40"></textarea></div>
+    <div class="spacer"></div>
+    <div id="fixedban">Advertisement</div>
+    <script>
+      (() => {
+        const banner = document.getElementById("fixedban");
+        banner.addEventListener("mousedown", () => {
+          banner.dataset.clicks = String(Number(banner.dataset.clicks || 0) + 1);
+        });
+
+        // A controlled input as React keeps one: a value a script assigns moves
+        // the tracker, so the input event after it changes nothing, and every
+        // render puts the state back into the field.
+        const named = document.getElementById("react-name");
+        const native = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+        let state = "";
+        let tracked = "";
+        Object.defineProperty(named, "value", {
+          configurable: true,
+          get() { return native.get.call(this); },
+          set(value) { tracked = String(value); native.set.call(this, value); },
+        });
+        named.addEventListener("input", () => {
+          const now = native.get.call(named);
+          if (now !== tracked) {
+            tracked = now;
+            state = now;
+            named.dataset.state = state;
+          }
+        });
+        setInterval(() => {
+          if (native.get.call(named) !== state) {
+            native.set.call(named, state);
+            tracked = state;
+          }
+        }, 50);
+
+        // An autocomplete: a click anywhere on the control focuses its input,
+        // which grows and shows itself only once it holds text.
+        const control = document.getElementById("subjects");
+        const subject = document.getElementById("subjectsInput");
+        const placeholder = control.querySelector(".placeholder");
+        const menu = document.getElementById("subjects-menu");
+        control.addEventListener("mousedown", (event) => {
+          if (event.target !== subject) {
+            event.preventDefault();
+            subject.focus();
+          }
+        });
+        subject.addEventListener("input", () => {
+          const typed = subject.value;
+          subject.style.width = typed ? typed.length + 1 + "ch" : "1px";
+          subject.style.opacity = typed ? "1" : "0";
+          placeholder.style.display = typed ? "none" : "";
+          menu.innerHTML = ["Maths", "Physics", "Chemistry"]
+            .filter((option) => typed && option.toLowerCase().startsWith(typed.toLowerCase()))
+            .map((option) => "<li>" + option + "</li>")
+            .join("");
+        });
+
+        // A field the page empties after every key.
+        const locked = document.getElementById("locked");
+        locked.addEventListener("input", () => {
+          locked.value = "";
+        });
+
+        const daysGrid = document.getElementById("days");
+        daysGrid.addEventListener("click", (event) => {
+          const day = event.target.closest("[data-day]");
+          if (day) daysGrid.dataset.picked = day.dataset.day;
+        });
+        window.__formsReady = true;
+      })();
+    </script>
+  </body>
+</html>`;
 }
