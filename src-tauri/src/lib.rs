@@ -267,9 +267,9 @@ mod cookie_paste;
 pub mod events;
 mod local_storage;
 mod mcp_integrations;
+mod mcp_local_server;
 mod mcp_remote;
 mod mcp_server;
-mod mcp_local_server;
 mod mcp_toolsets;
 mod mcp_views;
 mod navigation_watch;
@@ -997,9 +997,7 @@ pub struct McpLocalConfig {
 /// Loopback endpoint + token for the settings page. `None` while the local
 /// server is disabled, so the page can hide its cards.
 #[tauri::command]
-async fn get_mcp_config(
-  app_handle: tauri::AppHandle,
-) -> Result<Option<McpLocalConfig>, String> {
+async fn get_mcp_config(app_handle: tauri::AppHandle) -> Result<Option<McpLocalConfig>, String> {
   let settings_manager = settings_manager::SettingsManager::instance();
   let settings = settings_manager
     .load_settings()
@@ -1013,7 +1011,9 @@ async fn get_mcp_config(
     .map_err(|e| backend_error_with_detail("INTERNAL_ERROR", e))?
     .ok_or_else(|| backend_error("MCP_TOKEN_NOT_FOUND"))?;
   Ok(Some(McpLocalConfig {
-    port: settings.mcp_port.unwrap_or(mcp_local_server::DEFAULT_MCP_LOCAL_PORT),
+    port: settings
+      .mcp_port
+      .unwrap_or(mcp_local_server::DEFAULT_MCP_LOCAL_PORT),
     token,
   }))
 }

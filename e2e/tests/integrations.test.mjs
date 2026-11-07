@@ -871,6 +871,38 @@ test("MCP clients are installed only against the remote endpoint", async () => {
   });
 });
 
+test("the local MCP server serves its endpoint on this machine, no account", async () => {
+  await withApp("integrations-mcp-local", async (app) => {
+    // Off is the shipped default: nothing listens, the page shows no card.
+    assert.equal(await app.invoke("get_mcp_server_status"), false);
+    assert.equal(await app.invoke("get_mcp_config"), null);
+
+    // The process runs independently of the settings flag: the switch follows
+    // the live server, the endpoint card follows the saved setting.
+    const port = await app.invoke("start_mcp_server");
+    assert.ok(Number.isInteger(port) && port > 0, `got port ${port}`);
+    assert.equal(await app.invoke("get_mcp_server_status"), true);
+    assert.equal(await app.invoke("get_mcp_config"), null);
+
+    // Enabling it persists the port and mints the token agents sign in with.
+    const settings = await app.invoke("get_app_settings");
+    await app.invoke("save_app_settings", {
+      settings: { ...settings, mcp_enabled: true, mcp_port: port },
+    });
+    const config = await app.invoke("get_mcp_config");
+    assert.equal(config.port, port);
+    assert.ok(
+      config.token.length >= 40,
+      "the token is a 32-byte url-safe string",
+    );
+
+    // Stopping leaves the setting in place; status follows the process.
+    await app.invoke("stop_mcp_server");
+    assert.equal(await app.invoke("get_mcp_server_status"), false);
+    assert.ok(await app.invoke("get_mcp_config"));
+  });
+});
+
 test("the agent console keeps notes, take-overs and the pause for connected agents", async () => {
   await withApp("integrations-agent-console", async (app) => {
     await seedTerms(app);

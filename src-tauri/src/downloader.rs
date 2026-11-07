@@ -1,4 +1,4 @@
-﻿use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -14,7 +14,6 @@ use crate::log_redaction::Plain;
 // the connection as stalled. Converts an indefinite hang into a terminal error so
 // the UI can surface it and the caller can move on / retry.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
 
 // Sent on both the asset request and its checksum sidecar so the CDN sees one
 // consistent client for the pair.
@@ -34,7 +33,6 @@ pub(crate) fn note_progress(browser: &str, version: &str) {
   if let Ok(mut moved) = LAST_PROGRESS.lock() {
     moved.insert(format!("{browser}-{version}"), std::time::Instant::now());
   }
-
 }
 
 /// Run `download` until it ends, or until neither its transfer nor its
@@ -1319,7 +1317,6 @@ mod tests {
       .map(|entry| entry.unwrap().path())
       .collect();
     assert_eq!(left, vec![archive]);
-
   }
 
   #[tokio::test]
@@ -1636,4 +1633,3 @@ mod tests {
     clear_download_state_for_browser("chromium");
   }
 }
-

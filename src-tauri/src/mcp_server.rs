@@ -14021,8 +14021,8 @@ mod tests {
     // tool was added or removed on purpose.
     assert_eq!(
       tools.len(),
-    117,
-    "the tool list is a published contract; update this number deliberately"
+      117,
+      "the tool list is a published contract; update this number deliberately"
     );
 
     // Names are the contract an MCP client is written against, so a duplicate

@@ -206,8 +206,9 @@ fn matches(profile: &BrowserProfile, names: &Names, query: &ProfileQuery) -> boo
 /// The `list_profiles` answer. Only locally supported profiles can be driven
 /// over MCP; the others are counted, so an agent knows they exist.
 pub fn list_profiles(profiles: &[BrowserProfile], names: &Names, query: &ProfileQuery) -> Value {
-  let is_supported =
-    |p: &BrowserProfile| p.browser == "wayfern" || p.browser == crate::fingerprint_chromium::BROWSER_ID;
+  let is_supported = |p: &BrowserProfile| {
+    p.browser == "wayfern" || p.browser == crate::fingerprint_chromium::BROWSER_ID
+  };
   let hidden = profiles.iter().filter(|p| !is_supported(p)).count();
   let mut found: Vec<&BrowserProfile> = profiles
     .iter()

@@ -157,12 +157,12 @@ async fn run_http_server(
     ))
     .with_state(state);
 
-  let port = listener
-    .local_addr()
-    .map(|addr| addr.port())
-    .unwrap_or(0);
+  let port = listener.local_addr().map(|addr| addr.port()).unwrap_or(0);
   let server = async move {
-    log::info!("[mcp] Local server listening on http://127.0.0.1:{}/mcp", port);
+    log::info!(
+      "[mcp] Local server listening on http://127.0.0.1:{}/mcp",
+      port
+    );
     if let Err(e) = axum::serve(listener, app).await {
       log::error!("[mcp] Local server error: {}", e);
     }
